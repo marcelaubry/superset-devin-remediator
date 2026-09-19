@@ -12,7 +12,7 @@ from ..approvals import approve_remediation, reject_remediation
 from ..config import Settings, get_settings
 from ..db import get_session
 from ..lifecycle import CaseState, InvalidTransition, transition
-from ..models import Attempt, Case
+from ..models import Attempt, AttemptKind, AttemptStatus, Case
 from .auth import COOKIE_NAME, _cookie_value, require_operator
 from .dashboard import _humanize, load_case, templates
 
@@ -89,6 +89,26 @@ async def _case_action(
             )
             if any(count >= get_settings().max_attempts_per_kind for _, count in counts.all()):
                 raise InvalidTransition("attempt cap reached")
+            latest = await session.scalar(
+                select(Attempt)
+                .where(Attempt.case_id == case.id)
+                .order_by(Attempt.started_at.desc())
+                .limit(1)
+            )
+            triage_succeeded = await session.scalar(
+                select(Attempt.id).where(
+                    Attempt.case_id == case.id,
+                    Attempt.kind == AttemptKind.TRIAGE,
+                    Attempt.status == AttemptStatus.SUCCEEDED,
+                )
+            )
+            if (
+                latest is not None
+                and latest.kind == AttemptKind.REMEDIATION
+                and triage_succeeded is not None
+            ):
+                to_state = CaseState.REMEDIATION_CREATE_INTENT
+                reason = "retry remediation"
         await transition(session, case, to_state, reason, "operator")
         await session.commit()
     except InvalidTransition as exc:

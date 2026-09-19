@@ -10,7 +10,7 @@ from remediator.config import get_settings
 from remediator.models import Base
 
 config = context.config
-database_url = os.getenv("DATABASE_URL") or config.get_main_option("sqlalchemy.url")
+database_url = config.get_main_option("sqlalchemy.url") or os.getenv("DATABASE_URL")
 if not database_url:
     database_url = get_settings().database_url
 config.set_main_option("sqlalchemy.url", database_url.replace("%", "%%"))

@@ -41,6 +41,7 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://remediator:remediator@db:5432/remediator
     command: python -m remediator.worker
+    stop_grace_period: 40s
     depends_on:
       migrate:
         condition: service_completed_successfully

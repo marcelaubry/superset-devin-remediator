@@ -146,9 +146,9 @@ TRANSITIONS: dict[CaseState, frozenset[CaseState]] = {
         }
     ),
     CaseState.TERMINATION_PENDING: frozenset({CaseState.CANCELLED, CaseState.FAILED}),
-    CaseState.TIMED_OUT: frozenset({CaseState.RECEIVED}),
+    CaseState.TIMED_OUT: frozenset({CaseState.RECEIVED, CaseState.REMEDIATION_CREATE_INTENT}),
     CaseState.POLICY_REJECTED: frozenset(),
-    CaseState.FAILED: frozenset({CaseState.RECEIVED}),
+    CaseState.FAILED: frozenset({CaseState.RECEIVED, CaseState.REMEDIATION_CREATE_INTENT}),
     CaseState.CANCELLED: frozenset(),
 }
 for _state in _ACTIVE:
@@ -167,6 +167,8 @@ async def transition(
     to_state: CaseState,
     reason: str,
     actor: str,
+    *,
+    expected_claimed_by: str | None = None,
 ) -> None:
     from_state = CaseState(case.state)
     if to_state not in TRANSITIONS[from_state]:
@@ -175,11 +177,14 @@ async def transition(
 
     now = datetime.now(UTC)
     completed_at = now if to_state in TERMINAL_STATES else None
+    conditions = [Case.id == case.id, Case.state == from_state]
+    if expected_claimed_by is not None:
+        conditions.append(Case.claimed_by == expected_claimed_by)
     result = cast(
         Any,
         await session.execute(
             update(Case)
-            .where(Case.id == case.id, Case.state == from_state)
+            .where(*conditions)
             .values(
                 state=to_state,
                 state_entered_at=now,
@@ -189,7 +194,8 @@ async def transition(
         ),
     )
     if result.rowcount == 0:
-        raise InvalidTransition(f"case {case.id} is no longer in {from_state}")
+        suffix = " or lease lost" if expected_claimed_by is not None else ""
+        raise InvalidTransition(f"case {case.id} is no longer in {from_state}{suffix}")
     case.state = to_state
     case.state_entered_at = now
     case.completed_at = completed_at

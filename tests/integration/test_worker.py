@@ -1,11 +1,13 @@
+from datetime import UTC, datetime, timedelta
+
 import pytest
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from remediator.approvals import approve_remediation
 from remediator.config import Settings
 from remediator.devin.fake import FakeDevinClient
-from remediator.lifecycle import CaseState
+from remediator.lifecycle import CaseState, InvalidTransition, transition
 from remediator.models import (
     Attempt,
     AttemptKind,
@@ -17,6 +19,7 @@ from remediator.models import (
     StateTransition,
     WebhookEvent,
 )
+from remediator.worker import Worker
 from remediator.worker.processor import process_case, process_event
 
 
@@ -301,7 +304,7 @@ async def test_reconcile_missing_session_fails(
     await integration_session.commit()
     await process_case(integration_session, case, FakeDevinClient(), Settings())
     assert case.state == CaseState.FAILED
-    assert case.failure_reason == "create intent could not be reconciled"
+    assert case.failure_reason == "create intent could not be reconciled after retry"
 
 
 @pytest.mark.asyncio
@@ -334,3 +337,166 @@ async def test_poll_budget_times_out(
     attempt = await integration_session.scalar(select(Attempt).where(Attempt.case_id == case.id))
     assert attempt and attempt.status == AttemptStatus.CANCELLED
     assert attempt.error == "poll budget exhausted"
+
+
+@pytest.mark.asyncio
+async def test_transition_rejects_wrong_lease_owner(
+    integration_session: AsyncSession,
+) -> None:
+    case = Case(
+        issue_number=4801,
+        repository="apache/superset",
+        issue_title="Lease",
+        issue_url="https://github.com/apache/superset/issues/4801",
+        state=CaseState.RECEIVED,
+        claimed_by="worker-a",
+    )
+    integration_session.add(case)
+    await integration_session.commit()
+    case_id = case.id
+    with pytest.raises(InvalidTransition, match="lease lost"):
+        await transition(
+            integration_session,
+            case,
+            CaseState.ELIGIBILITY_EVALUATED,
+            "test",
+            "worker",
+            expected_claimed_by="worker-b",
+        )
+    await integration_session.rollback()
+    fresh = await integration_session.get(Case, case_id)
+    assert fresh and fresh.state == CaseState.RECEIVED
+
+
+@pytest.mark.asyncio
+async def test_worker_heartbeat_renews_case_lease(
+    integration_session: AsyncSession,
+    test_database_url: str,
+) -> None:
+    case = Case(
+        issue_number=4802,
+        repository="apache/superset",
+        issue_title="Heartbeat",
+        issue_url="https://github.com/apache/superset/issues/4802",
+        state=CaseState.RECEIVED,
+    )
+    integration_session.add(case)
+    await integration_session.commit()
+    worker = Worker(Settings(database_url=test_database_url, worker_lease_seconds=30))
+    try:
+        async with integration_session.begin():
+            case.claimed_by = worker.worker_id
+            case.lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        before = case.lease_expires_at
+        await worker._heartbeat(case_id=case.id)
+    finally:
+        await worker.devin.aclose()
+        await worker.engine.dispose()
+    await integration_session.refresh(case)
+    assert case.lease_expires_at and case.lease_expires_at > before
+
+
+@pytest.mark.asyncio
+async def test_reconcile_retries_missing_session(
+    integration_session: AsyncSession,
+) -> None:
+    case = Case(
+        issue_number=4803,
+        repository="apache/superset",
+        issue_title="Reconcile",
+        issue_url="https://github.com/apache/superset/issues/4803",
+        state=CaseState.REMEDIATION_CREATE_INTENT,
+        claimed_by="worker",
+    )
+    integration_session.add(case)
+    await integration_session.flush()
+    key = f"{case.id}:REMEDIATION:1"
+    integration_session.add(
+        Attempt(
+            case_id=case.id,
+            kind=AttemptKind.REMEDIATION,
+            idempotency_key=key,
+            status=AttemptStatus.RUNNING,
+        )
+    )
+    await integration_session.commit()
+
+    client = FakeDevinClient()
+    await client.create_session(
+        "",
+        {
+            "repository": case.repository,
+            "issue_number": str(case.issue_number),
+            "kind": "REMEDIATION",
+        },
+        idempotency_key=key,
+    )
+
+    class RetryClient(FakeDevinClient):
+        def __init__(self, source: FakeDevinClient) -> None:
+            super().__init__()
+            self._sessions = source._sessions
+            self._idempotency = source._idempotency
+            self.calls = 0
+
+        async def find_session(self, idempotency_key: str):
+            self.calls += 1
+            if self.calls == 1:
+                return None
+            return await super().find_session(idempotency_key)
+
+    retry_client = RetryClient(client)
+    await process_case(
+        integration_session,
+        case,
+        retry_client,
+        Settings(reconcile_retry_delay_seconds=0),
+        claimed_by="worker",
+    )
+    assert case.state == CaseState.CI_PASSED
+    assert retry_client.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_create_orphan_is_terminated(
+    integration_session: AsyncSession,
+    integration_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    case = Case(
+        issue_number=4804,
+        repository="apache/superset",
+        issue_title="Orphan",
+        issue_url="https://github.com/apache/superset/issues/4804",
+        state=CaseState.TRIAGE_CREATE_INTENT,
+        claimed_by="worker",
+    )
+    integration_session.add(case)
+    await integration_session.commit()
+    case_id = case.id
+    client = FakeDevinClient()
+    terminated: list[str] = []
+    original_create = client.create_session
+
+    async def create_and_steal(prompt, tags, idempotency_key):
+        created = await original_create(prompt, tags, idempotency_key)
+        async with integration_session_factory() as other:
+            await other.execute(update(Case).where(Case.id == case_id).values(claimed_by="other"))
+            await other.commit()
+        return created
+
+    async def terminate(session_id: str) -> None:
+        terminated.append(session_id)
+
+    client.create_session = create_and_steal
+    client.terminate_session = terminate
+    with pytest.raises(InvalidTransition, match="lease lost"):
+        await process_case(
+            integration_session,
+            case,
+            client,
+            Settings(),
+            claimed_by="worker",
+        )
+    attempt = await integration_session.scalar(select(Attempt).where(Attempt.case_id == case_id))
+    assert attempt and attempt.status == AttemptStatus.CANCELLED
+    assert attempt.devin_session_id in terminated

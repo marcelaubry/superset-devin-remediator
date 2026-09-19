@@ -29,4 +29,7 @@ def test_terminal_states() -> None:
     assert not hasattr(CaseState, "AWAITING_TRIAGE_APPROVAL")
     assert CaseState.TRIAGE_CREATE_INTENT in TRANSITIONS[CaseState.ELIGIBILITY_EVALUATED]
     for state in TERMINAL_STATES:
-        assert set(TRANSITIONS[state]) <= {CaseState.RECEIVED}
+        assert set(TRANSITIONS[state]) <= {
+            CaseState.RECEIVED,
+            CaseState.REMEDIATION_CREATE_INTENT,
+        }

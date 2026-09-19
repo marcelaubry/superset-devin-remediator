@@ -110,6 +110,9 @@ stateDiagram-v2
 `TRIAGE_CREATE_INTENT` and `REMEDIATION_CREATE_INTENT` make external session
 creation resumable. Triage infeasibility transitions to `POLICY_REJECTED`,
 records a GitHub notification intent, and creates no remediation attempt.
+Retries from `FAILED` or `TIMED_OUT` normally return to eligibility, while a
+case whose latest attempt is a failed remediation after successful triage
+returns directly to `REMEDIATION_CREATE_INTENT`.
 
 ## Data model
 
@@ -144,12 +147,19 @@ event is pending (or processing with an unexpired lease). Each claim uses
 commits before processing. This provides queue-like concurrency without
 introducing Redis or another queue service.
 
-State writes are guarded by `UPDATE ... WHERE state = expected_state`; a
-concurrent operator or worker therefore cannot overwrite a newer state. Devin
+State writes are guarded by `UPDATE ... WHERE state = expected_state` and the
+current worker owner; a concurrent operator or worker therefore cannot
+overwrite a newer state or a stolen lease. A heartbeat renews each case and
+event lease at roughly one third of the lease duration.
+Devin
 CREATE_INTENT attempts have durable idempotency keys and are reconciled after
-a crash. A lease is released after success, failure, or a concurrent-change
-abandonment. If a process stops, in-flight jobs are drained for up to the
-configured shutdown timeout; anything longer is reclaimed after lease expiry.
+a crash, with a bounded second lookup before declaring reconciliation failure.
+If a create returns after ownership was lost, the session is terminated and
+the attempt is recorded as orphaned. A lease is released after success,
+failure, or a concurrent-change abandonment. If a process stops, in-flight
+jobs are drained for up to the configured shutdown timeout; anything longer is
+reclaimed after lease expiry. Docker's worker stop grace period exceeds that
+timeout.
 
 Webhook and case processing are isolated in their own transactions. Exceptions
 mark the event or case failed and are logged; the loop continues to process

@@ -76,6 +76,13 @@ uv run python scripts/simulate.py --scenario good --bad-signature
 | `LOG_LEVEL` | `INFO` | Application log level |
 | `COOKIE_SECURE` | `false` | Set `true` when dashboard traffic is behind TLS |
 
+A real Devin client must raise `DEVIN_POLL_INTERVAL_SECONDS` (approximately 15
+seconds) and `DEVIN_MAX_POLLS` together; the fake defaults would time out any
+real session.
+
+The worker's Docker `stop_grace_period` must exceed
+`WORKER_SHUTDOWN_TIMEOUT_SECONDS` so in-flight jobs can drain before SIGKILL.
+
 ## Development and test database
 
 ```bash

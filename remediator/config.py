@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     worker_lease_seconds: int = 300
     worker_shutdown_timeout_seconds: int = 30
     event_max_attempts: int = 3
+    reconcile_retry_delay_seconds: float = 1.0
     devin_client: str = "fake"
     devin_poll_interval_seconds: float = 0.01
     devin_max_polls: int = 5
