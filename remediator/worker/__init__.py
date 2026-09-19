@@ -12,9 +12,29 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..config import Settings
 from ..db import build_engine, build_session_factory
 from ..devin import build_devin_client
+from ..github_refs import build_base_commit_resolver
 from ..lifecycle import CaseState, InvalidTransition
-from ..models import Attempt, AttemptStatus, Case, EventStatus, WebhookEvent
+from ..models import (
+    ACTIVE_ATTEMPT_STATUSES,
+    Attempt,
+    AttemptStatus,
+    Case,
+    EventStatus,
+    WebhookEvent,
+)
 from .processor import _terminate_running_attempts, fail_case, process_case, process_event
+
+CLAIMABLE_STATES = frozenset(
+    {
+        CaseState.RECEIVED,
+        CaseState.TRIAGE_CREATE_INTENT,
+        CaseState.TRIAGING,
+        CaseState.RECONCILING_CREATE,
+        CaseState.REMEDIATION_CREATE_INTENT,
+        CaseState.REMEDIATING,
+        CaseState.TERMINATION_PENDING,
+    }
+)
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +45,7 @@ class Worker:
         self.engine = build_engine(settings)
         self.session_factory = build_session_factory(self.engine)
         self.devin = build_devin_client(settings)
+        self.base_commits = build_base_commit_resolver(settings)
         self.stop_event = asyncio.Event()
         self.worker_id = f"{socket.gethostname()}:{os.getpid()}:{uuid4().hex[:6]}"
 
@@ -93,14 +114,7 @@ class Worker:
                 case = await session.scalar(
                     select(Case)
                     .where(
-                        Case.state.in_(
-                            {
-                                CaseState.RECEIVED,
-                                CaseState.REMEDIATION_CREATE_INTENT,
-                                CaseState.TERMINATION_PENDING,
-                                CaseState.TRIAGE_CREATE_INTENT,
-                            }
-                        ),
+                        Case.state.in_(CLAIMABLE_STATES),
                         (Case.lease_expires_at.is_(None) | (Case.lease_expires_at < now)),
                         ~active_event,
                     )
@@ -127,10 +141,16 @@ class Worker:
 
     async def _release_case(self, case_id: object) -> None:
         async with self.session_factory() as session:
+            state = await session.scalar(select(Case.state).where(Case.id == case_id))
+            backoff: datetime | None = None
+            if state == CaseState.TERMINATION_PENDING:
+                backoff = datetime.now(UTC) + timedelta(
+                    seconds=self.settings.devin_poll_interval_seconds
+                )
             await session.execute(
                 update(Case)
                 .where(Case.id == case_id, Case.claimed_by == self.worker_id)
-                .values(claimed_by=None, lease_expires_at=None)
+                .values(claimed_by=None, lease_expires_at=backoff)
             )
             await session.commit()
 
@@ -182,14 +202,24 @@ class Worker:
                     fresh = await session.get(WebhookEvent, event.id)
                     if fresh:
                         await process_event(
-                            session, fresh, self.devin, self.settings, self.worker_id
+                            session,
+                            fresh,
+                            self.devin,
+                            self.settings,
+                            self.worker_id,
+                            self.base_commits,
                         )
                         logger.info("processed webhook %s", fresh.delivery_id)
                 elif case:
                     fresh_case = await session.get(Case, case.id)
                     if fresh_case:
                         await process_case(
-                            session, fresh_case, self.devin, self.settings, self.worker_id
+                            session,
+                            fresh_case,
+                            self.devin,
+                            self.settings,
+                            self.worker_id,
+                            self.base_commits,
                         )
                         logger.info("processed case %s in %s", case.id, fresh_case.state)
         finally:
@@ -227,7 +257,7 @@ class Worker:
                                         await session.scalars(
                                             select(Attempt).where(
                                                 Attempt.case_id == fresh.case_id,
-                                                Attempt.status == AttemptStatus.RUNNING,
+                                                Attempt.status.in_(ACTIVE_ATTEMPT_STATUSES),
                                             )
                                         )
                                     ).all()
@@ -244,7 +274,7 @@ class Worker:
                                 await session.scalars(
                                     select(Attempt).where(
                                         Attempt.case_id == case.id,
-                                        Attempt.status == AttemptStatus.RUNNING,
+                                        Attempt.status.in_(ACTIVE_ATTEMPT_STATUSES),
                                     )
                                 )
                             ).all()
@@ -295,6 +325,7 @@ class Worker:
                 await asyncio.gather(*tasks, return_exceptions=True)
         finally:
             await self.devin.aclose()
+            await self.base_commits.aclose()
             await self.engine.dispose()
 
     def stop(self) -> None:

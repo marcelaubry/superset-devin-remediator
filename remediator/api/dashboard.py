@@ -12,7 +12,7 @@ from sqlalchemy.orm import selectinload
 
 from ..db import get_session
 from ..lifecycle import TERMINAL_STATES, CaseState
-from ..models import Case, EventStatus, StateTransition, WebhookEvent
+from ..models import Attempt, Case, EventStatus, StateTransition, WebhookEvent
 from .auth import require_operator
 
 router = APIRouter()
@@ -30,6 +30,37 @@ def _humanize(value: datetime | None) -> str:
     return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
 
 
+def _until(value: datetime | None) -> str:
+    if not value:
+        return "-"
+    seconds = int((value - datetime.now(UTC)).total_seconds())
+    if seconds <= 0:
+        return "expired"
+    return f"in {_humanize(datetime.now(UTC) - timedelta(seconds=seconds))}"
+
+
+def _attempt_elapsed(attempt: Attempt) -> str:
+    start = attempt.create_sent_at or attempt.started_at
+    if attempt.finished_at and start:
+        return f"{int((attempt.finished_at - start).total_seconds())}s"
+    return _humanize(start)
+
+
+def latest_attempt(case: Case) -> Attempt | None:
+    if not case.attempts:
+        return None
+    floor = datetime.min.replace(tzinfo=UTC)
+    return max(case.attempts, key=lambda attempt: attempt.started_at or floor)
+
+
+TEMPLATE_HELPERS: dict[str, object] = {
+    "humanize": _humanize,
+    "until": _until,
+    "attempt_elapsed": _attempt_elapsed,
+    "latest_attempt": latest_attempt,
+}
+
+
 async def load_case(session: AsyncSession, case_id: UUID) -> Case | None:
     return cast(
         Case | None,
@@ -43,7 +74,14 @@ async def load_case(session: AsyncSession, case_id: UUID) -> Case | None:
 
 async def _context(session: AsyncSession) -> dict[str, object]:
     cases = list(
-        (await session.scalars(select(Case).order_by(Case.created_at.desc()).limit(100))).all()
+        (
+            await session.scalars(
+                select(Case)
+                .options(selectinload(Case.attempts))
+                .order_by(Case.created_at.desc())
+                .limit(100)
+            )
+        ).all()
     )
     events = list(
         (
@@ -158,7 +196,7 @@ async def _context(session: AsyncSession) -> dict[str, object]:
             "accepted_24h": accepted_24h,
             "buckets": buckets,
         },
-        "humanize": _humanize,
+        **TEMPLATE_HELPERS,
     }
 
 
@@ -189,7 +227,7 @@ async def case_detail(
     if not case:
         raise HTTPException(status_code=404, detail="case not found")
     return templates.TemplateResponse(
-        request, "case.html", {"request": request, "case": case, "humanize": _humanize}
+        request, "case.html", {"request": request, "case": case, **TEMPLATE_HELPERS}
     )
 
 
@@ -206,7 +244,7 @@ async def case_detail_partial(
     return templates.TemplateResponse(
         request,
         "partials/case_detail.html",
-        {"request": request, "case": case, "humanize": _humanize, "error": None},
+        {"request": request, "case": case, **TEMPLATE_HELPERS, "error": None},
     )
 
 

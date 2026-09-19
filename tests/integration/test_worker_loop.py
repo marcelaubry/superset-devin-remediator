@@ -64,7 +64,9 @@ async def test_worker_loop_survives_failed_job(
     worker = Worker(settings)
     calls = 0
 
-    async def fake_process_event(session, event, devin, settings, claimed_by=None) -> None:
+    async def fake_process_event(
+        session, event, devin, settings, claimed_by=None, resolver=None
+    ) -> None:
         nonlocal calls
         calls += 1
         if calls == 1:

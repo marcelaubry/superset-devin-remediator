@@ -5,10 +5,34 @@
 <dl>
   <dt>Recommendation</dt><dd>{{case.recommendation or "-"}}</dd>
   <dt>Issue</dt><dd><a href="{{case.issue_url}}">{{case.issue_url}}</a></dd>
-  <dt>Devin session</dt><dd>{{case.devin_session_url or "-"}}</dd>
+  <dt>Devin session</dt><dd>{% if case.devin_session_url %}<a href="{{case.devin_session_url}}">{{case.devin_session_url}}</a>{% else %}-{% endif %}</dd>
   <dt>PR</dt><dd>{{case.pr_url or "-"}}</dd>
   <dt>CI</dt><dd>{{case.ci_status or "-"}}</dd>
+  {% if case.failure_reason %}<dt>Blocked / failure reason</dt><dd>{{case.failure_reason}}</dd>{% endif %}
 </dl>
+{% set attempt = latest_attempt(case) %}
+{% if attempt %}
+<section id="devin-session">
+  <h2>Devin session ({{attempt.kind}})</h2>
+  <dl>
+    <dt>Attempt</dt><dd>{{attempt.id}} · {{attempt.status}} · create {{attempt.create_state or "-"}}</dd>
+    <dt>Operation key</dt><dd><code>{{attempt.operation_key}}</code></dd>
+    <dt>Session</dt><dd>{% if attempt.devin_session_url %}<a href="{{attempt.devin_session_url}}">{{attempt.devin_session_id}}</a>{% else %}{{attempt.devin_session_id or "not created"}}{% endif %}</dd>
+    <dt>Remote status</dt><dd>{{attempt.devin_status or "-"}}{% if attempt.devin_status_detail %} / {{attempt.devin_status_detail}}{% endif %}</dd>
+    <dt>Elapsed</dt><dd>{{attempt_elapsed(attempt)}} ({{attempt.poll_count}} polls, last {{humanize(attempt.last_polled_at)}} ago)</dd>
+    <dt>Deadline</dt><dd>{{attempt.timeout_at or "-"}} ({{until(attempt.timeout_at)}})</dd>
+    <dt>Budget</dt><dd>max {{attempt.max_acu_limit or "-"}} ACU · consumed {{attempt.devin_acus_consumed if attempt.devin_acus_consumed is not none else "-"}}</dd>
+    <dt>Base SHA</dt><dd><code>{{attempt.base_sha or "-"}}</code> · prompt {{attempt.prompt_version or "-"}}</dd>
+    <dt>Tags</dt><dd>{{(attempt.devin_tags or [])|join(", ")}}</dd>
+    {% if attempt.reconciliation_reason %}<dt>Reconciliation</dt><dd>{{attempt.reconciliation_reason}}</dd>{% endif %}
+    {% if attempt.error %}<dt>Error</dt><dd>{{attempt.error}}</dd>{% endif %}
+  </dl>
+  {% if attempt.structured_output %}
+  <h3>Validated triage result</h3>
+  <pre>{{attempt.structured_output|tojson(indent=2)}}</pre>
+  {% endif %}
+</section>
+{% endif %}
 <section id="case-status">
   <h2>Actions</h2>
   {% if case.state in ["FAILED","TIMED_OUT","HUMAN_BLOCKED"] %}
@@ -25,6 +49,6 @@
 <h2>Rubric</h2>
 <ul>{% for check in case.rubric or [] %}<li><strong>{{check.name}}</strong>: {{check.passed}} — {{check.reason}}</li>{% else %}<li>None</li>{% endfor %}</ul>
 <h2>Attempts</h2>
-<ul>{% for attempt in case.attempts %}<li>{{attempt.kind}} {{attempt.status}} {{attempt.devin_session_id}}</li>{% else %}<li>None</li>{% endfor %}</ul>
+<ul>{% for attempt in case.attempts|sort(attribute="started_at") %}<li>{{attempt.kind}} {{attempt.status}} {{attempt.create_state or ""}} {{attempt.devin_session_id or ""}} {{attempt.devin_status or ""}}{% if attempt.devin_status_detail %}/{{attempt.devin_status_detail}}{% endif %}{% if attempt.error %} — {{attempt.error}}{% endif %}</li>{% else %}<li>None</li>{% endfor %}</ul>
 <h2>Timeline</h2>
 <ol>{% for item in case.transitions %}<li>{{item.created_at}}: {{item.from_state or "-"}} → {{item.to_state}} ({{item.actor}}) — {{item.reason}}</li>{% else %}<li>None</li>{% endfor %}</ol>

@@ -7,6 +7,7 @@ from sqlalchemy import (
     BigInteger,
     DateTime,
     Enum,
+    Float,
     ForeignKey,
     Identity,
     Index,
@@ -15,6 +16,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -44,6 +46,26 @@ class AttemptStatus(str, enum.Enum):
     FAILED = "FAILED"
     BLOCKED = "BLOCKED"
     CANCELLED = "CANCELLED"
+    RECONCILING = "RECONCILING"
+    TERMINATION_PENDING = "TERMINATION_PENDING"
+    TIMED_OUT = "TIMED_OUT"
+
+
+ACTIVE_ATTEMPT_STATUSES = frozenset(
+    {AttemptStatus.RUNNING, AttemptStatus.RECONCILING, AttemptStatus.TERMINATION_PENDING}
+)
+
+
+class CreateState(str, enum.Enum):
+    """Outcome of the single POST /sessions issued for an attempt."""
+
+    PENDING = "PENDING"
+    NOT_SENT = "NOT_SENT"
+    CREATED = "CREATED"
+    UNCERTAIN = "UNCERTAIN"
+    RECONCILED = "RECONCILED"
+    API_ERROR = "API_ERROR"
+    UNRESOLVED = "UNRESOLVED"
 
 
 class Recommendation(str, enum.Enum):
@@ -132,17 +154,46 @@ class Case(Base):
 
 class Attempt(Base):
     __tablename__ = "attempts"
+    __table_args__ = (
+        Index(
+            "uq_attempts_one_active_per_kind",
+            "case_id",
+            "kind",
+            unique=True,
+            postgresql_where=text("finished_at IS NULL"),
+        ),
+        Index("ix_attempts_devin_session_id", "devin_session_id"),
+    )
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     case_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("cases.id", ondelete="CASCADE"))
     kind: Mapped[AttemptKind] = mapped_column(Enum(AttemptKind, name="attempt_kind"))
     idempotency_key: Mapped[str] = mapped_column(String(255), unique=True)
+    operation_key: Mapped[str] = mapped_column(String(255), unique=True)
+    create_state: Mapped[CreateState] = mapped_column(
+        Enum(CreateState, name="create_state"), default=CreateState.PENDING
+    )
     devin_session_id: Mapped[str | None] = mapped_column(String(255))
+    devin_session_url: Mapped[str | None] = mapped_column(Text)
+    devin_tags: Mapped[list[str] | None] = mapped_column(JSONB)
+    devin_status: Mapped[str | None] = mapped_column(String(50))
+    devin_status_detail: Mapped[str | None] = mapped_column(String(100))
+    devin_acus_consumed: Mapped[float | None] = mapped_column(Float)
+    base_sha: Mapped[str | None] = mapped_column(String(64))
+    prompt_version: Mapped[str | None] = mapped_column(String(50))
+    max_acu_limit: Mapped[int | None] = mapped_column(Integer)
     status: Mapped[AttemptStatus] = mapped_column(
         Enum(AttemptStatus, name="attempt_status"), default=AttemptStatus.RUNNING
     )
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    create_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    first_polled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_polled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    poll_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    timeout_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    structured_output: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     error: Mapped[str | None] = mapped_column(Text)
+    reconciliation_reason: Mapped[str | None] = mapped_column(Text)
     case: Mapped[Case] = relationship(back_populates="attempts")
 
 

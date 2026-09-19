@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from ..approvals import approve_remediation, reject_remediation
 from ..config import Settings, get_settings
@@ -14,7 +15,7 @@ from ..db import get_session
 from ..lifecycle import CaseState, InvalidTransition, transition
 from ..models import Attempt, AttemptKind, AttemptStatus, Case
 from .auth import COOKIE_NAME, _cookie_value, require_operator
-from .dashboard import _humanize, load_case, templates
+from .dashboard import TEMPLATE_HELPERS, load_case, templates
 
 router = APIRouter()
 
@@ -52,7 +53,9 @@ async def case_json(
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
     case = await session.scalar(
-        select(Case).where(Case.repository == repository, Case.issue_number == issue_number)
+        select(Case)
+        .options(selectinload(Case.attempts))
+        .where(Case.repository == repository, Case.issue_number == issue_number)
     )
     if not case:
         raise HTTPException(status_code=404, detail="case not found")
@@ -61,8 +64,38 @@ async def case_json(
         "state": case.state,
         "issue_number": case.issue_number,
         "repository": case.repository,
+        "failure_reason": case.failure_reason,
+        "devin_session_url": case.devin_session_url,
         "pr_url": case.pr_url,
         "ci_status": case.ci_status,
+        "attempts": [_attempt_json(attempt) for attempt in case.attempts],
+    }
+
+
+def _attempt_json(attempt: Attempt) -> dict[str, Any]:
+    return {
+        "id": str(attempt.id),
+        "kind": attempt.kind,
+        "status": attempt.status,
+        "operation_key": attempt.operation_key,
+        "create_state": attempt.create_state,
+        "devin_session_id": attempt.devin_session_id,
+        "devin_session_url": attempt.devin_session_url,
+        "devin_status": attempt.devin_status,
+        "devin_status_detail": attempt.devin_status_detail,
+        "devin_tags": list(attempt.devin_tags or []),
+        "devin_acus_consumed": attempt.devin_acus_consumed,
+        "base_sha": attempt.base_sha,
+        "prompt_version": attempt.prompt_version,
+        "max_acu_limit": attempt.max_acu_limit,
+        "poll_count": attempt.poll_count,
+        "started_at": attempt.started_at.isoformat() if attempt.started_at else None,
+        "last_polled_at": attempt.last_polled_at.isoformat() if attempt.last_polled_at else None,
+        "timeout_at": attempt.timeout_at.isoformat() if attempt.timeout_at else None,
+        "finished_at": attempt.finished_at.isoformat() if attempt.finished_at else None,
+        "structured_output": attempt.structured_output,
+        "reconciliation_reason": attempt.reconciliation_reason,
+        "error": attempt.error,
     }
 
 
@@ -120,7 +153,7 @@ async def _case_action(
             return templates.TemplateResponse(
                 request,
                 "partials/case_detail.html",
-                {"request": request, "case": refreshed, "humanize": _humanize, "error": str(exc)},
+                {"request": request, "case": refreshed, **TEMPLATE_HELPERS, "error": str(exc)},
                 status_code=200,
             )
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -131,7 +164,7 @@ async def _case_action(
         return templates.TemplateResponse(
             request,
             "partials/case_detail.html",
-            {"request": request, "case": refreshed, "humanize": _humanize, "error": None},
+            {"request": request, "case": refreshed, **TEMPLATE_HELPERS, "error": None},
         )
     refreshed = await load_case(session, case_id)
     if not refreshed:
@@ -183,7 +216,7 @@ async def _remediation_approval_action(
             return templates.TemplateResponse(
                 request,
                 "partials/case_detail.html",
-                {"request": request, "case": refreshed, "humanize": _humanize, "error": str(exc)},
+                {"request": request, "case": refreshed, **TEMPLATE_HELPERS, "error": str(exc)},
                 status_code=200,
             )
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -194,7 +227,7 @@ async def _remediation_approval_action(
         return templates.TemplateResponse(
             request,
             "partials/case_detail.html",
-            {"request": request, "case": refreshed, "humanize": _humanize, "error": None},
+            {"request": request, "case": refreshed, **TEMPLATE_HELPERS, "error": None},
         )
     refreshed = await load_case(session, case_id)
     if not refreshed:

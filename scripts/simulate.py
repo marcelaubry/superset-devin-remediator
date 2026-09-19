@@ -18,6 +18,14 @@ SCENARIOS = {
     "triage-infeasible": "issue_triage_infeasible.json",
     "wrong-repo": "issue_wrong_repo.json",
     "missing-label": "issue_missing_label.json",
+    # Phase 2 fake Devin scenarios (issue numbers pinned in remediator.devin.fake.FIXTURE_SCENARIOS)
+    "malformed-output": "issue_malformed_output.json",
+    "missing-output": "issue_missing_output.json",
+    "uncertain-create": "issue_uncertain_create.json",
+    "quota-failure": "issue_quota_failure.json",
+    "timeout": "issue_timeout.json",
+    "unknown-status": "issue_unknown_status.json",
+    "create-rejected": "issue_create_rejected.json",
 }
 
 
@@ -77,7 +85,7 @@ def main() -> None:
             ):
                 repository = payload["repository"]["full_name"]
                 issue_number = payload["issue"]["number"]
-                for _ in range(40):
+                for _ in range(120):
                     result = client.get(
                         f"/api/cases/{repository}/{issue_number}",
                         headers={"Authorization": f"Bearer {operator_token}"},
@@ -88,11 +96,28 @@ def main() -> None:
                         "HUMAN_BLOCKED",
                         "POLICY_REJECTED",
                         "CANCELLED",
+                        "TIMED_OUT",
                     }
                     if not auto_approve:
                         terminal_states.add("AWAITING_REMEDIATION_APPROVAL")
                     if result.status_code == 200 and result.json().get("state") in terminal_states:
-                        print("timeline", result.json())
+                        summary = {
+                            key: value for key, value in result.json().items() if key != "attempts"
+                        }
+                        summary["attempts"] = [
+                            {
+                                "kind": attempt["kind"],
+                                "status": attempt["status"],
+                                "create_state": attempt["create_state"],
+                                "devin_status": attempt["devin_status"],
+                                "devin_status_detail": attempt["devin_status_detail"],
+                                "outcome": (attempt.get("structured_output") or {}).get("outcome"),
+                                "reason": attempt.get("reconciliation_reason")
+                                or attempt.get("error"),
+                            }
+                            for attempt in result.json().get("attempts", [])
+                        ]
+                        print("timeline", json.dumps(summary))
                         if result.json().get("state") == "AWAITING_REMEDIATION_APPROVAL":
                             print(
                                 "approve",
