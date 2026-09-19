@@ -6,6 +6,12 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from alembic import command
 
+# Tests never touch the real Devin API and must not inherit slow live-mode pacing.
+os.environ["DEVIN_CLIENT_MODE"] = "fake"
+os.environ["DEVIN_POLL_INTERVAL_SECONDS"] = "0"
+os.environ["DEVIN_TRIAGE_TIMEOUT_SECONDS"] = "5"
+os.environ.pop("DEVIN_API_KEY", None)
+
 
 @pytest.fixture(scope="session")
 def test_database_url() -> str:

@@ -6,7 +6,10 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from remediator.approvals import approve_remediation
 from remediator.config import Settings
+from remediator.devin.client import CreateSessionRequest, SessionSnapshot
 from remediator.devin.fake import FakeDevinClient
+from remediator.devin.tags import correlation_tags, operation_key
+from remediator.devin.triage import TRIAGE_OUTPUT_SCHEMA
 from remediator.lifecycle import CaseState, InvalidTransition, transition
 from remediator.models import (
     Attempt,
@@ -37,6 +40,22 @@ async def integration_session(test_database_url: str, database_available: bool) 
     async with factory() as session:
         yield session
     await engine.dispose()
+
+
+async def seed_remediation_session(
+    client: FakeDevinClient, case: Case, key: str
+) -> SessionSnapshot:
+    return await client.create_session(
+        CreateSessionRequest(
+            prompt="",
+            repository=case.repository,
+            base_sha="0" * 40,
+            max_acu_limit=1,
+            operation_key=key,
+            tags=correlation_tags(case.repository, case.issue_number, "REMEDIATION", case.id, "x"),
+            structured_output_schema=TRIAGE_OUTPUT_SCHEMA,
+        )
+    )
 
 
 def payload(number: int, body: str, labels: list[str]) -> dict[str, object]:
@@ -172,7 +191,7 @@ async def test_processor_triage_infeasible(integration_session: AsyncSession) ->
         (await integration_session.scalars(select(Attempt).where(Attempt.case_id == case.id))).all()
     )
     assert [attempt.kind for attempt in attempts] == [AttemptKind.TRIAGE]
-    assert "triage: remediation not feasible" in (
+    assert "triage outcome needs_human" in (
         await integration_session.scalar(
             select(StateTransition.reason)
             .where(
@@ -247,25 +266,18 @@ async def test_reconcile_remediation_create_intent(
     integration_session.add_all([event, case])
     await integration_session.flush()
     event.case_id = case.id
-    key = f"{case.id}:REMEDIATION:1"
+    key = operation_key(case.id, "REMEDIATION", 1)
     attempt = Attempt(
         case_id=case.id,
         kind=AttemptKind.REMEDIATION,
-        idempotency_key=key,
+        idempotency_key=f"{case.id}:REMEDIATION:1",
+        operation_key=key,
         status=AttemptStatus.RUNNING,
     )
     integration_session.add(attempt)
     await integration_session.commit()
     client = FakeDevinClient()
-    await client.create_session(
-        "",
-        {
-            "repository": case.repository,
-            "issue_number": str(case.issue_number),
-            "kind": "REMEDIATION",
-        },
-        idempotency_key=key,
-    )
+    await seed_remediation_session(client, case, key)
     await process_case(integration_session, case, client, Settings())
     assert case.state == CaseState.CI_PASSED
     transitions = list(
@@ -298,13 +310,16 @@ async def test_reconcile_missing_session_fails(
             case_id=case.id,
             kind=AttemptKind.REMEDIATION,
             idempotency_key=f"{case.id}:REMEDIATION:1",
+            operation_key=operation_key(case.id, "REMEDIATION", 1),
             status=AttemptStatus.RUNNING,
         )
     )
     await integration_session.commit()
-    await process_case(integration_session, case, FakeDevinClient(), Settings())
-    assert case.state == CaseState.FAILED
-    assert case.failure_reason == "create intent could not be reconciled after retry"
+    client = FakeDevinClient()
+    await process_case(integration_session, case, client, Settings(reconcile_retry_delay_seconds=0))
+    assert case.state == CaseState.HUMAN_BLOCKED
+    assert case.failure_reason and "create outcome unknown" in case.failure_reason
+    assert client.create_calls == 0
 
 
 @pytest.mark.asyncio
@@ -328,15 +343,15 @@ async def test_poll_budget_times_out(
     )
     integration_session.add(event)
     await integration_session.commit()
-    settings = Settings(devin_max_polls=2, devin_poll_interval_seconds=0)
-    await process_event(
-        integration_session, event, FakeDevinClient(never_finish_issues={4213}), settings
-    )
+    settings = Settings(devin_triage_timeout_seconds=0.05, devin_poll_interval_seconds=0)
+    client = FakeDevinClient(never_finish_issues={4213})
+    await process_event(integration_session, event, client, settings)
     case = await integration_session.scalar(select(Case).where(Case.issue_number == 4213))
     assert case and case.state == CaseState.TIMED_OUT
     attempt = await integration_session.scalar(select(Attempt).where(Attempt.case_id == case.id))
-    assert attempt and attempt.status == AttemptStatus.CANCELLED
-    assert attempt.error == "poll budget exhausted"
+    assert attempt and attempt.status == AttemptStatus.TIMED_OUT
+    assert attempt.error and "session terminated remotely" in attempt.error
+    assert client.terminate_calls == [attempt.devin_session_id]
 
 
 @pytest.mark.asyncio
@@ -410,40 +425,33 @@ async def test_reconcile_retries_missing_session(
     )
     integration_session.add(case)
     await integration_session.flush()
-    key = f"{case.id}:REMEDIATION:1"
+    key = operation_key(case.id, "REMEDIATION", 1)
     integration_session.add(
         Attempt(
             case_id=case.id,
             kind=AttemptKind.REMEDIATION,
-            idempotency_key=key,
+            idempotency_key=f"{case.id}:REMEDIATION:1",
+            operation_key=key,
             status=AttemptStatus.RUNNING,
         )
     )
     await integration_session.commit()
 
     client = FakeDevinClient()
-    await client.create_session(
-        "",
-        {
-            "repository": case.repository,
-            "issue_number": str(case.issue_number),
-            "kind": "REMEDIATION",
-        },
-        idempotency_key=key,
-    )
+    await seed_remediation_session(client, case, key)
 
     class RetryClient(FakeDevinClient):
         def __init__(self, source: FakeDevinClient) -> None:
             super().__init__()
             self._sessions = source._sessions
-            self._idempotency = source._idempotency
+            self._by_operation = source._by_operation
             self.calls = 0
 
-        async def find_session(self, idempotency_key: str):
+        async def find_sessions_by_tag(self, tag: str) -> list[SessionSnapshot]:
             self.calls += 1
             if self.calls == 1:
-                return None
-            return await super().find_session(idempotency_key)
+                return []
+            return await super().find_sessions_by_tag(tag)
 
     retry_client = RetryClient(client)
     await process_case(
@@ -477,15 +485,16 @@ async def test_create_orphan_is_terminated(
     terminated: list[str] = []
     original_create = client.create_session
 
-    async def create_and_steal(prompt, tags, idempotency_key):
-        created = await original_create(prompt, tags, idempotency_key)
+    async def create_and_steal(request: CreateSessionRequest) -> SessionSnapshot:
+        created = await original_create(request)
         async with integration_session_factory() as other:
             await other.execute(update(Case).where(Case.id == case_id).values(claimed_by="other"))
             await other.commit()
         return created
 
-    async def terminate(session_id: str) -> None:
+    async def terminate(session_id: str) -> SessionSnapshot | None:
         terminated.append(session_id)
+        return None
 
     client.create_session = create_and_steal
     client.terminate_session = terminate

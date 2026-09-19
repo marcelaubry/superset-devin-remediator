@@ -12,9 +12,29 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..config import Settings
 from ..db import build_engine, build_session_factory
 from ..devin import build_devin_client
+from ..github_refs import build_base_commit_resolver
 from ..lifecycle import CaseState, InvalidTransition
-from ..models import Attempt, AttemptStatus, Case, EventStatus, WebhookEvent
+from ..models import (
+    ACTIVE_ATTEMPT_STATUSES,
+    Attempt,
+    AttemptStatus,
+    Case,
+    EventStatus,
+    WebhookEvent,
+)
 from .processor import _terminate_running_attempts, fail_case, process_case, process_event
+
+CLAIMABLE_STATES = frozenset(
+    {
+        CaseState.RECEIVED,
+        CaseState.TRIAGE_CREATE_INTENT,
+        CaseState.TRIAGING,
+        CaseState.RECONCILING_CREATE,
+        CaseState.REMEDIATION_CREATE_INTENT,
+        CaseState.REMEDIATING,
+        CaseState.TERMINATION_PENDING,
+    }
+)
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +45,7 @@ class Worker:
         self.engine = build_engine(settings)
         self.session_factory = build_session_factory(self.engine)
         self.devin = build_devin_client(settings)
+        self.base_commits = build_base_commit_resolver(settings)
         self.stop_event = asyncio.Event()
         self.worker_id = f"{socket.gethostname()}:{os.getpid()}:{uuid4().hex[:6]}"
 
@@ -93,14 +114,7 @@ class Worker:
                 case = await session.scalar(
                     select(Case)
                     .where(
-                        Case.state.in_(
-                            {
-                                CaseState.RECEIVED,
-                                CaseState.REMEDIATION_CREATE_INTENT,
-                                CaseState.TERMINATION_PENDING,
-                                CaseState.TRIAGE_CREATE_INTENT,
-                            }
-                        ),
+                        Case.state.in_(CLAIMABLE_STATES),
                         (Case.lease_expires_at.is_(None) | (Case.lease_expires_at < now)),
                         ~active_event,
                     )
@@ -127,12 +141,26 @@ class Worker:
 
     async def _release_case(self, case_id: object) -> None:
         async with self.session_factory() as session:
+            state = await session.scalar(select(Case.state).where(Case.id == case_id))
+            backoff: datetime | None = None
+            if state == CaseState.TERMINATION_PENDING:
+                backoff = datetime.now(UTC) + timedelta(
+                    seconds=self.settings.devin_poll_interval_seconds
+                )
             await session.execute(
                 update(Case)
                 .where(Case.id == case_id, Case.claimed_by == self.worker_id)
-                .values(claimed_by=None, lease_expires_at=None)
+                .values(claimed_by=None, lease_expires_at=backoff)
             )
             await session.commit()
+
+    async def _release_event_case(self, event_id: object) -> None:
+        async with self.session_factory() as session:
+            case_id = await session.scalar(
+                select(WebhookEvent.case_id).where(WebhookEvent.id == event_id)
+            )
+        if case_id is not None:
+            await self._release_case(case_id)
 
     async def _heartbeat(
         self, case_id: object | None = None, event_id: object | None = None
@@ -182,26 +210,64 @@ class Worker:
                     fresh = await session.get(WebhookEvent, event.id)
                     if fresh:
                         await process_event(
-                            session, fresh, self.devin, self.settings, self.worker_id
+                            session,
+                            fresh,
+                            self.devin,
+                            self.settings,
+                            self.worker_id,
+                            self.base_commits,
                         )
                         logger.info("processed webhook %s", fresh.delivery_id)
                 elif case:
                     fresh_case = await session.get(Case, case.id)
                     if fresh_case:
                         await process_case(
-                            session, fresh_case, self.devin, self.settings, self.worker_id
+                            session,
+                            fresh_case,
+                            self.devin,
+                            self.settings,
+                            self.worker_id,
+                            self.base_commits,
                         )
                         logger.info("processed case %s in %s", case.id, fresh_case.state)
         finally:
             heartbeat.cancel()
             await asyncio.gather(heartbeat, return_exceptions=True)
 
+    async def _cancel_unsent_attempts(self, session: AsyncSession, case_id: object) -> None:
+        """Cancel active attempts that never sent a create.
+
+        Attempts whose create was sent may own a live Devin session; they are left
+        active so the case's current owner (or TERMINATION_PENDING recovery) can
+        terminate or resume them instead of orphaning the session.
+        """
+        attempts = list(
+            (
+                await session.scalars(
+                    select(Attempt).where(
+                        Attempt.case_id == case_id,
+                        Attempt.status.in_(ACTIVE_ATTEMPT_STATUSES),
+                        Attempt.create_sent_at.is_(None),
+                    )
+                )
+            ).all()
+        )
+        for attempt in attempts:
+            attempt.status = AttemptStatus.CANCELLED
+            attempt.error = "case changed concurrently"
+            attempt.finished_at = datetime.now(UTC)
+
     async def _mark_failed(
         self, session: AsyncSession, case_id: object, error: str, claimed_by: str | None = None
     ) -> None:
         case = await session.get(Case, case_id)
-        if case:
-            await fail_case(session, case, error, "worker", claimed_by)
+        if case is None:
+            return
+        try:
+            async with session.begin_nested():
+                await fail_case(session, case, error, "worker", claimed_by)
+        except InvalidTransition as exc:
+            logger.warning("could not record failure for case %s: %s", case_id, exc)
 
     async def _run_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -222,37 +288,11 @@ class Worker:
                             fresh.last_error = str(exc)
                             fresh.processed_at = datetime.now(UTC)
                             if fresh.case_id:
-                                attempts = list(
-                                    (
-                                        await session.scalars(
-                                            select(Attempt).where(
-                                                Attempt.case_id == fresh.case_id,
-                                                Attempt.status == AttemptStatus.RUNNING,
-                                            )
-                                        )
-                                    ).all()
-                                )
-                                for attempt in attempts:
-                                    attempt.status = AttemptStatus.CANCELLED
-                                    attempt.error = "case changed concurrently"
-                                    attempt.finished_at = datetime.now(UTC)
+                                await self._cancel_unsent_attempts(session, fresh.case_id)
                             await session.commit()
                 elif case:
                     async with self.session_factory() as session:
-                        attempts = list(
-                            (
-                                await session.scalars(
-                                    select(Attempt).where(
-                                        Attempt.case_id == case.id,
-                                        Attempt.status == AttemptStatus.RUNNING,
-                                    )
-                                )
-                            ).all()
-                        )
-                        for attempt in attempts:
-                            attempt.status = AttemptStatus.CANCELLED
-                            attempt.error = "case changed concurrently"
-                            attempt.finished_at = datetime.now(UTC)
+                        await self._cancel_unsent_attempts(session, case.id)
                         await session.commit()
                     await self._release_case(case.id)
             except Exception as exc:
@@ -275,6 +315,7 @@ class Worker:
                         await session.commit()
             finally:
                 if event:
+                    await self._release_event_case(event.id)
                     await self._release_event(event.id)
                 if case:
                     await self._release_case(case.id)
@@ -295,6 +336,7 @@ class Worker:
                 await asyncio.gather(*tasks, return_exceptions=True)
         finally:
             await self.devin.aclose()
+            await self.base_commits.aclose()
             await self.engine.dispose()
 
     def stop(self) -> None:

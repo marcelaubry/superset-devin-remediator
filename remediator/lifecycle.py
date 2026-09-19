@@ -134,18 +134,28 @@ TRANSITIONS: dict[CaseState, frozenset[CaseState]] = {
             CaseState.CANCELLED,
             CaseState.FAILED,
             CaseState.RECEIVED,
+            CaseState.TERMINATION_PENDING,
         }
     ),
     CaseState.RECONCILING_CREATE: frozenset(
         {
             CaseState.TRIAGING,
             CaseState.REMEDIATING,
+            CaseState.HUMAN_BLOCKED,
             CaseState.FAILED,
             CaseState.CANCELLED,
             CaseState.TERMINATION_PENDING,
         }
     ),
-    CaseState.TERMINATION_PENDING: frozenset({CaseState.CANCELLED, CaseState.FAILED}),
+    CaseState.TERMINATION_PENDING: frozenset(
+        {
+            CaseState.TIMED_OUT,
+            CaseState.TRIAGED,
+            CaseState.HUMAN_BLOCKED,
+            CaseState.CANCELLED,
+            CaseState.FAILED,
+        }
+    ),
     CaseState.TIMED_OUT: frozenset({CaseState.RECEIVED, CaseState.REMEDIATION_CREATE_INTENT}),
     CaseState.POLICY_REJECTED: frozenset(),
     CaseState.FAILED: frozenset({CaseState.RECEIVED, CaseState.REMEDIATION_CREATE_INTENT}),
