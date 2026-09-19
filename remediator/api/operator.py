@@ -13,7 +13,7 @@ from ..db import get_session
 from ..lifecycle import CaseState, InvalidTransition, transition
 from ..models import Case
 from .auth import require_operator
-from .dashboard import templates
+from .dashboard import _humanize, load_case, templates
 
 router = APIRouter()
 
@@ -64,18 +64,29 @@ async def _case_action(
     except InvalidTransition as exc:
         await session.rollback()
         if request.headers.get("HX-Request") == "true":
+            refreshed = await load_case(session, case_id)
+            if not refreshed:
+                raise HTTPException(status_code=404, detail="case not found") from exc
             return templates.TemplateResponse(
                 request,
-                "partials/case_status.html",
-                {"request": request, "case": case, "error": str(exc)},
+                "partials/case_detail.html",
+                {"request": request, "case": refreshed, "humanize": _humanize, "error": str(exc)},
                 status_code=200,
             )
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     if request.headers.get("HX-Request") == "true":
+        refreshed = await load_case(session, case_id)
+        if not refreshed:
+            raise HTTPException(status_code=404, detail="case not found")
         return templates.TemplateResponse(
-            request, "partials/case_status.html", {"request": request, "case": case, "error": None}
+            request,
+            "partials/case_detail.html",
+            {"request": request, "case": refreshed, "humanize": _humanize, "error": None},
         )
-    return {"id": str(case.id), "state": case.state}
+    refreshed = await load_case(session, case_id)
+    if not refreshed:
+        raise HTTPException(status_code=404, detail="case not found")
+    return {"id": str(refreshed.id), "state": refreshed.state}
 
 
 @router.post("/operator/cases/{case_id}/retry")
@@ -116,18 +127,29 @@ async def _remediation_approval_action(
     except InvalidTransition as exc:
         await session.rollback()
         if request.headers.get("HX-Request") == "true":
+            refreshed = await load_case(session, case_id)
+            if not refreshed:
+                raise HTTPException(status_code=404, detail="case not found") from exc
             return templates.TemplateResponse(
                 request,
-                "partials/case_status.html",
-                {"request": request, "case": case, "error": str(exc)},
+                "partials/case_detail.html",
+                {"request": request, "case": refreshed, "humanize": _humanize, "error": str(exc)},
                 status_code=200,
             )
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     if request.headers.get("HX-Request") == "true":
+        refreshed = await load_case(session, case_id)
+        if not refreshed:
+            raise HTTPException(status_code=404, detail="case not found")
         return templates.TemplateResponse(
-            request, "partials/case_status.html", {"request": request, "case": case, "error": None}
+            request,
+            "partials/case_detail.html",
+            {"request": request, "case": refreshed, "humanize": _humanize, "error": None},
         )
-    return {"id": str(case.id), "state": case.state}
+    refreshed = await load_case(session, case_id)
+    if not refreshed:
+        raise HTTPException(status_code=404, detail="case not found")
+    return {"id": str(refreshed.id), "state": refreshed.state}
 
 
 @router.post("/operator/cases/{case_id}/approve-remediation")

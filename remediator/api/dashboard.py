@@ -1,5 +1,6 @@
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import cast
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -27,6 +28,17 @@ def _humanize(value: datetime | None) -> str:
     if seconds < 3600:
         return f"{seconds // 60}m"
     return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
+
+
+async def load_case(session: AsyncSession, case_id: UUID) -> Case | None:
+    return cast(
+        Case | None,
+        await session.scalar(
+            select(Case)
+            .options(selectinload(Case.attempts), selectinload(Case.transitions))
+            .where(Case.id == case_id)
+        ),
+    )
 
 
 async def _context(session: AsyncSession) -> dict[str, object]:
@@ -123,15 +135,28 @@ async def case_detail(
     _: str = Depends(require_operator),
     session: AsyncSession = Depends(get_session),
 ) -> HTMLResponse:
-    case = await session.scalar(
-        select(Case)
-        .options(selectinload(Case.attempts), selectinload(Case.transitions))
-        .where(Case.id == case_id)
-    )
+    case = await load_case(session, case_id)
     if not case:
         raise HTTPException(status_code=404, detail="case not found")
     return templates.TemplateResponse(
         request, "case.html", {"request": request, "case": case, "humanize": _humanize}
+    )
+
+
+@router.get("/partials/case/{case_id}", response_class=HTMLResponse)
+async def case_detail_partial(
+    case_id: UUID,
+    request: Request,
+    _: str = Depends(require_operator),
+    session: AsyncSession = Depends(get_session),
+) -> HTMLResponse:
+    case = await load_case(session, case_id)
+    if not case:
+        raise HTTPException(status_code=404, detail="case not found")
+    return templates.TemplateResponse(
+        request,
+        "partials/case_detail.html",
+        {"request": request, "case": case, "humanize": _humanize, "error": None},
     )
 
 
@@ -150,6 +175,7 @@ async def partial(
         "timeline",
         "overview",
         "throughput",
+        "cases",
     }:
         raise HTTPException(status_code=404, detail="partial not found")
     return templates.TemplateResponse(

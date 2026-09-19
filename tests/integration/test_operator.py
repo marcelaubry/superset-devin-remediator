@@ -68,11 +68,18 @@ async def test_operator_retry_cancel_and_case_auth(
         hx_headers = {**headers, "HX-Request": "true"}
         hx_retry = await client.post(f"/operator/cases/{blocked_id}/retry", headers=hx_headers)
         assert hx_retry.status_code == 200
-        assert '<section id="case-status">' in hx_retry.text
+        assert "Elapsed in stage:" in hx_retry.text
 
         hx_cancel = await client.post(f"/operator/cases/{blocked_id}/cancel", headers=hx_headers)
         assert hx_cancel.status_code == 200
         assert "CANCELLED" in hx_cancel.text
+
+        hx_terminal_cancel = await client.post(
+            f"/operator/cases/{passed_id}/cancel", headers=hx_headers
+        )
+        assert hx_terminal_cancel.status_code == 200
+        assert "CI_PASSED cannot transition to CANCELLED" in hx_terminal_cancel.text
+        assert 'role="alert"' in hx_terminal_cancel.text
 
         approve = await client.post(
             f"/operator/cases/{approval_id}/approve-remediation", headers=headers
@@ -126,6 +133,18 @@ async def test_dashboard_auth_health_metrics_detail_and_throughput(
         detail = await client.get(f"/cases/{case_id}", headers={"Authorization": "Bearer operator"})
         assert detail.status_code == 200
         assert "Scope is bounded." in detail.text
+
+        detail_partial = await client.get(
+            f"/partials/case/{case_id}", headers={"Authorization": "Bearer operator"}
+        )
+        assert detail_partial.status_code == 200
+        assert "Age:" in detail_partial.text
+
+        cases_partial = await client.get(
+            "/partials/cases", headers={"Authorization": "Bearer operator"}
+        )
+        assert cases_partial.status_code == 200
+        assert f"/cases/{case_id}" in cases_partial.text
 
         throughput = await client.get(
             "/partials/throughput", headers={"Authorization": "Bearer operator"}
