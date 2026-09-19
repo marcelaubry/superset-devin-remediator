@@ -10,6 +10,7 @@ from ..config import Settings, get_settings
 from ..db import get_session
 from ..github.signature import verify_signature
 from ..models import EventStatus, WebhookEvent
+from .metrics import webhook_requests_total
 
 router = APIRouter()
 
@@ -31,24 +32,35 @@ async def github_webhook(
 ) -> JSONResponse:
     body = await request.body()
     if not verify_signature(settings.github_webhook_secret, body, x_hub_signature_256):
+        webhook_requests_total.labels(result="invalid_signature").inc()
         return JSONResponse({"detail": "invalid signature"}, status_code=401)
     if not x_github_delivery:
+        webhook_requests_total.labels(result="bad_request").inc()
         return JSONResponse({"detail": "missing delivery id"}, status_code=400)
     if not x_github_event:
+        webhook_requests_total.labels(result="bad_request").inc()
         return JSONResponse({"detail": "missing event type"}, status_code=400)
     try:
-        payload: dict[str, Any] = json.loads(body)
+        parsed = json.loads(body)
     except json.JSONDecodeError:
+        webhook_requests_total.labels(result="bad_request").inc()
         return JSONResponse({"detail": "invalid JSON"}, status_code=400)
+    if not isinstance(parsed, dict):
+        webhook_requests_total.labels(result="bad_request").inc()
+        return JSONResponse({"detail": "payload must be a JSON object"}, status_code=400)
+    payload: dict[str, Any] = parsed
     action = str(payload.get("action", ""))
     repository = payload.get("repository", {}).get("full_name")
     if repository != settings.github_repository:
+        webhook_requests_total.labels(result="filtered").inc()
         return JSONResponse(
             {"accepted": False, "reason": "repository not allowed"}, status_code=202
         )
     if x_github_event not in settings.allowed_events:
+        webhook_requests_total.labels(result="filtered").inc()
         return JSONResponse({"accepted": False, "reason": "event not allowed"}, status_code=202)
     if action not in settings.allowed_actions:
+        webhook_requests_total.labels(result="filtered").inc()
         return JSONResponse({"accepted": False, "reason": "action not allowed"}, status_code=202)
     required = settings.github_required_label.lower()
     if (
@@ -59,6 +71,7 @@ async def github_webhook(
             and str(payload.get("label", {}).get("name", "")).lower() == required
         )
     ):
+        webhook_requests_total.labels(result="filtered").inc()
         return JSONResponse(
             {"accepted": False, "reason": "required label missing"}, status_code=202
         )
@@ -76,7 +89,9 @@ async def github_webhook(
         await session.commit()
     except IntegrityError:
         await session.rollback()
+        webhook_requests_total.labels(result="deduplicated").inc()
         return JSONResponse({"accepted": True, "deduplicated": True}, status_code=202)
+    webhook_requests_total.labels(result="accepted").inc()
     return JSONResponse(
         {"accepted": True, "delivery_id": x_github_delivery, "deduplicated": False}, status_code=202
     )

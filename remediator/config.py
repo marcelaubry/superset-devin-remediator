@@ -13,9 +13,16 @@ class Settings(BaseSettings):
     github_required_label: str = "devin-candidate"
     worker_poll_interval_seconds: float = 1.0
     worker_concurrency: int = 2
+    worker_lease_seconds: int = 300
+    worker_shutdown_timeout_seconds: int = 30
+    event_max_attempts: int = 3
     devin_client: str = "fake"
+    devin_poll_interval_seconds: float = 0.01
+    devin_max_polls: int = 5
+    max_attempts_per_kind: int = 3
     log_level: str = "INFO"
     simulation_auto_approve_remediation: bool = True
+    cookie_secure: bool = False
 
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=False, extra="ignore")
 

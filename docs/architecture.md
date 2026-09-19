@@ -25,6 +25,7 @@ flowchart LR
   DB --> UI[Operator browser dashboard]
   DB --> O[Notification outbox]
   O -. Phase 2 dispatcher .-> SL[Slack]
+  SL -. human approval .-> API
   GH -. audit ledger .- UI
 ```
 
@@ -84,9 +85,9 @@ stateDiagram-v2
   CI_PENDING --> FAILED
   CI_PENDING --> CANCELLED
   CI_PENDING --> TERMINATION_PENDING
-  HUMAN_BLOCKED --> TRIAGING
-  HUMAN_BLOCKED --> REMEDIATING
   HUMAN_BLOCKED --> RECEIVED
+  HUMAN_BLOCKED --> CANCELLED
+  HUMAN_BLOCKED --> FAILED
   FAILED --> RECEIVED
   TIMED_OUT --> RECEIVED
   TERMINATION_PENDING --> CANCELLED
@@ -134,17 +135,28 @@ worker processing inline.
 
 ## Worker claiming and failure isolation
 
-The worker first claims one `PENDING` webhook event, then a case in `RECEIVED`
-or `REMEDIATION_CREATE_INTENT` whose state is older than the polling interval
-and has no related pending/processing event. Each claim uses
-`SELECT ... FOR UPDATE SKIP LOCKED`, which provides queue-like concurrency
-without introducing Redis or another queue service. The claim is committed
-before processing so another worker cannot take it.
+The worker first claims one `PENDING` webhook event, or reclaims a
+`PROCESSING` event whose lease expired. It then claims cases in
+`RECEIVED`, `TRIAGE_CREATE_INTENT`, `REMEDIATION_CREATE_INTENT`, or
+`TERMINATION_PENDING` when their case lease is free or expired and no related
+event is pending (or processing with an unexpired lease). Each claim uses
+`SELECT ... FOR UPDATE SKIP LOCKED`, records a worker id and lease, and
+commits before processing. This provides queue-like concurrency without
+introducing Redis or another queue service.
+
+State writes are guarded by `UPDATE ... WHERE state = expected_state`; a
+concurrent operator or worker therefore cannot overwrite a newer state. Devin
+CREATE_INTENT attempts have durable idempotency keys and are reconciled after
+a crash. A lease is released after success, failure, or a concurrent-change
+abandonment. If a process stops, in-flight jobs are drained for up to the
+configured shutdown timeout; anything longer is reclaimed after lease expiry.
 
 Webhook and case processing are isolated in their own transactions. Exceptions
 mark the event or case failed and are logged; the loop continues to process
-other work. On SIGTERM or SIGINT, loops stop, tasks are cancelled and awaited,
-the Devin client closes, and the database engine is disposed.
+other work. Invalid concurrent transitions are logged at INFO and do not fail
+the case. On SIGTERM or SIGINT, loops stop after their current job, in-flight
+tasks are drained up to the configured timeout, then cancelled if necessary;
+the Devin client closes and the database engine is disposed.
 
 ## Security boundaries
 
@@ -164,6 +176,6 @@ the Devin client closes, and the database engine is disposed.
 - **GitHub App writes:** publish comments, branches, pull requests, and statuses.
 - **Slack dispatcher:** dispatch pending outbox rows and retry delivery.
 - **Slack approval interactivity:** call the existing approval service from Slack.
-- **Intent reconciliation:** recover uncertain CREATE_INTENT operations and apply stage deadlines to `TIMED_OUT`.
+- **Stage deadline reconciliation:** apply longer-lived stage deadlines and operational escalation to `TIMED_OUT`.
 - **CI webhook ingestion:** advance `CI_PENDING` from GitHub CI events.
 - **Retention and cleanup:** expire old payloads, attempts, and notification records.

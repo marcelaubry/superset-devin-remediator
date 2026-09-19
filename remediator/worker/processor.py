@@ -3,13 +3,13 @@ import logging
 from datetime import UTC, datetime
 from typing import Any, cast
 
-from sqlalchemy import desc, select
+from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..approvals import approve_remediation
 from ..config import Settings
 from ..devin.client import DevinClient, DevinSession
-from ..lifecycle import CaseState, transition
+from ..lifecycle import TERMINAL_STATES, CaseState, transition
 from ..models import (
     Attempt,
     AttemptKind,
@@ -26,36 +26,113 @@ from ..rubric import IssueSnapshot, evaluate
 logger = logging.getLogger(__name__)
 
 
+async def fail_case(session: AsyncSession, case: Case, reason: str, actor: str) -> None:
+    case.failure_reason = reason
+    if CaseState(case.state) not in TERMINAL_STATES:
+        await transition(session, case, CaseState.FAILED, reason, actor)
+        session.add(
+            NotificationOutbox(
+                case_id=case.id,
+                channel=OutboxChannel.GITHUB,
+                kind="case_failed",
+                payload={"issue_number": case.issue_number, "reason": reason},
+            )
+        )
+
+
+async def _timeout_case(session: AsyncSession, case: Case, budget: int) -> None:
+    reason = f"Devin poll budget exhausted after {budget} polls"
+    await transition(session, case, CaseState.TIMED_OUT, reason, "worker")
+    session.add(
+        NotificationOutbox(
+            case_id=case.id,
+            channel=OutboxChannel.GITHUB,
+            kind="case_timed_out",
+            payload={"issue_number": case.issue_number, "reason": reason},
+        )
+    )
+
+
 async def _run_devin(
     session: AsyncSession, case: Case, devin: DevinClient, kind: AttemptKind, settings: Settings
 ) -> DevinSession:
+    target_state = CaseState.TRIAGING if kind == AttemptKind.TRIAGE else CaseState.REMEDIATING
     prompt = f"{kind.value.lower()} issue #{case.issue_number}: {case.issue_title}"
-    created = await devin.create_session(
-        prompt,
-        {"repository": case.repository, "issue_number": str(case.issue_number), "kind": kind.value},
+    attempt = await session.scalar(
+        select(Attempt)
+        .where(Attempt.case_id == case.id, Attempt.kind == kind)
+        .order_by(desc(Attempt.started_at))
+        .limit(1)
     )
-    attempt = Attempt(
-        case_id=case.id,
-        kind=kind,
-        devin_session_id=created.session_id,
-        status=AttemptStatus.RUNNING,
-    )
-    session.add(attempt)
-    case.devin_session_id = created.session_id
-    case.devin_session_url = created.url
-    await session.commit()
-    current = created
-    for _ in range(5):
-        current = await devin.get_session(created.session_id)
+    if attempt and attempt.status == AttemptStatus.RUNNING and attempt.devin_session_id is None:
+        await transition(
+            session, case, CaseState.RECONCILING_CREATE, "reconciling Devin create", "worker"
+        )
+        await session.commit()
+        current = await devin.find_session(attempt.idempotency_key)
+        if current is None:
+            attempt.status = AttemptStatus.FAILED
+            attempt.error = "create intent could not be reconciled"
+            attempt.finished_at = datetime.now(UTC)
+            await fail_case(session, case, attempt.error, "worker")
+            await session.commit()
+            return DevinSession("", "", "failed", error=attempt.error)
+        attempt.devin_session_id = current.session_id
+        case.devin_session_id = current.session_id
+        case.devin_session_url = current.url
+        await transition(session, case, target_state, "Devin session reconciled", "worker")
+        await session.commit()
+    elif attempt and attempt.status == AttemptStatus.RUNNING and attempt.devin_session_id:
+        current = await devin.get_session(attempt.devin_session_id)
+    else:
+        count = await session.scalar(
+            select(func.count())
+            .select_from(Attempt)
+            .where(Attempt.case_id == case.id, Attempt.kind == kind)
+        )
+        if count is None or count >= settings.max_attempts_per_kind:
+            reason = "attempt cap reached"
+            await fail_case(session, case, reason, "worker")
+            await session.commit()
+            return DevinSession("", "", "failed", error=reason)
+        idempotency_key = f"{case.id}:{kind.value}:{int(count) + 1}"
+        attempt = Attempt(
+            case_id=case.id,
+            kind=kind,
+            idempotency_key=idempotency_key,
+            devin_session_id=None,
+            status=AttemptStatus.RUNNING,
+        )
+        session.add(attempt)
+        await session.commit()
+        current = await devin.create_session(
+            prompt,
+            {
+                "repository": case.repository,
+                "issue_number": str(case.issue_number),
+                "kind": kind.value,
+            },
+            idempotency_key=idempotency_key,
+        )
+        attempt.devin_session_id = current.session_id
+        case.devin_session_id = current.session_id
+        case.devin_session_url = current.url
+        await transition(session, case, target_state, "Devin session created", "worker")
+        await session.commit()
+
+    for _ in range(settings.devin_max_polls):
         if current.status != "working":
             break
-        await asyncio.sleep(0.01)
+        current = await devin.get_session(current.session_id)
+        if current.status != "working":
+            break
+        await asyncio.sleep(settings.devin_poll_interval_seconds)
+
     if current.status == "failed":
         attempt.status = AttemptStatus.FAILED
         attempt.error = current.error
         attempt.finished_at = datetime.now(UTC)
-        case.failure_reason = current.error
-        await transition(session, case, CaseState.FAILED, current.error or "Devin failed", "worker")
+        await fail_case(session, case, current.error or "Devin failed", "worker")
         await session.commit()
     elif current.status == "blocked":
         attempt.status = AttemptStatus.BLOCKED
@@ -72,9 +149,16 @@ async def _run_devin(
             )
         )
         await session.commit()
-    else:
+    elif current.status == "finished":
         attempt.status = AttemptStatus.SUCCEEDED
         attempt.finished_at = datetime.now(UTC)
+        await session.commit()
+    else:
+        await devin.terminate_session(current.session_id)
+        attempt.status = AttemptStatus.CANCELLED
+        attempt.error = "poll budget exhausted"
+        attempt.finished_at = datetime.now(UTC)
+        await _timeout_case(session, case, settings.devin_max_polls)
         await session.commit()
     return current
 
@@ -91,53 +175,9 @@ async def _source_issue(session: AsyncSession, case: Case) -> dict[str, Any]:
     return cast(dict[str, Any], source_event.payload.get("issue", {}))
 
 
-async def _process_eligibility_and_triage(
-    session: AsyncSession, case: Case, devin: DevinClient, settings: Settings
+async def _finish_triage(
+    session: AsyncSession, case: Case, triage: DevinSession, settings: Settings
 ) -> None:
-    issue = await _source_issue(session, case)
-    result = evaluate(
-        IssueSnapshot(
-            str(issue.get("title", "")),
-            str(issue.get("body", "")),
-            [str(label.get("name", "")) for label in issue.get("labels", [])],
-        )
-    )
-    case.recommendation = result.recommendation
-    case.rubric = [
-        {"name": check.name, "passed": check.passed, "reason": check.reason}
-        for check in result.checks
-    ]
-    await transition(
-        session,
-        case,
-        CaseState.ELIGIBILITY_EVALUATED,
-        "; ".join(f"{c.name}: {c.reason}" for c in result.checks),
-        "worker",
-    )
-    await session.commit()
-    if result.recommendation != Recommendation.ELIGIBLE_FOR_DEVIN_TRIAGE:
-        await transition(
-            session,
-            case,
-            CaseState.POLICY_REJECTED,
-            f"recommendation {result.recommendation.value}",
-            "worker",
-        )
-        session.add(
-            NotificationOutbox(
-                case_id=case.id,
-                channel=OutboxChannel.GITHUB,
-                kind="eligibility_rejected",
-                payload={"recommendation": result.recommendation.value},
-            )
-        )
-        await session.commit()
-        return
-
-    await transition(session, case, CaseState.TRIAGE_CREATE_INTENT, "triage requested", "worker")
-    await session.commit()
-    await transition(session, case, CaseState.TRIAGING, "triage session created", "worker")
-    triage = await _run_devin(session, case, devin, AttemptKind.TRIAGE, settings)
     if triage.status != "finished":
         return
     await transition(session, case, CaseState.TRIAGED, "triage finished", "worker")
@@ -157,8 +197,6 @@ async def _process_eligibility_and_triage(
         )
         await session.commit()
         return
-
-    await session.commit()
     session.add(
         NotificationOutbox(
             case_id=case.id,
@@ -185,10 +223,60 @@ async def _process_eligibility_and_triage(
         await session.commit()
 
 
+async def _process_eligibility_and_triage(
+    session: AsyncSession, case: Case, devin: DevinClient, settings: Settings
+) -> None:
+    if CaseState(case.state) == CaseState.RECEIVED:
+        issue = await _source_issue(session, case)
+        result = evaluate(
+            IssueSnapshot(
+                str(issue.get("title", "")),
+                str(issue.get("body", "")),
+                [str(label.get("name", "")) for label in issue.get("labels", [])],
+            )
+        )
+        case.recommendation = result.recommendation
+        case.rubric = [
+            {"name": check.name, "passed": check.passed, "reason": check.reason}
+            for check in result.checks
+        ]
+        await transition(
+            session,
+            case,
+            CaseState.ELIGIBILITY_EVALUATED,
+            "; ".join(f"{c.name}: {c.reason}" for c in result.checks),
+            "worker",
+        )
+        await session.commit()
+        if result.recommendation != Recommendation.ELIGIBLE_FOR_DEVIN_TRIAGE:
+            await transition(
+                session,
+                case,
+                CaseState.POLICY_REJECTED,
+                f"recommendation {result.recommendation.value}",
+                "worker",
+            )
+            session.add(
+                NotificationOutbox(
+                    case_id=case.id,
+                    channel=OutboxChannel.GITHUB,
+                    kind="eligibility_rejected",
+                    payload={"recommendation": result.recommendation.value},
+                )
+            )
+            await session.commit()
+            return
+        await transition(
+            session, case, CaseState.TRIAGE_CREATE_INTENT, "triage requested", "worker"
+        )
+        await session.commit()
+    triage = await _run_devin(session, case, devin, AttemptKind.TRIAGE, settings)
+    await _finish_triage(session, case, triage, settings)
+
+
 async def _process_remediation(
     session: AsyncSession, case: Case, devin: DevinClient, settings: Settings
 ) -> None:
-    await transition(session, case, CaseState.REMEDIATING, "remediation session created", "worker")
     remediation = await _run_devin(session, case, devin, AttemptKind.REMEDIATION, settings)
     if remediation.status != "finished":
         return
@@ -198,12 +286,15 @@ async def _process_remediation(
     await session.commit()
     pr_url = (remediation.output or {}).get("pr_url")
     if not isinstance(pr_url, str) or not pr_url:
-        case.failure_reason = "missing pr_url in structured output"
-        await transition(session, case, CaseState.FAILED, case.failure_reason, "worker")
+        reason = "missing pr_url in structured output"
+        await fail_case(session, case, reason, "worker")
         await session.commit()
         return
     case.pr_url = pr_url
-    case.pr_number = int(pr_url.rsplit("/", 1)[-1])
+    try:
+        case.pr_number = int(pr_url.rsplit("/", 1)[-1])
+    except ValueError:
+        case.pr_number = None
     await transition(
         session, case, CaseState.PR_VALIDATED, "structured PR output validated", "worker"
     )
@@ -223,13 +314,36 @@ async def _process_remediation(
     await session.commit()
 
 
+async def _terminate_case(session: AsyncSession, case: Case, devin: DevinClient) -> None:
+    attempts = list(
+        (
+            await session.scalars(
+                select(Attempt).where(
+                    Attempt.case_id == case.id, Attempt.status == AttemptStatus.RUNNING
+                )
+            )
+        ).all()
+    )
+    for attempt in attempts:
+        if attempt.devin_session_id:
+            await devin.terminate_session(attempt.devin_session_id)
+        attempt.status = AttemptStatus.CANCELLED
+        attempt.error = "operator requested cancel"
+        attempt.finished_at = datetime.now(UTC)
+    await transition(session, case, CaseState.CANCELLED, "operator requested cancel", "worker")
+    await session.commit()
+
+
 async def process_case(
     session: AsyncSession, case: Case, devin: DevinClient, settings: Settings
 ) -> None:
-    if CaseState(case.state) == CaseState.RECEIVED:
+    state = CaseState(case.state)
+    if state in {CaseState.RECEIVED, CaseState.TRIAGE_CREATE_INTENT}:
         await _process_eligibility_and_triage(session, case, devin, settings)
     if CaseState(case.state) == CaseState.REMEDIATION_CREATE_INTENT:
         await _process_remediation(session, case, devin, settings)
+    if CaseState(case.state) == CaseState.TERMINATION_PENDING:
+        await _terminate_case(session, case, devin)
 
 
 async def process_event(
@@ -250,8 +364,22 @@ async def process_event(
             state=CaseState.RECEIVED,
         )
         session.add(case)
-        await session.flush()
-    elif CaseState(case.state) != CaseState.RECEIVED:
+        try:
+            await session.flush()
+        except Exception as exc:
+            from sqlalchemy.exc import IntegrityError
+
+            if not isinstance(exc, IntegrityError):
+                raise
+            await session.rollback()
+            case = await session.scalar(
+                select(Case).where(
+                    Case.repository == event.repository, Case.issue_number == issue.get("number")
+                )
+            )
+            if case is None:
+                raise
+    if CaseState(case.state) != CaseState.RECEIVED:
         logger.info(
             "ignoring delivery %s for case %s already in %s",
             event.delivery_id,

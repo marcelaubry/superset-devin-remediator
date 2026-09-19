@@ -1,12 +1,14 @@
 import enum
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import (
+    BigInteger,
     DateTime,
     Enum,
     ForeignKey,
+    Identity,
     Index,
     Integer,
     String,
@@ -77,6 +79,8 @@ class WebhookEvent(Base):
         Enum(EventStatus, name="event_status"), default=EventStatus.PENDING
     )
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    claimed_by: Mapped[str | None] = mapped_column(String(255))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     attempts_count: Mapped[int] = mapped_column(Integer, default=0)
     last_error: Mapped[str | None] = mapped_column(Text)
@@ -116,10 +120,13 @@ class Case(Base):
     )
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     failure_reason: Mapped[str | None] = mapped_column(Text)
+    version: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    claimed_by: Mapped[str | None] = mapped_column(String(255))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     events: Mapped[list[WebhookEvent]] = relationship(back_populates="case")
     attempts: Mapped[list["Attempt"]] = relationship(back_populates="case")
     transitions: Mapped[list["StateTransition"]] = relationship(
-        back_populates="case", order_by="StateTransition.created_at"
+        back_populates="case", order_by="StateTransition.seq"
     )
 
 
@@ -128,7 +135,8 @@ class Attempt(Base):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     case_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("cases.id", ondelete="CASCADE"))
     kind: Mapped[AttemptKind] = mapped_column(Enum(AttemptKind, name="attempt_kind"))
-    devin_session_id: Mapped[str] = mapped_column(String(255))
+    idempotency_key: Mapped[str] = mapped_column(String(255), unique=True)
+    devin_session_id: Mapped[str | None] = mapped_column(String(255))
     status: Mapped[AttemptStatus] = mapped_column(
         Enum(AttemptStatus, name="attempt_status"), default=AttemptStatus.RUNNING
     )
@@ -141,6 +149,7 @@ class Attempt(Base):
 class StateTransition(Base):
     __tablename__ = "state_transitions"
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    seq: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=False)
     case_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("cases.id", ondelete="CASCADE"))
     from_state: Mapped[CaseState | None] = mapped_column(
         Enum(CaseState, name="case_state", create_type=False)
@@ -150,7 +159,9 @@ class StateTransition(Base):
     )
     reason: Mapped[str] = mapped_column(Text)
     actor: Mapped[str] = mapped_column(String(50))
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
     case: Mapped[Case] = relationship(back_populates="transitions")
 
 

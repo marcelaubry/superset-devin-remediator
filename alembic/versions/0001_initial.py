@@ -83,6 +83,9 @@ def upgrade() -> None:
         ),
         sa.Column("completed_at", sa.DateTime(timezone=True)),
         sa.Column("failure_reason", sa.Text()),
+        sa.Column("version", sa.Integer(), server_default="0", nullable=False),
+        sa.Column("claimed_by", sa.String(255)),
+        sa.Column("lease_expires_at", sa.DateTime(timezone=True)),
         sa.UniqueConstraint("repository", "issue_number", name="uq_case_repo_issue"),
     )
     op.create_table(
@@ -100,6 +103,8 @@ def upgrade() -> None:
             "status", postgresql.ENUM(name="event_status", create_type=False), nullable=False
         ),
         sa.Column("claimed_at", sa.DateTime(timezone=True)),
+        sa.Column("claimed_by", sa.String(255)),
+        sa.Column("lease_expires_at", sa.DateTime(timezone=True)),
         sa.Column("processed_at", sa.DateTime(timezone=True)),
         sa.Column("attempts_count", sa.Integer(), nullable=False),
         sa.Column("last_error", sa.Text()),
@@ -110,7 +115,8 @@ def upgrade() -> None:
         sa.Column("id", u, primary_key=True),
         sa.Column("case_id", u, sa.ForeignKey("cases.id", ondelete="CASCADE"), nullable=False),
         sa.Column("kind", postgresql.ENUM(name="attempt_kind", create_type=False), nullable=False),
-        sa.Column("devin_session_id", sa.String(255), nullable=False),
+        sa.Column("idempotency_key", sa.String(255), nullable=False, unique=True),
+        sa.Column("devin_session_id", sa.String(255)),
         sa.Column(
             "status", postgresql.ENUM(name="attempt_status", create_type=False), nullable=False
         ),
@@ -122,6 +128,7 @@ def upgrade() -> None:
     )
     op.create_table(
         "state_transitions",
+        sa.Column("seq", sa.BigInteger(), sa.Identity(), nullable=False),
         sa.Column("id", u, primary_key=True),
         sa.Column("case_id", u, sa.ForeignKey("cases.id", ondelete="CASCADE"), nullable=False),
         sa.Column(

@@ -34,6 +34,7 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
+    restart: unless-stopped
   worker:
     build: .
     env_file: .env
@@ -43,5 +44,6 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
+    restart: unless-stopped
 volumes:
   postgres-data:

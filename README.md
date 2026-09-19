@@ -65,9 +65,16 @@ uv run python scripts/simulate.py --scenario good --bad-signature
 | `GITHUB_REQUIRED_LABEL` | `devin-candidate` | Required issue label; empty disables label filtering |
 | `WORKER_POLL_INTERVAL_SECONDS` | `1.0` | Worker idle poll interval |
 | `WORKER_CONCURRENCY` | `2` | Concurrent worker loops |
+| `WORKER_LEASE_SECONDS` | `300` | Case and webhook ownership lease |
+| `WORKER_SHUTDOWN_TIMEOUT_SECONDS` | `30` | Maximum in-flight drain time |
+| `EVENT_MAX_ATTEMPTS` | `3` | Event reclaim limit |
 | `DEVIN_CLIENT` | `fake` | Phase 1 only accepts `fake` |
+| `DEVIN_POLL_INTERVAL_SECONDS` | `0.01` | Fake poll delay; real clients would use about 15 seconds |
+| `DEVIN_MAX_POLLS` | `5` | Poll budget before `TIMED_OUT` |
+| `MAX_ATTEMPTS_PER_KIND` | `3` | Per-case triage/remediation spend cap |
 | `SIMULATION_AUTO_APPROVE_REMEDIATION` | `true` | Auto-approve remediation after a feasible triage verdict |
 | `LOG_LEVEL` | `INFO` | Application log level |
+| `COOKIE_SECURE` | `false` | Set `true` when dashboard traffic is behind TLS |
 
 ## Development and test database
 
@@ -75,14 +82,14 @@ uv run python scripts/simulate.py --scenario good --bad-signature
 make fmt lint typecheck
 docker compose up -d db
 cp .env.example .env
-uv run alembic upgrade head
 make test
 ```
 
 The Postgres init script creates both `remediator` and `remediator_test`.
-Integration tests use `TEST_DATABASE_URL`, defaulting to
+The test fixture automatically runs Alembic against `TEST_DATABASE_URL`,
+defaulting to
 `postgresql+asyncpg://remediator:remediator@localhost:5432/remediator_test`.
-They require the local test database and fail clearly if it is unavailable.
+They require the local test database and skip clearly if it is unavailable.
 
 Set `SIMULATION_AUTO_APPROVE_REMEDIATION=false` to park eligible cases at
 `AWAITING_REMEDIATION_APPROVAL`. With that setting, `simulate.py --wait` stops

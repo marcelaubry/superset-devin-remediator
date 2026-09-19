@@ -58,7 +58,7 @@ async def test_operator_retry_cancel_and_case_auth(
 
         cancel = await client.post(f"/operator/cases/{triaging_id}/cancel", headers=headers)
         assert cancel.status_code == 200
-        assert cancel.json()["state"] == CaseState.CANCELLED
+        assert cancel.json()["state"] == CaseState.TERMINATION_PENDING
 
         invalid_cancel = await client.post(
             f"/operator/cases/{cancelled_id}/cancel", headers=headers
@@ -118,14 +118,19 @@ async def test_dashboard_auth_health_metrics_detail_and_throughput(
         assert dashboard_redirect.status_code == 303
         assert dashboard_redirect.headers["location"] == "/login"
 
-        dashboard = await client.get("/", cookies={"operator_token": "operator"})
+        login = await client.post("/login", data={"token": "operator"})
+        assert login.status_code == 303
+        dashboard = await client.get("/", cookies=login.cookies)
         assert dashboard.status_code == 200
 
-        unauthorized_metrics = await client.get("/metrics")
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test", follow_redirects=False
+        ) as anonymous:
+            unauthorized_metrics = await anonymous.get("/metrics")
         assert unauthorized_metrics.status_code == 401
         metrics = await client.get("/metrics", headers={"Authorization": "Bearer operator"})
         assert metrics.status_code == 200
-        assert "webhook_events_total" in metrics.text
+        assert "webhook_requests_total" in metrics.text
 
         health = await client.get("/health")
         assert health.status_code == 200
@@ -150,4 +155,14 @@ async def test_dashboard_auth_health_metrics_detail_and_throughput(
             "/partials/throughput", headers={"Authorization": "Bearer operator"}
         )
         assert throughput.status_code == 200
-        assert "Mean time to complete" in throughput.text
+        assert "mean time to terminal" in throughput.text
+
+        tampered = await client.get("/", cookies={"operator_session": "9999999999.invalid"})
+        assert tampered.status_code == 303
+        expired = await client.get("/", cookies={"operator_session": "1.invalid"})
+        assert expired.status_code == 303
+        valid = login.cookies.get("operator_session")
+        assert valid is not None
+        assert (await client.get("/", cookies={"operator_session": valid})).status_code == 200
+        logged_out = await client.post("/logout", cookies={"operator_session": valid})
+        assert logged_out.status_code == 303

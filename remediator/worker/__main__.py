@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import signal
 
 from ..config import get_settings
@@ -6,7 +7,12 @@ from . import Worker
 
 
 async def main() -> None:
-    worker = Worker(get_settings())
+    settings = get_settings()
+    logging.basicConfig(
+        level=settings.log_level,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    worker = Worker(settings)
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, worker.stop)

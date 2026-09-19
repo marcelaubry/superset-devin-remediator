@@ -6,7 +6,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -42,27 +42,43 @@ async def load_case(session: AsyncSession, case_id: UUID) -> Case | None:
 
 
 async def _context(session: AsyncSession) -> dict[str, object]:
-    cases = list((await session.scalars(select(Case).order_by(Case.created_at.desc()))).all())
+    cases = list(
+        (await session.scalars(select(Case).order_by(Case.created_at.desc()).limit(100))).all()
+    )
     events = list(
         (
-            await session.scalars(select(WebhookEvent).order_by(WebhookEvent.received_at.desc()))
+            await session.scalars(
+                select(WebhookEvent).order_by(WebhookEvent.received_at.desc()).limit(100)
+            )
         ).all()
     )
     transitions = list(
         (
             await session.scalars(
-                select(StateTransition).order_by(StateTransition.created_at.desc()).limit(50)
+                select(StateTransition).order_by(StateTransition.seq.desc()).limit(50)
             )
         ).all()
     )
-    state_counts = {state.value: sum(case.state == state for case in cases) for state in CaseState}
-    recommendation_counts: dict[str, int] = {}
-    for case in cases:
-        if case.recommendation:
-            recommendation_counts[case.recommendation.value] = (
-                recommendation_counts.get(case.recommendation.value, 0) + 1
+    state_counts = {state.value: 0 for state in CaseState}
+    for state, count in (
+        await session.execute(select(Case.state, func.count()).group_by(Case.state))
+    ).all():
+        state_counts[CaseState(state).value] = count
+    recommendation_counts = {
+        str(recommendation): count
+        for recommendation, count in (
+            await session.execute(
+                select(Case.recommendation, func.count())
+                .where(Case.recommendation.is_not(None))
+                .group_by(Case.recommendation)
             )
-    active = [case for case in cases if case.state not in TERMINAL_STATES]
+        ).all()
+    }
+    active = [
+        case
+        for case in cases
+        if case.state not in TERMINAL_STATES and case.state != CaseState.HUMAN_BLOCKED
+    ]
     completed = [case for case in cases if case.state in TERMINAL_STATES]
     processing_events = [event for event in events if event.status == EventStatus.PROCESSING]
     failures: list[object] = [
@@ -72,22 +88,59 @@ async def _context(session: AsyncSession) -> dict[str, object]:
     ]
     failures.extend(event for event in events if event.status == EventStatus.FAILED)
     now = datetime.now(UTC)
-    received_1h = sum(
-        1
-        for case in cases
-        if case.created_at is not None and case.created_at >= now - timedelta(hours=1)
+    received_1h = await session.scalar(
+        select(func.count()).select_from(Case).where(Case.created_at >= now - timedelta(hours=1))
     )
-    received_24h = sum(
-        1
-        for case in cases
-        if case.created_at is not None and case.created_at >= now - timedelta(hours=24)
+    received_24h = await session.scalar(
+        select(func.count()).select_from(Case).where(Case.created_at >= now - timedelta(hours=24))
     )
-    completed_cases = [case for case in cases if case.completed_at is not None]
-    durations = [
-        (case.completed_at - case.created_at).total_seconds()
-        for case in completed_cases
-        if case.completed_at and case.created_at
-    ]
+    accepted_1h = await session.scalar(
+        select(func.count())
+        .select_from(WebhookEvent)
+        .where(WebhookEvent.received_at >= now - timedelta(hours=1))
+    )
+    accepted_24h = await session.scalar(
+        select(func.count())
+        .select_from(WebhookEvent)
+        .where(WebhookEvent.received_at >= now - timedelta(hours=24))
+    )
+    bucket_rows = (
+        await session.execute(
+            select(
+                Case.state,
+                func.count(),
+                func.avg(func.extract("epoch", Case.completed_at - Case.created_at)),
+            )
+            .where(
+                Case.state.in_(
+                    {
+                        CaseState.CI_PASSED,
+                        CaseState.POLICY_REJECTED,
+                        CaseState.FAILED,
+                        CaseState.TIMED_OUT,
+                        CaseState.CANCELLED,
+                    }
+                ),
+                Case.completed_at.is_not(None),
+            )
+            .group_by(Case.state)
+        )
+    ).all()
+    buckets = {
+        "succeeded": {"count": 0, "mean_time": "-"},
+        "rejected": {"count": 0, "mean_time": "-"},
+        "failed": {"count": 0, "mean_time": "-"},
+    }
+    for state, count, mean in bucket_rows:
+        bucket = (
+            "succeeded"
+            if state == CaseState.CI_PASSED
+            else ("rejected" if state == CaseState.POLICY_REJECTED else "failed")
+        )
+        buckets[bucket] = {
+            "count": count,
+            "mean_time": f"{float(mean):.1f}s" if mean is not None else "-",
+        }
     return {
         "cases": cases,
         "events": events,
@@ -101,12 +154,9 @@ async def _context(session: AsyncSession) -> dict[str, object]:
         "throughput": {
             "received_1h": received_1h,
             "received_24h": received_24h,
-            "completed_total": len(completed_cases),
-            "ci_passed": sum(1 for case in cases if case.state == CaseState.CI_PASSED),
-            "policy_rejected": sum(1 for case in cases if case.state == CaseState.POLICY_REJECTED),
-            "mean_time_to_complete": (
-                f"{sum(durations) / len(durations):.1f}s" if durations else "-"
-            ),
+            "accepted_1h": accepted_1h,
+            "accepted_24h": accepted_24h,
+            "buckets": buckets,
         },
         "humanize": _humanize,
     }

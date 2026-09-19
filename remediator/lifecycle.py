@@ -1,7 +1,8 @@
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 if TYPE_CHECKING:
@@ -130,8 +131,6 @@ TRANSITIONS: dict[CaseState, frozenset[CaseState]] = {
     CaseState.CI_PASSED: frozenset(),
     CaseState.HUMAN_BLOCKED: frozenset(
         {
-            CaseState.REMEDIATING,
-            CaseState.TRIAGING,
             CaseState.CANCELLED,
             CaseState.FAILED,
             CaseState.RECEIVED,
@@ -172,13 +171,29 @@ async def transition(
     from_state = CaseState(case.state)
     if to_state not in TRANSITIONS[from_state]:
         raise InvalidTransition(f"{from_state} cannot transition to {to_state}")
-    from .models import StateTransition
+    from .models import Case, StateTransition
 
     now = datetime.now(UTC)
+    completed_at = now if to_state in TERMINAL_STATES else None
+    result = cast(
+        Any,
+        await session.execute(
+            update(Case)
+            .where(Case.id == case.id, Case.state == from_state)
+            .values(
+                state=to_state,
+                state_entered_at=now,
+                completed_at=completed_at,
+                version=Case.version + 1,
+            )
+        ),
+    )
+    if result.rowcount == 0:
+        raise InvalidTransition(f"case {case.id} is no longer in {from_state}")
     case.state = to_state
     case.state_entered_at = now
-    if to_state in TERMINAL_STATES:
-        case.completed_at = now
+    case.completed_at = completed_at
+    case.version += 1
     session.add(
         StateTransition(
             case_id=case.id,

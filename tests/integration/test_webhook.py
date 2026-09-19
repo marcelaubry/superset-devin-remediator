@@ -124,3 +124,13 @@ async def test_missing_delivery_id(test_app) -> None:
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await send(client, body, delivery=None)
     assert response.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_signed_non_object_payload_is_bad_request(test_app) -> None:
+    body = b"[]"
+    transport = httpx.ASGITransport(app=test_app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await send(client, body, delivery="array-payload")
+    assert response.status_code == 400
+    assert response.json()["detail"] == "payload must be a JSON object"

@@ -39,9 +39,13 @@ def evaluate(issue: IssueSnapshot) -> RubricResult:
             len(issue.body) <= 12000
             and not _has(text, "refactor everything", "migrate everything")
             and areas <= 2,
-            "Scope is bounded."
-            if len(issue.body) <= 12000 and areas <= 2
-            else "Issue is too broad or spans too many areas.",
+            (
+                "Scope is bounded."
+                if len(issue.body) <= 12000
+                and areas <= 2
+                and not _has(text, "refactor everything", "migrate everything")
+                else ("Issue exceeds the body-length, area-count, or broad-refactor scope limit.")
+            ),
         ),
         RubricCheck(
             "objective_verification",

@@ -9,6 +9,7 @@ from remediator.lifecycle import CaseState
 from remediator.models import (
     Attempt,
     AttemptKind,
+    AttemptStatus,
     Case,
     EventStatus,
     NotificationOutbox,
@@ -219,3 +220,117 @@ async def test_manual_remediation_approval_resumes_processing(
     await integration_session.commit()
     await process_case(integration_session, case, FakeDevinClient(), settings)
     assert case.state == CaseState.CI_PASSED
+
+
+@pytest.mark.asyncio
+async def test_reconcile_remediation_create_intent(
+    integration_session: AsyncSession,
+) -> None:
+    event = WebhookEvent(
+        delivery_id="integration-reconcile",
+        event_type="issues",
+        action="opened",
+        repository="apache/superset",
+        payload=payload(4213, "source", ["devin-candidate"]),
+        status=EventStatus.PROCESSED,
+    )
+    case = Case(
+        issue_number=4213,
+        repository="apache/superset",
+        issue_title="Fix issue",
+        issue_url="https://github.com/apache/superset/issues/4213",
+        state=CaseState.REMEDIATION_CREATE_INTENT,
+    )
+    integration_session.add_all([event, case])
+    await integration_session.flush()
+    event.case_id = case.id
+    key = f"{case.id}:REMEDIATION:1"
+    attempt = Attempt(
+        case_id=case.id,
+        kind=AttemptKind.REMEDIATION,
+        idempotency_key=key,
+        status=AttemptStatus.RUNNING,
+    )
+    integration_session.add(attempt)
+    await integration_session.commit()
+    client = FakeDevinClient()
+    await client.create_session(
+        "",
+        {
+            "repository": case.repository,
+            "issue_number": str(case.issue_number),
+            "kind": "REMEDIATION",
+        },
+        idempotency_key=key,
+    )
+    await process_case(integration_session, case, client, Settings())
+    assert case.state == CaseState.CI_PASSED
+    transitions = list(
+        (
+            await integration_session.scalars(
+                select(StateTransition)
+                .where(StateTransition.case_id == case.id)
+                .order_by(StateTransition.seq)
+            )
+        ).all()
+    )
+    assert any(t.to_state == CaseState.RECONCILING_CREATE for t in transitions)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_missing_session_fails(
+    integration_session: AsyncSession,
+) -> None:
+    case = Case(
+        issue_number=4213,
+        repository="apache/superset",
+        issue_title="Fix issue",
+        issue_url="https://github.com/apache/superset/issues/4213",
+        state=CaseState.REMEDIATION_CREATE_INTENT,
+    )
+    integration_session.add(case)
+    await integration_session.flush()
+    integration_session.add(
+        Attempt(
+            case_id=case.id,
+            kind=AttemptKind.REMEDIATION,
+            idempotency_key=f"{case.id}:REMEDIATION:1",
+            status=AttemptStatus.RUNNING,
+        )
+    )
+    await integration_session.commit()
+    await process_case(integration_session, case, FakeDevinClient(), Settings())
+    assert case.state == CaseState.FAILED
+    assert case.failure_reason == "create intent could not be reconciled"
+
+
+@pytest.mark.asyncio
+async def test_poll_budget_times_out(
+    integration_session: AsyncSession,
+) -> None:
+    event = WebhookEvent(
+        delivery_id="integration-timeout",
+        event_type="issues",
+        action="opened",
+        repository="apache/superset",
+        payload=payload(
+            4213,
+            (
+                "Steps to reproduce:\n1. Run. Expected behavior works. "
+                "Actual behavior fails. Acceptance criteria: fixed. Similar existing pattern."
+            ),
+            ["bug", "devin-candidate"],
+        ),
+        status=EventStatus.PENDING,
+    )
+    integration_session.add(event)
+    await integration_session.commit()
+    settings = Settings(devin_max_polls=2, devin_poll_interval_seconds=0)
+    await process_event(
+        integration_session, event, FakeDevinClient(never_finish_issues={4213}), settings
+    )
+    case = await integration_session.scalar(select(Case).where(Case.issue_number == 4213))
+    assert case and case.state == CaseState.TIMED_OUT
+    attempt = await integration_session.scalar(select(Attempt).where(Attempt.case_id == case.id))
+    assert attempt and attempt.status == AttemptStatus.CANCELLED
+    assert attempt.error == "poll budget exhausted"

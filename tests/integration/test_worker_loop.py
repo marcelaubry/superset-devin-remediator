@@ -79,7 +79,13 @@ async def test_worker_loop_survives_failed_job(
     async def stop_when_done() -> None:
         for _ in range(500):
             async with integration_session_factory() as session:
-                statuses = list((await session.scalars(select(WebhookEvent.status))).all())
+                statuses = list(
+                    (
+                        await session.scalars(
+                            select(WebhookEvent.status).order_by(WebhookEvent.received_at)
+                        )
+                    ).all()
+                )
             if statuses and all(status != EventStatus.PENDING for status in statuses):
                 worker.stop()
                 return
@@ -94,7 +100,9 @@ async def test_worker_loop_survives_failed_job(
         await worker.engine.dispose()
 
     async with integration_session_factory() as session:
-        events = list((await session.scalars(select(WebhookEvent))).all())
+        events = list(
+            (await session.scalars(select(WebhookEvent).order_by(WebhookEvent.received_at))).all()
+        )
     assert [event.status for event in events] == [EventStatus.FAILED, EventStatus.PROCESSED]
     assert events[0].last_error == "injected processor failure"
 
