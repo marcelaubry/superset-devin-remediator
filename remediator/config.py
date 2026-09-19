@@ -6,6 +6,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 MIN_LIVE_POLL_INTERVAL_SECONDS = 10.0
 MAX_RECOMMENDED_POLL_INTERVAL_SECONDS = 30.0
+MIN_LIVE_TRIAGE_TIMEOUT_SECONDS = 300.0
+MIN_LIVE_SECRET_LENGTH = 16
+PLACEHOLDER_SECRET = "change-me"
 
 
 class Settings(BaseSettings):
@@ -82,6 +85,21 @@ class Settings(BaseSettings):
             )
         if not self.devin_api_base_url.startswith("https://"):
             raise ValueError("DEVIN_API_BASE_URL must use https in live mode")
+        if self.devin_triage_timeout_seconds < MIN_LIVE_TRIAGE_TIMEOUT_SECONDS:
+            raise ValueError(
+                "DEVIN_TRIAGE_TIMEOUT_SECONDS must be at least "
+                f"{MIN_LIVE_TRIAGE_TIMEOUT_SECONDS:.0f} in live mode; the short value in "
+                ".env.example is for fake-mode simulations only"
+            )
+        for name, value in (
+            ("GITHUB_WEBHOOK_SECRET", self.github_webhook_secret),
+            ("OPERATOR_TOKEN", self.operator_token),
+        ):
+            if value == PLACEHOLDER_SECRET or len(value) < MIN_LIVE_SECRET_LENGTH:
+                raise ValueError(
+                    f"{name} must be a unique secret of at least {MIN_LIVE_SECRET_LENGTH} "
+                    "characters in live mode"
+                )
         if self.devin_poll_interval_seconds < MIN_LIVE_POLL_INTERVAL_SECONDS:
             raise ValueError(
                 "DEVIN_POLL_INTERVAL_SECONDS must be at least "

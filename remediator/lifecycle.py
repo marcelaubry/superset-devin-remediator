@@ -134,6 +134,7 @@ TRANSITIONS: dict[CaseState, frozenset[CaseState]] = {
             CaseState.CANCELLED,
             CaseState.FAILED,
             CaseState.RECEIVED,
+            CaseState.TERMINATION_PENDING,
         }
     ),
     CaseState.RECONCILING_CREATE: frozenset(

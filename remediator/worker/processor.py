@@ -8,12 +8,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..approvals import approve_remediation
 from ..config import Settings
-from ..devin.client import DevinClient, DevinError
+from ..devin.client import DevinClient, DevinError, DevinSessionNotFound
 from ..devin.triage import TriageValidationError, validate_triage_output
 from ..github_refs import BaseCommitResolver, build_base_commit_resolver
 from ..lifecycle import CaseState, transition
 from ..models import (
     ACTIVE_ATTEMPT_STATUSES,
+    CANCEL_TERMINATION_REASON,
     Attempt,
     AttemptKind,
     AttemptStatus,
@@ -254,27 +255,48 @@ async def _process_remediation(
 
 async def _terminate_running_attempts(
     session: AsyncSession, case: Case, devin: DevinClient
-) -> None:
+) -> bool:
+    """Terminate every session an active attempt owns or may own.
+
+    Returns False when at least one termination could not be confirmed; such attempts
+    are parked as TERMINATION_PENDING so the case is retried rather than closed.
+    """
     attempts = list(
         (
             await session.scalars(
                 select(Attempt).where(
-                    Attempt.case_id == case.id, Attempt.status.in_(ACTIVE_ATTEMPT_STATUSES)
+                    Attempt.case_id == case.id,
+                    Attempt.status.in_([*ACTIVE_ATTEMPT_STATUSES, AttemptStatus.BLOCKED]),
                 )
             )
         ).all()
     )
+    confirmed = True
     for attempt in attempts:
-        if attempt.devin_session_id:
-            try:
+        try:
+            if attempt.devin_session_id:
                 await devin.terminate_session(attempt.devin_session_id)
-            except DevinError as exc:
-                logger.warning(
-                    "could not terminate Devin session %s: %s", attempt.devin_session_id, exc
-                )
+            elif attempt.create_sent_at is not None:
+                for match in await devin.find_sessions_by_tag(attempt.operation_key):
+                    try:
+                        await devin.terminate_session(match.session_id)
+                    except DevinSessionNotFound:
+                        pass
+        except DevinSessionNotFound:
+            pass
+        except DevinError as exc:
+            logger.warning(
+                "could not terminate Devin session for attempt %s: %s", attempt.operation_key, exc
+            )
+            attempt.status = AttemptStatus.TERMINATION_PENDING
+            attempt.reconciliation_reason = f"{CANCEL_TERMINATION_REASON}; DELETE failed: {exc}"
+            confirmed = False
+            continue
         attempt.status = AttemptStatus.CANCELLED
-        attempt.error = "operator requested cancel"
+        attempt.error = CANCEL_TERMINATION_REASON
+        attempt.reconciliation_reason = None
         attempt.finished_at = datetime.now(UTC)
+    return confirmed
 
 
 async def _terminate_case(
@@ -283,12 +305,15 @@ async def _terminate_case(
     devin: DevinClient,
     claimed_by: str | None = None,
 ) -> None:
-    await _terminate_running_attempts(session, case, devin)
+    if not await _terminate_running_attempts(session, case, devin):
+        case.failure_reason = "operator requested cancel; Devin session termination pending"
+        await session.commit()
+        return
     await transition(
         session,
         case,
         CaseState.CANCELLED,
-        "operator requested cancel",
+        CANCEL_TERMINATION_REASON,
         "worker",
         expected_claimed_by=claimed_by,
     )

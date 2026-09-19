@@ -234,12 +234,40 @@ class Worker:
             heartbeat.cancel()
             await asyncio.gather(heartbeat, return_exceptions=True)
 
+    async def _cancel_unsent_attempts(self, session: AsyncSession, case_id: object) -> None:
+        """Cancel active attempts that never sent a create.
+
+        Attempts whose create was sent may own a live Devin session; they are left
+        active so the case's current owner (or TERMINATION_PENDING recovery) can
+        terminate or resume them instead of orphaning the session.
+        """
+        attempts = list(
+            (
+                await session.scalars(
+                    select(Attempt).where(
+                        Attempt.case_id == case_id,
+                        Attempt.status.in_(ACTIVE_ATTEMPT_STATUSES),
+                        Attempt.create_sent_at.is_(None),
+                    )
+                )
+            ).all()
+        )
+        for attempt in attempts:
+            attempt.status = AttemptStatus.CANCELLED
+            attempt.error = "case changed concurrently"
+            attempt.finished_at = datetime.now(UTC)
+
     async def _mark_failed(
         self, session: AsyncSession, case_id: object, error: str, claimed_by: str | None = None
     ) -> None:
         case = await session.get(Case, case_id)
-        if case:
-            await fail_case(session, case, error, "worker", claimed_by)
+        if case is None:
+            return
+        try:
+            async with session.begin_nested():
+                await fail_case(session, case, error, "worker", claimed_by)
+        except InvalidTransition as exc:
+            logger.warning("could not record failure for case %s: %s", case_id, exc)
 
     async def _run_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -260,37 +288,11 @@ class Worker:
                             fresh.last_error = str(exc)
                             fresh.processed_at = datetime.now(UTC)
                             if fresh.case_id:
-                                attempts = list(
-                                    (
-                                        await session.scalars(
-                                            select(Attempt).where(
-                                                Attempt.case_id == fresh.case_id,
-                                                Attempt.status.in_(ACTIVE_ATTEMPT_STATUSES),
-                                            )
-                                        )
-                                    ).all()
-                                )
-                                for attempt in attempts:
-                                    attempt.status = AttemptStatus.CANCELLED
-                                    attempt.error = "case changed concurrently"
-                                    attempt.finished_at = datetime.now(UTC)
+                                await self._cancel_unsent_attempts(session, fresh.case_id)
                             await session.commit()
                 elif case:
                     async with self.session_factory() as session:
-                        attempts = list(
-                            (
-                                await session.scalars(
-                                    select(Attempt).where(
-                                        Attempt.case_id == case.id,
-                                        Attempt.status.in_(ACTIVE_ATTEMPT_STATUSES),
-                                    )
-                                )
-                            ).all()
-                        )
-                        for attempt in attempts:
-                            attempt.status = AttemptStatus.CANCELLED
-                            attempt.error = "case changed concurrently"
-                            attempt.finished_at = datetime.now(UTC)
+                        await self._cancel_unsent_attempts(session, case.id)
                         await session.commit()
                     await self._release_case(case.id)
             except Exception as exc:

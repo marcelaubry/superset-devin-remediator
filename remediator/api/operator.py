@@ -13,7 +13,15 @@ from ..approvals import approve_remediation, reject_remediation
 from ..config import Settings, get_settings
 from ..db import get_session
 from ..lifecycle import CaseState, InvalidTransition, transition
-from ..models import Attempt, AttemptKind, AttemptStatus, Case
+from ..models import (
+    ACTIVE_ATTEMPT_STATUSES,
+    UNRESOLVED_CREATE_ACK,
+    Attempt,
+    AttemptKind,
+    AttemptStatus,
+    Case,
+    CreateState,
+)
 from .auth import COOKIE_NAME, _cookie_value, require_operator
 from .dashboard import TEMPLATE_HELPERS, load_case, templates
 
@@ -99,6 +107,55 @@ def _attempt_json(attempt: Attempt) -> dict[str, Any]:
     }
 
 
+async def _may_own_session(session: AsyncSession, case: Case) -> bool:
+    """True when an attempt of this case sent a create and has not been closed out."""
+    owner = await session.scalar(
+        select(Attempt.id).where(
+            Attempt.case_id == case.id,
+            Attempt.status.in_([*ACTIVE_ATTEMPT_STATUSES, AttemptStatus.BLOCKED]),
+            Attempt.create_sent_at.is_not(None),
+        )
+    )
+    return owner is not None
+
+
+async def _acknowledge_unresolved(session: AsyncSession, case: Case, request: Request) -> None:
+    """Retry after an unresolved create needs an explicit operator confirmation.
+
+    The first POST may have created a session we could not find by tag; a silent
+    retry would issue a second paid create. The operator must assert that no live
+    session carries the operation key (``confirm_no_session=true``).
+    """
+    unresolved = list(
+        (
+            await session.scalars(
+                select(Attempt).where(
+                    Attempt.case_id == case.id,
+                    Attempt.create_state == CreateState.UNRESOLVED,
+                    Attempt.status.in_([AttemptStatus.BLOCKED, AttemptStatus.RECONCILING]),
+                )
+            )
+        ).all()
+    )
+    pending = [a for a in unresolved if a.reconciliation_reason != UNRESOLVED_CREATE_ACK]
+    if not pending:
+        return
+    confirmed = request.query_params.get("confirm_no_session")
+    if confirmed is None and request.headers.get("content-type", "").startswith(
+        ("application/x-www-form-urlencoded", "multipart/form-data")
+    ):
+        form = await request.form()
+        confirmed = str(form.get("confirm_no_session", "")) or None
+    if str(confirmed or "").lower() not in {"true", "1", "yes", "on"}:
+        keys = ", ".join(a.operation_key for a in pending)
+        raise InvalidTransition(
+            f"create outcome unresolved for {keys}; confirm in the Devin console that no "
+            "session carries this tag, then retry with confirm_no_session=true"
+        )
+    for attempt in pending:
+        attempt.reconciliation_reason = UNRESOLVED_CREATE_ACK
+
+
 async def _case_action(
     case_id: UUID, to_state: CaseState, request: Request, session: AsyncSession
 ) -> Any:
@@ -106,15 +163,16 @@ async def _case_action(
     if not case:
         raise HTTPException(status_code=404, detail="case not found")
     try:
-        if to_state == CaseState.CANCELLED and CaseState(case.state) in {
-            CaseState.TRIAGING,
-            CaseState.REMEDIATING,
-        }:
+        if to_state == CaseState.CANCELLED and (
+            CaseState(case.state) in {CaseState.TRIAGING, CaseState.REMEDIATING}
+            or await _may_own_session(session, case)
+        ):
             to_state = CaseState.TERMINATION_PENDING
             reason = "operator requested cancel; terminating Devin session"
         else:
             reason = f"operator requested {to_state.lower()}"
         if to_state == CaseState.RECEIVED:
+            await _acknowledge_unresolved(session, case, request)
             counts = await session.execute(
                 select(Attempt.kind, func.count())
                 .where(Attempt.case_id == case.id)

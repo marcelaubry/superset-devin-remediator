@@ -8,8 +8,8 @@ from alembic import command
 
 # Tests never touch the real Devin API and must not inherit slow live-mode pacing.
 os.environ["DEVIN_CLIENT_MODE"] = "fake"
-os.environ.setdefault("DEVIN_POLL_INTERVAL_SECONDS", "0")
-os.environ.setdefault("DEVIN_TRIAGE_TIMEOUT_SECONDS", "5")
+os.environ["DEVIN_POLL_INTERVAL_SECONDS"] = "0"
+os.environ["DEVIN_TRIAGE_TIMEOUT_SECONDS"] = "5"
 os.environ.pop("DEVIN_API_KEY", None)
 
 

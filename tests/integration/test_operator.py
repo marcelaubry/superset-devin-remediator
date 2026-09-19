@@ -6,7 +6,14 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from remediator.lifecycle import CaseState
-from remediator.models import Case
+from remediator.models import (
+    UNRESOLVED_CREATE_ACK,
+    Attempt,
+    AttemptKind,
+    AttemptStatus,
+    Case,
+    CreateState,
+)
 
 
 async def add_case(
@@ -166,3 +173,77 @@ async def test_dashboard_auth_health_metrics_detail_and_throughput(
         assert (await client.get("/", cookies={"operator_session": valid})).status_code == 200
         logged_out = await client.post("/logout", cookies={"operator_session": valid})
         assert logged_out.status_code == 303
+
+
+async def add_attempt(
+    factory: async_sessionmaker[AsyncSession], case_id: UUID, **fields: object
+) -> UUID:
+    async with factory() as session:
+        attempt = Attempt(
+            case_id=case_id,
+            kind=AttemptKind.TRIAGE,
+            idempotency_key=f"{case_id}:TRIAGE:1",
+            operation_key=f"op:{case_id}:TRIAGE:1",
+            create_sent_at=datetime.now(UTC),
+            **fields,  # type: ignore[arg-type]
+        )
+        session.add(attempt)
+        await session.commit()
+        return attempt.id
+
+
+@pytest.mark.asyncio
+async def test_operator_actions_respect_possibly_live_sessions(
+    test_app, integration_session_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    waiting_id = await add_case(integration_session_factory, 5101, CaseState.HUMAN_BLOCKED)
+    await add_attempt(
+        integration_session_factory,
+        waiting_id,
+        create_state=CreateState.CREATED,
+        status=AttemptStatus.BLOCKED,
+        devin_session_id="devin-waiting",
+    )
+    unresolved_id = await add_case(integration_session_factory, 5102, CaseState.HUMAN_BLOCKED)
+    unresolved_attempt = await add_attempt(
+        integration_session_factory,
+        unresolved_id,
+        create_state=CreateState.UNRESOLVED,
+        status=AttemptStatus.BLOCKED,
+    )
+    reconciling_id = await add_case(integration_session_factory, 5103, CaseState.RECONCILING_CREATE)
+    await add_attempt(
+        integration_session_factory,
+        reconciling_id,
+        create_state=CreateState.PENDING,
+        status=AttemptStatus.RECONCILING,
+    )
+    headers = {"Authorization": "Bearer operator"}
+    transport = httpx.ASGITransport(app=test_app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        # Cancelling a case whose blocked attempt still holds a session must terminate it.
+        cancel = await client.post(f"/operator/cases/{waiting_id}/cancel", headers=headers)
+        assert cancel.status_code == 200
+        assert cancel.json()["state"] == CaseState.TERMINATION_PENDING
+
+        # Cancelling while the create outcome is uncertain also goes through termination.
+        cancel = await client.post(f"/operator/cases/{reconciling_id}/cancel", headers=headers)
+        assert cancel.status_code == 200
+        assert cancel.json()["state"] == CaseState.TERMINATION_PENDING
+
+        # Retry after an unresolved create is refused until the operator confirms.
+        refused = await client.post(f"/operator/cases/{unresolved_id}/retry", headers=headers)
+        assert refused.status_code == 409
+        assert "confirm_no_session=true" in refused.json()["detail"]
+        async with integration_session_factory() as session:
+            assert (await session.get(Case, unresolved_id)).state == CaseState.HUMAN_BLOCKED  # type: ignore[union-attr]
+
+        confirmed = await client.post(
+            f"/operator/cases/{unresolved_id}/retry?confirm_no_session=true", headers=headers
+        )
+        assert confirmed.status_code == 200
+        assert confirmed.json()["state"] == CaseState.RECEIVED
+        async with integration_session_factory() as session:
+            attempt = await session.get(Attempt, unresolved_attempt)
+            assert attempt is not None
+            assert attempt.reconciliation_reason == UNRESOLVED_CREATE_ACK

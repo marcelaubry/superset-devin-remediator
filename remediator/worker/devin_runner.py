@@ -36,6 +36,9 @@ from ..github_refs import BaseCommitResolutionError, BaseCommitResolver
 from ..lifecycle import TERMINAL_STATES, CaseState, InvalidTransition, transition
 from ..models import (
     ACTIVE_ATTEMPT_STATUSES,
+    CANCEL_TERMINATION_REASON,
+    UNRESOLVED_CREATE_ACK,
+    WORKER_ERROR_TERMINATION_PREFIX,
     Attempt,
     AttemptKind,
     AttemptStatus,
@@ -94,6 +97,21 @@ def _outbox(case: Case, kind: str, **payload: Any) -> NotificationOutbox:
     )
 
 
+async def active_attempts_with_session(session: AsyncSession, case_id: Any) -> list[Attempt]:
+    """Active attempts that may own a live Devin session (created or uncertain)."""
+    return list(
+        (
+            await session.scalars(
+                select(Attempt).where(
+                    Attempt.case_id == case_id,
+                    Attempt.status.in_(ACTIVE_ATTEMPT_STATUSES),
+                    Attempt.create_sent_at.is_not(None),
+                )
+            )
+        ).all()
+    )
+
+
 async def fail_case(
     session: AsyncSession,
     case: Case,
@@ -101,12 +119,33 @@ async def fail_case(
     actor: str,
     claimed_by: str | None = None,
 ) -> None:
+    """Fail a case, or park it in TERMINATION_PENDING while a Devin session may be live.
+
+    A case never becomes terminal while an active attempt still owns (or may own) a
+    remote session; the TERMINATION_PENDING recovery path performs the DELETE first.
+    """
     case.failure_reason = reason
-    if CaseState(case.state) not in TERMINAL_STATES:
-        await transition(
-            session, case, CaseState.FAILED, reason, actor, expected_claimed_by=claimed_by
-        )
-        session.add(_outbox(case, "case_failed", reason=reason))
+    state = CaseState(case.state)
+    if state in TERMINAL_STATES:
+        return
+    live = await active_attempts_with_session(session, case.id)
+    if live:
+        pending_reason = f"{WORKER_ERROR_TERMINATION_PREFIX}: {reason}; terminating Devin session"
+        for attempt in live:
+            attempt.status = AttemptStatus.TERMINATION_PENDING
+            attempt.reconciliation_reason = pending_reason
+        if state != CaseState.TERMINATION_PENDING:
+            await transition(
+                session,
+                case,
+                CaseState.TERMINATION_PENDING,
+                pending_reason,
+                actor,
+                expected_claimed_by=claimed_by,
+            )
+        return
+    await transition(session, case, CaseState.FAILED, reason, actor, expected_claimed_by=claimed_by)
+    session.add(_outbox(case, "case_failed", reason=reason))
 
 
 class DevinRunner:
@@ -160,6 +199,8 @@ class DevinRunner:
                 return created
             attempt = created
         elif attempt.status == AttemptStatus.TERMINATION_PENDING:
+            if attempt.devin_session_id is None:
+                return await self._terminate_by_tag(attempt)
             return await self._handle_timeout(attempt)
         elif attempt.devin_session_id is None:
             reconciled = await self._reconcile_create(attempt)
@@ -190,6 +231,13 @@ class DevinRunner:
             await self.session.commit()
             placeholder = Attempt(case_id=case.id, kind=kind, idempotency_key="", operation_key="")
             return RunOutcome(RunResult.FAILED, placeholder, reason=reason)
+
+        refused = await self._settle_previous_sessions(kind)
+        if refused is not None:
+            await fail_case(self.session, case, refused, "worker", self.claimed_by)
+            await self.session.commit()
+            placeholder = Attempt(case_id=case.id, kind=kind, idempotency_key="", operation_key="")
+            return RunOutcome(RunResult.FAILED, placeholder, reason=refused)
 
         key = operation_key(case.id, kind.value, ordinal)
         now = self.clock()
@@ -242,6 +290,51 @@ class DevinRunner:
             return reconciled if isinstance(reconciled, RunOutcome) else attempt
 
         return await self._attach(attempt, snapshot, CreateState.CREATED, "Devin session created")
+
+    async def _settle_previous_sessions(self, kind: AttemptKind) -> str | None:
+        """Before a new POST, make sure no earlier attempt of this kind may still be live.
+
+        Blocked attempts with a known session are terminated remotely; unresolved
+        creates require an explicit operator acknowledgement because a session may
+        exist that we could not find by tag. Returns a refusal reason, or None.
+        """
+        previous = list(
+            (
+                await self.session.scalars(
+                    select(Attempt).where(
+                        Attempt.case_id == self.case.id,
+                        Attempt.kind == kind,
+                        Attempt.status.in_([AttemptStatus.BLOCKED, AttemptStatus.RECONCILING]),
+                    )
+                )
+            ).all()
+        )
+        for attempt in previous:
+            if attempt.create_state == CreateState.UNRESOLVED:
+                if attempt.reconciliation_reason != UNRESOLVED_CREATE_ACK:
+                    return (
+                        f"attempt {attempt.operation_key} has an unresolved create; "
+                        "an operator must confirm no live session exists before a new POST"
+                    )
+                attempt.status = AttemptStatus.CANCELLED
+                attempt.finished_at = attempt.finished_at or self.clock()
+                continue
+            if attempt.devin_session_id is None:
+                continue
+            try:
+                await self.devin.terminate_session(attempt.devin_session_id)
+            except DevinSessionNotFound:
+                pass
+            except DevinError as exc:
+                return (
+                    f"could not terminate previous Devin session {attempt.devin_session_id} "
+                    f"before retry: {exc}"
+                )
+            attempt.status = AttemptStatus.CANCELLED
+            attempt.error = f"{attempt.error or ''}; terminated before retry".lstrip("; ")
+            attempt.finished_at = attempt.finished_at or self.clock()
+        await self.session.commit()
+        return None
 
     async def _build_request(
         self, attempt: Attempt, kind: AttemptKind
@@ -306,6 +399,9 @@ class DevinRunner:
         attempt.devin_status = snapshot.status
         attempt.devin_status_detail = snapshot.status_detail
         attempt.reconciliation_reason = None
+        attempt.timeout_at = self.clock() + timedelta(
+            seconds=self.settings.devin_triage_timeout_seconds
+        )
         case.devin_session_id = snapshot.session_id
         case.devin_session_url = snapshot.url
         attempt_id = attempt.id
@@ -413,6 +509,11 @@ class DevinRunner:
         deadline = attempt.timeout_at
         consecutive_errors = 0
         while True:
+            if await self._cancel_requested():
+                attempt.status = AttemptStatus.TERMINATION_PENDING
+                attempt.reconciliation_reason = CANCEL_TERMINATION_REASON
+                await self.session.commit()
+                return await self._handle_timeout(attempt)
             if self.clock() >= deadline:
                 return await self._handle_timeout(attempt)
             try:
@@ -443,6 +544,16 @@ class DevinRunner:
                 await self.sleep(self.settings.devin_poll_interval_seconds)
                 continue
             return await self._settle(attempt, snapshot, mapping.disposition, mapping.reason)
+
+    async def _cancel_requested(self) -> bool:
+        """Re-read the case state so an operator cancel interrupts an in-flight poll loop."""
+        fresh = await self.session.scalar(select(Case.state).where(Case.id == self.case.id))
+        if fresh is None:
+            return False
+        state = CaseState(fresh)
+        if state != CaseState(self.case.state):
+            await self.session.refresh(self.case)
+        return state == CaseState.TERMINATION_PENDING
 
     async def _settle(
         self, attempt: Attempt, snapshot: SessionSnapshot, disposition: Disposition, reason: str
@@ -509,7 +620,13 @@ class DevinRunner:
         except DevinSessionNotFound:
             return await self._mark_timed_out(attempt, "session already gone at timeout")
         except DevinError as exc:
-            reason = f"timeout reached but DELETE failed: {exc}"
+            pending = attempt.reconciliation_reason or ""
+            trigger = (
+                pending.split(";")[0]
+                if pending.startswith((CANCEL_TERMINATION_REASON, WORKER_ERROR_TERMINATION_PREFIX))
+                else "timeout reached"
+            )
+            reason = f"{trigger}; DELETE failed: {exc}"
             attempt.status = AttemptStatus.TERMINATION_PENDING
             attempt.reconciliation_reason = reason
             if CaseState(self.case.state) != CaseState.TERMINATION_PENDING:
@@ -519,18 +636,75 @@ class DevinRunner:
             return RunOutcome(RunResult.TERMINATION_PENDING, attempt, final, reason)
         return await self._mark_timed_out(attempt, "session terminated remotely")
 
+    async def _terminate_by_tag(self, attempt: Attempt) -> RunOutcome:
+        """Termination requested for an attempt whose create outcome is still unknown."""
+        try:
+            matches = await self.devin.find_sessions_by_tag(attempt.operation_key)
+            for match in matches:
+                try:
+                    await self.devin.terminate_session(match.session_id)
+                except DevinSessionNotFound:
+                    pass
+        except DevinError as exc:
+            reason = f"termination pending: could not look up or delete session by tag: {exc}"
+            attempt.reconciliation_reason = reason
+            self.case.failure_reason = reason
+            await self.session.commit()
+            return RunOutcome(RunResult.TERMINATION_PENDING, attempt, None, reason)
+        detail = (
+            f"{len(matches)} session(s) carrying the operation tag terminated"
+            if matches
+            else "no session carries the operation tag"
+        )
+        return await self._mark_terminated(attempt, detail)
+
     async def _mark_timed_out(self, attempt: Attempt, detail: str) -> RunOutcome:
-        deadline = attempt.timeout_at.isoformat() if attempt.timeout_at else "?"
-        reason = f"Devin session exceeded deadline {deadline}; {detail}"
-        attempt.status = AttemptStatus.TIMED_OUT
+        return await self._mark_terminated(attempt, detail)
+
+    async def _mark_terminated(self, attempt: Attempt, detail: str) -> RunOutcome:
+        """Record the confirmed end of a remote session.
+
+        Termination reached through the deadline becomes TIMED_OUT; termination requested
+        by an operator cancel becomes CANCELLED; termination forced by a worker error
+        becomes FAILED. Terminal case states are only entered here, after confirmation.
+        """
+        pending = attempt.reconciliation_reason or ""
+        now = self.clock()
+        expired = attempt.timeout_at is not None and now >= attempt.timeout_at
+        if pending.startswith(CANCEL_TERMINATION_REASON) and not expired:
+            reason = f"{CANCEL_TERMINATION_REASON}; {detail}"
+            attempt_status, case_state, kind = (
+                AttemptStatus.CANCELLED,
+                CaseState.CANCELLED,
+                "case_cancelled",
+            )
+            result = RunResult.FAILED
+        elif pending.startswith(WORKER_ERROR_TERMINATION_PREFIX) and not expired:
+            reason = f"{pending}; {detail}"
+            attempt_status, case_state, kind = (
+                AttemptStatus.FAILED,
+                CaseState.FAILED,
+                "case_failed",
+            )
+            result = RunResult.FAILED
+        else:
+            deadline = attempt.timeout_at.isoformat() if attempt.timeout_at else "?"
+            reason = f"Devin session exceeded deadline {deadline}; {detail}"
+            attempt_status, case_state, kind = (
+                AttemptStatus.TIMED_OUT,
+                CaseState.TIMED_OUT,
+                "case_timed_out",
+            )
+            result = RunResult.TIMED_OUT
+        attempt.status = attempt_status
         attempt.error = reason
         attempt.reconciliation_reason = None
-        attempt.finished_at = self.clock()
+        attempt.finished_at = now
         self.case.failure_reason = reason
-        await self._transition(CaseState.TIMED_OUT, reason)
-        self.session.add(_outbox(self.case, "case_timed_out", reason=reason))
+        await self._transition(case_state, reason)
+        self.session.add(_outbox(self.case, kind, reason=reason))
         await self.session.commit()
-        return RunOutcome(RunResult.TIMED_OUT, attempt, None, reason)
+        return RunOutcome(result, attempt, None, reason)
 
 
 async def _source_issue(session: AsyncSession, case: Case) -> dict[str, Any]:

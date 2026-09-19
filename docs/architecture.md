@@ -104,6 +104,29 @@ after lease expiry and retries the final-GET/DELETE cycle until termination is
 confirmed. Local polling therefore never stops while a paid session may still
 be running unobserved.
 
+The same final-GET/DELETE path handles every other way a live session can
+lose its local owner:
+
+- **Worker error.** An unexpected exception while an attempt has a sent
+  create (`create_sent_at` set) parks the attempt and case in
+  `TERMINATION_PENDING` with a `worker error: …` reason instead of `FAILED`;
+  `fail_case` refuses to make such a case terminal until the remote session is
+  confirmed gone. Lease loss / concurrent transitions cancel only attempts
+  whose create was never sent.
+- **Operator cancel.** Cancelling a case in `TRIAGING`, `REMEDIATING`, or any
+  state whose active/blocked attempt may own a session moves it to
+  `TERMINATION_PENDING`. The poll loop re-reads the case state every
+  iteration, so a cancel during polling terminates the session on the next
+  poll rather than at the deadline. A `PENDING` create is terminated by exact
+  tag lookup.
+- **Retry.** Before a new create, earlier blocked attempts with a known
+  session id are `DELETE`d (failure blocks the retry). An `UNRESOLVED` create
+  never permits a second `POST` until the operator retries with
+  `confirm_no_session=true`, which records the acknowledgement on the attempt.
+
+The deadline `timeout_at` is anchored when the session is attached (after the
+`POST` returns or the tag reconciliation succeeds), not before create latency.
+
 ### Restart recovery
 
 All runner state lives in the `attempts` row (session id, deadline, poll
@@ -169,6 +192,7 @@ stateDiagram-v2
   HUMAN_BLOCKED --> RECEIVED
   HUMAN_BLOCKED --> CANCELLED
   HUMAN_BLOCKED --> FAILED
+  HUMAN_BLOCKED --> TERMINATION_PENDING
   FAILED --> RECEIVED
   TIMED_OUT --> RECEIVED
   TERMINATION_PENDING --> CANCELLED

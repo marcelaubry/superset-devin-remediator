@@ -55,6 +55,10 @@ ACTIVE_ATTEMPT_STATUSES = frozenset(
     {AttemptStatus.RUNNING, AttemptStatus.RECONCILING, AttemptStatus.TERMINATION_PENDING}
 )
 
+UNRESOLVED_CREATE_ACK = "operator confirmed no live Devin session carries this operation key"
+CANCEL_TERMINATION_REASON = "operator requested cancel"
+WORKER_ERROR_TERMINATION_PREFIX = "worker error"
+
 
 class CreateState(str, enum.Enum):
     """Outcome of the single POST /sessions issued for an attempt."""

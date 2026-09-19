@@ -105,11 +105,11 @@ uv run python scripts/simulate.py --scenario good --bad-signature
 | `DEVIN_ORG_ID` | unset | Devin organization id; required in live mode |
 | `DEVIN_API_BASE_URL` | `https://api.devin.ai/v3` | Devin v3 API base; must be HTTPS in live mode |
 | `DEVIN_TRIAGE_MAX_ACU` | `5` | `max_acu_limit` sent on every triage session |
-| `DEVIN_TRIAGE_TIMEOUT_SECONDS` | `1800` | Absolute deadline after which the session is terminated remotely |
+| `DEVIN_TRIAGE_TIMEOUT_SECONDS` | `1800` | Absolute deadline (anchored after create) after which the session is terminated remotely; live mode enforces `>= 300` |
 | `DEVIN_POLL_INTERVAL_SECONDS` | `15` | Poll interval; live mode enforces `>= 10` (10–30 recommended) |
 | `DEVIN_HTTP_TIMEOUT_SECONDS` | `30` | Per-request HTTP timeout |
 | `DEVIN_HTTP_MAX_RETRIES` | `3` | Bounded retries with backoff and jitter for GET/list only |
-| `DEVIN_REPOS_FORMAT` | `https://github.com/{repository}` | How the allowlisted repository is passed in `repos` |
+| `DEVIN_REPOS_FORMAT` | `https://github.com/{repository}` | How the allowlisted repository is passed in `repos`. **Unverified against the live API** — the v3 spec types `repos` as `array[string]` without documenting the entry format; confirm with one minimal live session (or Devin support) before enabling live mode |
 | `GITHUB_BASE_REF` | `master` | Ref resolved to the exact base SHA pinned in each session |
 | `GITHUB_API_TOKEN` | unset | Optional token for the GitHub commits API used to resolve the base SHA |
 | `RECONCILE_MAX_ATTEMPTS` | `3` | Bounded list-by-tag lookups after an uncertain create |
@@ -119,9 +119,17 @@ uv run python scripts/simulate.py --scenario good --bad-signature
 | `COOKIE_SECURE` | `false` | Set `true` when dashboard traffic is behind TLS |
 
 `.env.example` uses very short fake-mode timeout and poll values so the
-simulation finishes in seconds. Live mode fails closed on startup when the API
-key or org id is missing, the base URL is not HTTPS, the poll interval is under
-10 seconds, or auto-approve is enabled.
+simulation finishes in seconds and placeholder `change-me` secrets. Live mode
+fails closed on startup when the API key or org id is missing, the base URL is
+not HTTPS, the poll interval is under 10 seconds, the triage timeout is under
+300 seconds, `GITHUB_WEBHOOK_SECRET`/`OPERATOR_TOKEN` are `change-me` or
+shorter than 16 characters, or auto-approve is enabled.
+
+A live session is never left without a local owner: worker errors, operator
+cancel (including mid-poll), and retries all go through `TERMINATION_PENDING`
+and a remote `DELETE` before the case becomes terminal or a new session is
+created. Retrying a case whose create outcome is unresolved requires
+`POST /operator/cases/{id}/retry?confirm_no_session=true`.
 
 ### Live mode
 

@@ -33,3 +33,10 @@ def test_terminal_states() -> None:
             CaseState.RECEIVED,
             CaseState.REMEDIATION_CREATE_INTENT,
         }
+
+
+def test_docker_build_context_excludes_local_env_files() -> None:
+    from pathlib import Path
+
+    lines = (Path(__file__).resolve().parents[1] / ".dockerignore").read_text().splitlines()
+    assert ".env" in lines and ".env.*" in lines and "!.env.example" in lines

@@ -1,5 +1,6 @@
 """Phase 2 spend-boundary flows exercised end-to-end against PostgreSQL with the fake client."""
 
+import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
 
@@ -9,11 +10,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from remediator.config import Settings
-from remediator.devin.client import DevinTransportError, SessionSnapshot
+from remediator.devin.client import CreateSessionRequest, DevinTransportError, SessionSnapshot
 from remediator.devin.fake import FakeDevinClient, FakeScenario, sample_triage_output
 from remediator.devin.tags import OPERATION_TAG_PREFIX
-from remediator.lifecycle import CaseState
+from remediator.lifecycle import CaseState, transition
 from remediator.models import (
+    UNRESOLVED_CREATE_ACK,
     Attempt,
     AttemptKind,
     AttemptStatus,
@@ -25,7 +27,7 @@ from remediator.models import (
     WebhookEvent,
 )
 from remediator.worker import Worker
-from remediator.worker.processor import process_case, process_event
+from remediator.worker.processor import fail_case, process_case, process_event
 
 ELIGIBLE_BODY = (
     "Steps to reproduce:\n1. Run.\nExpected behavior works. "
@@ -583,3 +585,297 @@ async def test_api_key_is_absent_from_logs_and_persistence(
         assert all(SECRET not in row for row in rows), table
     assert SECRET not in repr(settings) and SECRET not in settings.model_dump_json()
     assert await db.scalar(select(func.count()).select_from(Attempt)) == 1
+
+
+@pytest.mark.asyncio
+async def test_worker_crash_with_live_session_terminates_before_failing(
+    integration_session_factory: async_sessionmaker[AsyncSession],
+    test_database_url: str,
+) -> None:
+    """H1: an unexpected worker exception must not orphan a paid session."""
+    async with integration_session_factory() as session:
+        session.add(_event(4213, "p2-crash-live"))
+        await session.commit()
+
+    class CrashOnce(FakeDevinClient):
+        crashed = False
+
+        async def get_session(self, session_id: str) -> SessionSnapshot:
+            if not self.crashed:
+                self.crashed = True
+                raise RuntimeError("worker bug while polling")
+            return await super().get_session(session_id)
+
+    client = CrashOnce(scenarios={4213: FakeScenario.TIMEOUT})
+    worker = Worker(
+        _settings(
+            database_url=test_database_url,
+            worker_poll_interval_seconds=0.01,
+            worker_concurrency=1,
+            devin_triage_timeout_seconds=60,
+        )
+    )
+    worker.devin = client
+
+    async def stop_when_terminal() -> None:
+        for _ in range(500):
+            async with integration_session_factory() as session:
+                state = await session.scalar(select(Case.state).where(Case.issue_number == 4213))
+            if state in {CaseState.FAILED, CaseState.TIMED_OUT, CaseState.CANCELLED}:
+                worker.stop()
+                return
+            await asyncio.sleep(0.02)
+        worker.stop()
+
+    try:
+        await asyncio.wait_for(asyncio.gather(worker._run_loop(), stop_when_terminal()), timeout=15)
+    finally:
+        await worker.base_commits.aclose()
+        await worker.engine.dispose()
+
+    async with integration_session_factory() as session:
+        case = await session.scalar(select(Case).where(Case.issue_number == 4213))
+        assert case is not None
+        (attempt,) = await _attempts(session, case)
+        states = await _states(session, case)
+    assert case.state == CaseState.FAILED
+    assert CaseState.TERMINATION_PENDING in states
+    assert states.index(CaseState.TERMINATION_PENDING) < states.index(CaseState.FAILED)
+    assert attempt.status == AttemptStatus.FAILED and attempt.finished_at is not None
+    assert attempt.error and "worker error: worker bug while polling" in attempt.error
+    assert client.terminate_calls == [attempt.devin_session_id]
+    assert client.create_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_fail_case_with_live_session_parks_in_termination_pending(db: AsyncSession) -> None:
+    case = Case(
+        issue_number=4960,
+        repository="apache/superset",
+        issue_title="live",
+        issue_url="https://github.com/apache/superset/issues/4960",
+        state=CaseState.TRIAGING,
+    )
+    db.add(case)
+    await db.flush()
+    client = FakeDevinClient(scenarios={4960: FakeScenario.TIMEOUT})
+    remote = await client.create_session(
+        CreateSessionRequest(
+            prompt="p",
+            repository="apache/superset",
+            base_sha="0" * 40,
+            max_acu_limit=1,
+            operation_key=f"op:{case.id}:TRIAGE:1",
+            tags=("issue:4960", "kind:TRIAGE"),
+            structured_output_schema={},
+        )
+    )
+    live = Attempt(
+        case_id=case.id,
+        kind=AttemptKind.TRIAGE,
+        idempotency_key=f"{case.id}:TRIAGE:1",
+        operation_key=f"op:{case.id}:TRIAGE:1",
+        create_state=CreateState.CREATED,
+        status=AttemptStatus.RUNNING,
+        create_sent_at=datetime.now(UTC),
+        devin_session_id=remote.session_id,
+    )
+    db.add(live)
+    await db.commit()
+
+    await fail_case(db, case, "boom", "worker")
+    await db.commit()
+    await db.refresh(live)
+    assert case.state == CaseState.TERMINATION_PENDING
+    assert live.status == AttemptStatus.TERMINATION_PENDING
+    assert live.reconciliation_reason and live.reconciliation_reason.startswith("worker error")
+
+    await process_case(db, case, client, _settings())
+    await db.refresh(live)
+    assert case.state == CaseState.FAILED
+    assert live.status == AttemptStatus.FAILED
+    assert client.terminate_calls == [remote.session_id]
+    assert client.create_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_change_leaves_sent_attempts_for_case_owner(
+    db: AsyncSession, test_database_url: str
+) -> None:
+    case = Case(
+        issue_number=4961,
+        repository="apache/superset",
+        issue_title="concurrent",
+        issue_url="https://github.com/apache/superset/issues/4961",
+        state=CaseState.TERMINATION_PENDING,
+    )
+    db.add(case)
+    await db.flush()
+    unsent = Attempt(
+        case_id=case.id,
+        kind=AttemptKind.REMEDIATION,
+        idempotency_key=f"{case.id}:REMEDIATION:1",
+        operation_key=f"op:{case.id}:REMEDIATION:1",
+        create_state=CreateState.PENDING,
+        status=AttemptStatus.RUNNING,
+    )
+    sent = Attempt(
+        case_id=case.id,
+        kind=AttemptKind.TRIAGE,
+        idempotency_key=f"{case.id}:TRIAGE:1",
+        operation_key=f"op:{case.id}:TRIAGE:1",
+        create_state=CreateState.CREATED,
+        status=AttemptStatus.RUNNING,
+        create_sent_at=datetime.now(UTC),
+        devin_session_id="devin-owned",
+    )
+    db.add_all([unsent, sent])
+    await db.commit()
+
+    worker = Worker(_settings(database_url=test_database_url))
+    try:
+        await worker._cancel_unsent_attempts(db, case.id)
+        await db.commit()
+    finally:
+        await worker.base_commits.aclose()
+        await worker.engine.dispose()
+    await db.refresh(unsent)
+    await db.refresh(sent)
+    assert unsent.status == AttemptStatus.CANCELLED
+    assert sent.status == AttemptStatus.RUNNING and sent.finished_at is None
+
+    client = FakeDevinClient()
+    await process_case(db, case, client, _settings())
+    await db.refresh(sent)
+    assert case.state == CaseState.CANCELLED
+    assert sent.status == AttemptStatus.CANCELLED
+    assert client.terminate_calls == ["devin-owned"]
+
+
+@pytest.mark.asyncio
+async def test_operator_cancel_during_polling_terminates_promptly(
+    db: AsyncSession, integration_session_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    """M1: the poll loop observes TERMINATION_PENDING instead of running to the deadline."""
+    event = _event(4213, "p2-cancel-poll")
+    db.add(event)
+    await db.commit()
+
+    class OperatorCancels(FakeDevinClient):
+        polls = 0
+
+        async def get_session(self, session_id: str) -> SessionSnapshot:
+            self.polls += 1
+            if self.polls == 2:
+                async with integration_session_factory() as other:
+                    target = await other.scalar(select(Case).where(Case.issue_number == 4213))
+                    assert target is not None
+                    await transition(
+                        other, target, CaseState.TERMINATION_PENDING, "operator cancel", "operator"
+                    )
+                    await other.commit()
+            return await super().get_session(session_id)
+
+    client = OperatorCancels(scenarios={4213: FakeScenario.TIMEOUT})
+    started = datetime.now(UTC)
+    await process_event(db, event, client, _settings(devin_triage_timeout_seconds=3600))
+    elapsed = datetime.now(UTC) - started
+    case = await db.scalar(select(Case).where(Case.issue_number == 4213))
+    assert case and case.state == CaseState.CANCELLED
+    (attempt,) = await _attempts(db, case)
+    assert attempt.status == AttemptStatus.CANCELLED
+    assert attempt.error and attempt.error.startswith("operator requested cancel")
+    assert client.terminate_calls == [attempt.devin_session_id]
+    assert client.polls <= 4 and elapsed < timedelta(seconds=5)
+    assert attempt.timeout_at and attempt.timeout_at > datetime.now(UTC)
+
+
+@pytest.mark.asyncio
+async def test_retry_from_waiting_session_terminates_it_before_new_create(
+    db: AsyncSession,
+) -> None:
+    """M2: a blocked session with a known id is terminated before a second POST."""
+    event = _event(4213, "p2-retry-blocked")
+    db.add(event)
+    await db.commit()
+    client = FakeDevinClient(scenarios={4213: FakeScenario.WAITING_FOR_HUMAN})
+    await process_event(db, event, client, _settings())
+    case = await db.scalar(select(Case).where(Case.issue_number == 4213))
+    assert case and case.state == CaseState.HUMAN_BLOCKED
+    (first,) = await _attempts(db, case)
+    first_session = first.devin_session_id
+    assert first.status == AttemptStatus.BLOCKED and first_session
+
+    await transition(db, case, CaseState.RECEIVED, "operator requested retry", "operator")
+    await db.commit()
+    client._scenarios[4213] = FakeScenario.SUCCESS
+    await process_case(db, case, client, _settings())
+
+    await db.refresh(first)
+    attempts = await _attempts(db, case)
+    assert len(attempts) == 2 and client.create_calls == 2
+    assert client.terminate_calls == [first_session]
+    assert first.status == AttemptStatus.CANCELLED
+    assert first.error and "terminated before retry" in first.error
+    assert attempts[1].devin_session_id != first_session
+    assert case.state == CaseState.AWAITING_REMEDIATION_APPROVAL
+
+
+@pytest.mark.asyncio
+async def test_retry_from_unresolved_create_requires_operator_confirmation(
+    db: AsyncSession,
+) -> None:
+    """M2: an unresolved first POST blocks a second one until an operator confirms."""
+    event = _event(4213, "p2-retry-unresolved")
+    db.add(event)
+    await db.commit()
+
+    class VanishingOnce(FakeDevinClient):
+        async def create_session(self, request):  # type: ignore[no-untyped-def]
+            if self.create_calls == 0:
+                self.create_calls += 1
+                raise DevinTransportError("simulated: socket closed before response")
+            return await super().create_session(request)
+
+    client = VanishingOnce()
+    await process_event(db, event, client, _settings(reconcile_max_attempts=1))
+    case = await db.scalar(select(Case).where(Case.issue_number == 4213))
+    assert case and case.state == CaseState.HUMAN_BLOCKED
+    (first,) = await _attempts(db, case)
+    assert first.create_state == CreateState.UNRESOLVED
+
+    await transition(db, case, CaseState.RECEIVED, "operator requested retry", "operator")
+    await db.commit()
+    await process_case(db, case, client, _settings())
+    assert client.create_calls == 1
+    assert case.state == CaseState.FAILED
+    assert case.failure_reason and "unresolved create" in case.failure_reason
+    assert len(await _attempts(db, case)) == 1
+
+    first.reconciliation_reason = UNRESOLVED_CREATE_ACK
+    await transition(db, case, CaseState.RECEIVED, "operator confirmed no session", "operator")
+    await db.commit()
+    await process_case(db, case, client, _settings())
+    await db.refresh(first)
+    assert client.create_calls == 2
+    assert first.status == AttemptStatus.CANCELLED
+    assert case.state == CaseState.AWAITING_REMEDIATION_APPROVAL
+
+
+@pytest.mark.asyncio
+async def test_deadline_is_anchored_after_session_creation(db: AsyncSession) -> None:
+    event = _event(4213, "p2-deadline-anchor")
+    db.add(event)
+    await db.commit()
+
+    class SlowCreate(FakeDevinClient):
+        async def create_session(self, request):  # type: ignore[no-untyped-def]
+            await asyncio.sleep(0.2)
+            return await super().create_session(request)
+
+    await process_event(db, event, SlowCreate(), _settings(devin_triage_timeout_seconds=5))
+    case = await db.scalar(select(Case).where(Case.issue_number == 4213))
+    assert case is not None
+    (attempt,) = await _attempts(db, case)
+    assert attempt.started_at and attempt.timeout_at
+    assert attempt.timeout_at - attempt.started_at >= timedelta(seconds=5.2)
