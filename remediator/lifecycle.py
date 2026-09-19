@@ -16,6 +16,9 @@ class CaseState(StrEnum):
     TRIAGING = "TRIAGING"
     TRIAGED = "TRIAGED"
     AWAITING_REMEDIATION_APPROVAL = "AWAITING_REMEDIATION_APPROVAL"
+    APPROVAL_DELIVERY_FAILED = "APPROVAL_DELIVERY_FAILED"
+    REMEDIATION_APPROVED = "REMEDIATION_APPROVED"
+    REMEDIATION_REJECTED = "REMEDIATION_REJECTED"
     REMEDIATION_CREATE_INTENT = "REMEDIATION_CREATE_INTENT"
     REMEDIATING = "REMEDIATING"
     OUTPUT_VALIDATING = "OUTPUT_VALIDATING"
@@ -36,6 +39,7 @@ TERMINAL_STATES = frozenset(
         CaseState.CI_PASSED,
         CaseState.TIMED_OUT,
         CaseState.POLICY_REJECTED,
+        CaseState.REMEDIATION_REJECTED,
         CaseState.FAILED,
         CaseState.CANCELLED,
     }
@@ -87,7 +91,27 @@ TRANSITIONS: dict[CaseState, frozenset[CaseState]] = {
             CaseState.TERMINATION_PENDING,
         }
     ),
+    # Approval is recorded on the approval request; the case only advances once the
+    # signed GitHub `labeled` webhook confirms `devin:remediate` was applied.
     CaseState.AWAITING_REMEDIATION_APPROVAL: frozenset(
+        {
+            CaseState.REMEDIATION_APPROVED,
+            CaseState.REMEDIATION_REJECTED,
+            CaseState.APPROVAL_DELIVERY_FAILED,
+            CaseState.FAILED,
+            CaseState.CANCELLED,
+            CaseState.TERMINATION_PENDING,
+        }
+    ),
+    CaseState.APPROVAL_DELIVERY_FAILED: frozenset(
+        {
+            CaseState.REMEDIATION_APPROVED,
+            CaseState.FAILED,
+            CaseState.CANCELLED,
+            CaseState.TERMINATION_PENDING,
+        }
+    ),
+    CaseState.REMEDIATION_APPROVED: frozenset(
         {
             CaseState.REMEDIATION_CREATE_INTENT,
             CaseState.FAILED,
@@ -95,6 +119,7 @@ TRANSITIONS: dict[CaseState, frozenset[CaseState]] = {
             CaseState.TERMINATION_PENDING,
         }
     ),
+    CaseState.REMEDIATION_REJECTED: frozenset(),
     CaseState.REMEDIATION_CREATE_INTENT: frozenset(
         {
             CaseState.RECONCILING_CREATE,

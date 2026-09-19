@@ -6,7 +6,7 @@ from sqlalchemy import desc, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..approvals import approve_remediation
+from ..approvals import confirm_label_webhook, create_approval_request
 from ..config import Settings
 from ..devin.client import DevinClient, DevinError, DevinSessionNotFound
 from ..devin.triage import TriageValidationError, validate_triage_output
@@ -15,6 +15,7 @@ from ..lifecycle import CaseState, transition
 from ..models import (
     ACTIVE_ATTEMPT_STATUSES,
     CANCEL_TERMINATION_REASON,
+    OUTBOX_KIND_GITHUB_NOT_FEASIBLE,
     Attempt,
     AttemptKind,
     AttemptStatus,
@@ -101,7 +102,7 @@ async def _finish_triage(
             NotificationOutbox(
                 case_id=case.id,
                 channel=OutboxChannel.GITHUB,
-                kind="triage_not_feasible",
+                kind=OUTBOX_KIND_GITHUB_NOT_FEASIBLE,
                 payload={
                     "issue_number": case.issue_number,
                     "outcome": result.outcome,
@@ -112,23 +113,9 @@ async def _finish_triage(
         )
         await session.commit()
         return
-    session.add(
-        NotificationOutbox(
-            case_id=case.id,
-            channel=OutboxChannel.SLACK,
-            kind="remediation_approval_requested",
-            payload={
-                "issue_number": case.issue_number,
-                "issue_url": case.issue_url,
-                "devin_session_url": case.devin_session_url,
-                "summary": result.summary,
-                "severity": result.severity,
-                "priority": result.priority,
-                "confidence": result.confidence,
-                "probe_command": result.probe_command,
-            },
-        )
-    )
+    # The Slack notification is only an outbox row here; delivery happens asynchronously
+    # and its failure can never roll back the validated triage result.
+    await create_approval_request(session, case, attempt, result, settings)
     await transition(
         session,
         case,
@@ -138,9 +125,6 @@ async def _finish_triage(
         expected_claimed_by=claimed_by,
     )
     await session.commit()
-    if settings.simulation_auto_approve_remediation and not settings.live_mode:
-        await approve_remediation(session, case, "simulation", claimed_by)
-        await session.commit()
 
 
 async def _evaluate_eligibility(session: AsyncSession, case: Case, claimed_by: str | None) -> bool:
@@ -376,6 +360,14 @@ async def _active_kind(session: AsyncSession, case: Case) -> AttemptKind | None:
     return kind
 
 
+def _is_remediation_label_event(event: WebhookEvent, settings: Settings) -> bool:
+    if event.event_type != "issues" or event.action != "labeled":
+        return False
+    label = event.payload.get("label", {})
+    name = str(label.get("name", "")) if isinstance(label, dict) else ""
+    return name.lower() == settings.github_remediation_label.lower()
+
+
 async def process_event(
     session: AsyncSession,
     event: WebhookEvent,
@@ -390,6 +382,25 @@ async def process_event(
             Case.repository == event.repository, Case.issue_number == issue.get("number")
         )
     )
+    if _is_remediation_label_event(event, settings):
+        confirmed = False
+        if case is not None:
+            confirmed = await confirm_label_webhook(
+                session, case, settings.github_remediation_label, event.delivery_id
+            )
+            event.case_id = case.id
+        logger.info(
+            "remediation label webhook %s for %s#%s: %s",
+            event.delivery_id,
+            event.repository,
+            issue.get("number"),
+            "confirmed approval" if confirmed else "ignored (no recorded approval)",
+        )
+        event.status = EventStatus.PROCESSED
+        event.last_error = None if confirmed else "label webhook without matching approval"
+        event.processed_at = datetime.now(UTC)
+        await session.commit()
+        return
     if case is None:
         case = Case(
             repository=event.repository,

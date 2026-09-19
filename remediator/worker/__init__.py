@@ -9,6 +9,7 @@ from uuid import uuid4
 from sqlalchemy import exists, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ..adapters import build_github_client, build_slack_client
 from ..config import Settings
 from ..db import build_engine, build_session_factory
 from ..devin import build_devin_client
@@ -22,6 +23,7 @@ from ..models import (
     EventStatus,
     WebhookEvent,
 )
+from .outbox import OutboxDispatcher
 from .processor import _terminate_running_attempts, fail_case, process_case, process_event
 
 CLAIMABLE_STATES = frozenset(
@@ -48,6 +50,11 @@ class Worker:
         self.base_commits = build_base_commit_resolver(settings)
         self.stop_event = asyncio.Event()
         self.worker_id = f"{socket.gethostname()}:{os.getpid()}:{uuid4().hex[:6]}"
+        self.slack = build_slack_client(settings, self.session_factory)
+        self.github = build_github_client(settings)
+        self.outbox = OutboxDispatcher(
+            settings, self.session_factory, self.slack, self.github, self.worker_id
+        )
 
     async def _claim_event(self) -> WebhookEvent | None:
         while True:
@@ -274,6 +281,10 @@ class Worker:
             event = await self._claim_event()
             case = None if event else await self._claim_case()
             if not event and not case:
+                outbox_row = await self.outbox.claim()
+                if outbox_row is not None:
+                    await self.outbox.dispatch(outbox_row.id)
+                    continue
                 await asyncio.sleep(self.settings.worker_poll_interval_seconds)
                 continue
             try:
@@ -337,6 +348,8 @@ class Worker:
         finally:
             await self.devin.aclose()
             await self.base_commits.aclose()
+            await self.slack.aclose()
+            await self.github.aclose()
             await self.engine.dispose()
 
     def stop(self) -> None:

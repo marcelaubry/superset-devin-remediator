@@ -51,7 +51,7 @@ async def github_webhook(
     payload: dict[str, Any] = parsed
     action = str(payload.get("action", ""))
     repository = payload.get("repository", {}).get("full_name")
-    if repository != settings.github_repository:
+    if not isinstance(repository, str) or not settings.repository_allowed(repository):
         webhook_requests_total.labels(result="filtered").inc()
         return JSONResponse(
             {"accepted": False, "reason": "repository not allowed"}, status_code=202
@@ -63,13 +63,12 @@ async def github_webhook(
         webhook_requests_total.labels(result="filtered").inc()
         return JSONResponse({"accepted": False, "reason": "action not allowed"}, status_code=202)
     required = settings.github_required_label.lower()
+    event_label = str(payload.get("label", {}).get("name", "")).lower()
+    remediation_label = settings.github_remediation_label.lower()
     if (
         required
         and required not in _labels(payload)
-        and not (
-            action == "labeled"
-            and str(payload.get("label", {}).get("name", "")).lower() == required
-        )
+        and not (action == "labeled" and event_label in {required, remediation_label})
     ):
         webhook_requests_total.labels(result="filtered").inc()
         return JSONResponse(

@@ -13,6 +13,7 @@ from sqlalchemy.orm import selectinload
 from ..db import get_session
 from ..lifecycle import TERMINAL_STATES, CaseState
 from ..models import (
+    ApprovalRequest,
     Attempt,
     AttemptKind,
     AttemptStatus,
@@ -69,7 +70,64 @@ def latest_triage_result(case: Case) -> dict[str, Any] | None:
     return attempt.structured_output
 
 
+def latest_approval(case: Case) -> ApprovalRequest | None:
+    if not case.approval_requests:
+        return None
+    return max(case.approval_requests, key=lambda request: request.created_at)
+
+
+def approval_json(case: Case) -> dict[str, Any] | None:
+    approval = latest_approval(case)
+    if approval is None:
+        return None
+    return {
+        "id": str(approval.id),
+        "attempt_id": str(approval.attempt_id),
+        "triage_schema_version": approval.triage_schema_version,
+        "triage_result_hash": approval.triage_result_hash,
+        "token_expires_at": approval.token_expires_at.isoformat(),
+        "notification_status": approval.notification_status.value,
+        "slack_channel": approval.slack_channel,
+        "slack_message_ts": approval.slack_message_ts,
+        "decision": approval.decision.value,
+        "decided_by_slack_user_id": approval.decided_by_slack_user_id,
+        "decided_at": approval.decided_at.isoformat() if approval.decided_at else None,
+        "decision_action_id": approval.decision_action_id,
+        "decision_reason": approval.decision_reason,
+        "label_operation": approval.label_operation,
+        "delivery_status": approval.delivery_status.value,
+        "label_applied_at": (
+            approval.label_applied_at.isoformat() if approval.label_applied_at else None
+        ),
+        "label_confirmed_at": (
+            approval.label_confirmed_at.isoformat() if approval.label_confirmed_at else None
+        ),
+        "github_comment_id": approval.github_comment_id,
+        "actions": [
+            {
+                "slack_user_id": action.slack_user_id,
+                "action_id": action.action_id,
+                "action_ts": action.action_ts,
+                "outcome": action.outcome,
+                "created_at": action.created_at.isoformat(),
+            }
+            for action in approval.actions
+        ],
+        "events": [
+            {
+                "seq": event.seq,
+                "kind": event.kind,
+                "actor": event.actor,
+                "detail": event.detail,
+                "created_at": event.created_at.isoformat(),
+            }
+            for event in approval.events
+        ],
+    }
+
+
 TEMPLATE_HELPERS: dict[str, object] = {
+    "latest_approval": latest_approval,
     "humanize": _humanize,
     "until": _until,
     "attempt_elapsed": _attempt_elapsed,
@@ -83,7 +141,13 @@ async def load_case(session: AsyncSession, case_id: UUID) -> Case | None:
         Case | None,
         await session.scalar(
             select(Case)
-            .options(selectinload(Case.attempts), selectinload(Case.transitions))
+            .options(
+                selectinload(Case.attempts),
+                selectinload(Case.transitions),
+                selectinload(Case.outbox),
+                selectinload(Case.approval_requests).selectinload(ApprovalRequest.events),
+                selectinload(Case.approval_requests).selectinload(ApprovalRequest.actions),
+            )
             .where(Case.id == case_id)
         ),
     )

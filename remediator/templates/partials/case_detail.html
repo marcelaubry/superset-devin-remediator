@@ -40,16 +40,52 @@
   <pre>{{triage_result|tojson(indent=2)}}</pre>
 </section>
 {% endif %}
+{% set approval = latest_approval(case) %}
+{% if approval %}
+<section id="approval">
+  <h2>Remediation approval</h2>
+  <dl>
+    <dt>Slack notification</dt><dd>{{approval.notification_status.value}}{% if approval.slack_message_ts %} · channel {{approval.slack_channel}} · ts {{approval.slack_message_ts}}{% endif %}</dd>
+    <dt>Decision</dt><dd>{{approval.decision.value}}{% if approval.decided_by_slack_user_id %} by Slack user <code>{{approval.decided_by_slack_user_id}}</code> at {{approval.decided_at}}{% endif %}{% if approval.decision_reason %} — {{approval.decision_reason}}{% endif %}</dd>
+    <dt>Action token</dt><dd>{% if approval.decision.value == "PENDING" %}valid until {{approval.token_expires_at}} ({{until(approval.token_expires_at)}}){% else %}closed{% endif %}</dd>
+    <dt>GitHub label delivery</dt><dd>{{approval.delivery_status.value}}{% if approval.label_operation %} · {{approval.label_operation}}{% endif %}{% if approval.label_applied_at %} · applied {{approval.label_applied_at}}{% endif %}{% if approval.label_confirmed_at %} · confirmed by webhook {{approval.label_confirmed_at}}{% endif %}</dd>
+    <dt>GitHub comment</dt><dd>{{approval.github_comment_id or "-"}}</dd>
+    <dt>Triage result</dt><dd><code>sha256:{{approval.triage_result_hash}}</code> (schema {{approval.triage_schema_version}})</dd>
+  </dl>
+  {% if approval.decision.value == "PENDING" %}
+  <form method="post" action="/operator/approvals/{{approval.id}}/expire" hx-post="/operator/approvals/{{approval.id}}/expire" hx-target="#case-detail" hx-swap="innerHTML"><button>Expire action token</button></form>
+  {% endif %}
+  <h3>Approval timeline</h3>
+  <ol>{% for item in approval.events %}<li>{{item.created_at}}: <strong>{{item.kind}}</strong> ({{item.actor}}) — {{item.detail}}</li>{% else %}<li>None</li>{% endfor %}</ol>
+</section>
+{% endif %}
+{% if case.outbox %}
+<section id="outbox">
+  <h2>Outbox</h2>
+  <table>
+    <thead><tr><th>Channel</th><th>Kind</th><th>Status</th><th>Attempts</th><th>Next attempt</th><th>Last error</th><th></th></tr></thead>
+    <tbody>
+    {% for row in case.outbox|sort(attribute="created_at") %}
+    <tr>
+      <td>{{row.channel.value}}</td><td>{{row.kind}}</td><td>{{row.status.value}}</td><td>{{row.attempts_count}}</td>
+      <td>{% if row.status.value == "PENDING" %}{{until(row.next_attempt_at)}}{% else %}-{% endif %}</td>
+      <td>{{row.last_error or "-"}}</td>
+      <td>{% if row.status.value == "FAILED" %}<form method="post" action="/operator/outbox/{{row.id}}/retry" hx-post="/operator/outbox/{{row.id}}/retry" hx-target="#case-detail" hx-swap="innerHTML"><button>Retry</button></form>{% endif %}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endif %}
 <section id="case-status">
   <h2>Actions</h2>
   {% if case.state in ["FAILED","TIMED_OUT","HUMAN_BLOCKED"] %}
   <form method="post" action="/operator/cases/{{case.id}}/retry" hx-post="/operator/cases/{{case.id}}/retry" hx-target="#case-detail" hx-swap="innerHTML"><button>Retry</button></form>
   {% endif %}
   {% if case.state == "AWAITING_REMEDIATION_APPROVAL" %}
-  <form method="post" action="/operator/cases/{{case.id}}/approve-remediation" hx-post="/operator/cases/{{case.id}}/approve-remediation" hx-target="#case-detail" hx-swap="innerHTML"><button>Approve remediation</button></form>
-  <form method="post" action="/operator/cases/{{case.id}}/reject-remediation" hx-post="/operator/cases/{{case.id}}/reject-remediation" hx-target="#case-detail" hx-swap="innerHTML"><button>Reject remediation</button></form>
+  <p class="muted">Remediation approval happens in Slack (approve/reject buttons on the notification). Operators cannot approve from the dashboard.</p>
   {% endif %}
-  {% if case.state not in ["CI_PASSED","TIMED_OUT","POLICY_REJECTED","FAILED","CANCELLED"] %}
+  {% if case.state not in ["CI_PASSED","TIMED_OUT","POLICY_REJECTED","FAILED","CANCELLED","REMEDIATION_REJECTED"] %}
   <form method="post" action="/operator/cases/{{case.id}}/cancel" hx-post="/operator/cases/{{case.id}}/cancel" hx-target="#case-detail" hx-swap="innerHTML"><button>Cancel</button></form>
   {% endif %}
 </section>

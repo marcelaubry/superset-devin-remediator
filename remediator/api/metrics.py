@@ -5,3 +5,15 @@ webhook_requests_total = Counter(
     "GitHub webhook requests by outcome",
     ["result"],
 )
+
+slack_action_requests_total = Counter(
+    "slack_action_requests_total",
+    "Slack interaction requests by outcome",
+    ["result"],
+)
+
+outbox_deliveries_total = Counter(
+    "outbox_deliveries_total",
+    "Outbox dispatch attempts by channel and outcome",
+    ["channel", "result"],
+)

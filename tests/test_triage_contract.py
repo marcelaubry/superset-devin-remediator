@@ -126,7 +126,6 @@ LIVE_OK: dict[str, Any] = {
     "devin_triage_timeout_seconds": 1800,
     "github_webhook_secret": "webhook-secret-with-enough-entropy",
     "operator_token": "operator-token-with-enough-entropy",
-    "simulation_auto_approve_remediation": False,
     "_env_file": None,
 }
 
@@ -144,8 +143,6 @@ def test_live_mode_fails_closed_without_credentials(monkeypatch: pytest.MonkeyPa
         Settings(devin_client_mode="live", devin_api_key="apk_unit_test_secret_key", _env_file=None)
     with pytest.raises(ValueError, match="at least 10s"):
         _live(devin_poll_interval_seconds=1)
-    with pytest.raises(ValueError, match="SIMULATION_AUTO_APPROVE_REMEDIATION"):
-        _live(simulation_auto_approve_remediation=True)
     with pytest.raises(ValueError, match="https"):
         _live(devin_api_base_url="http://api.devin.ai/v3")
     ok = _live()

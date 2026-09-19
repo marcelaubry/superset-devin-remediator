@@ -3,8 +3,9 @@
 A production-shaped issue remediation service. It accepts signed GitHub issue
 webhooks, evaluates a deterministic zero-ACU rubric, persists an append-only
 lifecycle in PostgreSQL, runs a bounded Devin triage session (live or fake),
-validates the structured triage result, and exposes an authenticated operator
-dashboard. Notification outbox rows are written but not dispatched yet.
+validates the structured triage result, asks a human in Slack to approve or
+reject remediation, dispatches the approval to GitHub as a `devin:remediate`
+label, and exposes an authenticated operator dashboard.
 
 ```text
 GitHub issue opened
@@ -13,12 +14,17 @@ GitHub issue opened
 → durable create intent
 → bounded Devin session
 → schema-validated triage result
-→ awaiting remediation approval
+→ AWAITING_REMEDIATION_APPROVAL (Slack notification, only for remediation_candidate)
+→ authorized Slack user approves or rejects
+→ approval queues `devin:remediate` label + audit comment through the outbox
+→ signed GitHub `issues/labeled` webhook → REMEDIATION_APPROVED
 ```
 
-Phase 2 (this release) implements the live and fake Devin clients for **triage
-only**. Slack approval, remediation sessions, PR creation, and merging are not
-implemented.
+Phase 3 (this release) adds the Slack approval loop and GitHub label dispatch.
+GitHub is the remediation dispatch authority: a case becomes
+`REMEDIATION_APPROVED` only when GitHub's signed webhook confirms the label.
+Slack never calls the Devin API, approval never creates a Devin session, and
+remediation sessions/PRs are deferred to Phase 4.
 
 ## How it works
 
@@ -41,6 +47,28 @@ implemented.
   Devin URL, validated result, and blocked/reconciliation reasons.
 - The fake client emits the same v3 `status`/`status_detail` vocabulary and
   deterministically picks a scenario from the issue number.
+- A validated `remediation_candidate` verdict creates one `approval_requests`
+  row and a Slack outbox row. The worker posts a Block Kit message (escaped,
+  length-capped, no raw issue body, no secrets) with `Approve remediation`,
+  `Reject`, an optional rejection-reason select, `View issue`, and
+  `View evidence/dashboard`. Buttons carry an opaque random token; only its
+  SHA-256 is stored.
+- `POST /webhooks/slack/actions` verifies the raw body (timestamp window, then
+  `v0:{ts}:{body}` HMAC-SHA256 with constant-time compare) before parsing,
+  then checks token, expiry, approver allowlist, case state, and dedupes on
+  `(token, action_ts, user)`. It answers within the request with a short
+  DB transaction; all Slack/GitHub HTTP happens in the worker's outbox
+  dispatcher.
+- Approval records actor/time/action id/triage hash/intended label operation
+  and enqueues `apply_remediation_label`; the worker re-checks the issue,
+  allowlist, and triage hash, applies the label exactly once (idempotent), and
+  posts one append-only audit comment. Rejection records actor/time/reason,
+  moves to `REMEDIATION_REJECTED`, and only posts a comment.
+- Outbox rows retry with bounded exponential backoff; after
+  `OUTBOX_MAX_ATTEMPTS` they are `FAILED` with `last_error` visible in the
+  dashboard, and the label operation moves the case to
+  `APPROVAL_DELIVERY_FAILED`. `POST /operator/outbox/{id}/retry` re-queues them
+  without any re-approval.
 
 ## Run
 
@@ -55,7 +83,7 @@ Open <http://localhost:8000> and sign in with `OPERATOR_TOKEN`.
 
 | Scenario | Fixture | Issue | Expected outcome | Why |
 | --- | --- | ---: | --- | --- |
-| `good` | `issue_good_candidate.json` | 4213 | `CI_PASSED` | Complete reproduction, objective checks, acceptance criteria, and existing-pattern evidence |
+| `good` | `issue_good_candidate.json` | 4213 | `AWAITING_REMEDIATION_APPROVAL` | Complete reproduction, objective checks, acceptance criteria, and existing-pattern evidence |
 | `needs-scoping` | `issue_needs_scoping.json` | 4321 | `POLICY_REJECTED` without Devin session | Missing reproducibility and acceptance details |
 | `deterministic` | `issue_deterministic.json` | 4422 | `POLICY_REJECTED` without Devin session | Dependency/version-bump work is deterministic automation |
 | `human-led` | `issue_human_led.json` | 4501 | `POLICY_REJECTED` without Devin session | Architecture and breaking-change reasoning requires human ownership |
@@ -72,15 +100,27 @@ Open <http://localhost:8000> and sign in with `OPERATOR_TOKEN`.
 | `unknown-status` | `issue_unknown_status.json` | 4666 | `TIMED_OUT` | Undocumented status enters reconciliation and stays bounded by the deadline |
 | `create-rejected` | `issue_create_rejected.json` | 4677 | `FAILED` | Definitive API error on create, recorded as `create_state=API_ERROR` |
 
-`good` reaches `CI_PASSED` only because `SIMULATION_AUTO_APPROVE_REMEDIATION=true`
-drives the fake-only remediation path kept from Phase 1; with it disabled (and
-always in live mode) the case parks at `AWAITING_REMEDIATION_APPROVAL`.
+Phase 3 scenarios drive the same fake adapters through the production
+endpoints (`/webhooks/github`, `/webhooks/slack/actions`, operator API). The
+Phase-1 `SIMULATION_AUTO_APPROVE_REMEDIATION` shortcut was removed: nothing in
+this release enters `REMEDIATION_CREATE_INTENT`.
 
-Run the scenarios through the real webhook endpoint:
+| Scenario | Issue | What it proves |
+| --- | ---: | --- |
+| `approve` | 4213 | Slack post → signed approve click → worker applies label (state still waiting) → signed `labeled` webhook → `REMEDIATION_APPROVED`; no Devin remediation attempt exists |
+| `reject` | 4219 | Signed reject click with a reason → `REMEDIATION_REJECTED`, GitHub comment queued, no label operation |
+| `slack-negative` | 4217 | Bad signature, stale timestamp, missing headers (401), outsider (403), unknown token (404); then duplicate/late clicks are no-ops and exactly one label op is queued |
+| `expired-token` | 4216 | Operator expires the token; the click returns 410 and the case is untouched |
+| `slack-delivery-failure` | 4699 | Fake Slack fails all attempts; triage result survives, outbox shows `FAILED`, authenticated retry delivers |
+| `github-label-failure` | 4688 | Fake GitHub fails all attempts; approval retained, case `APPROVAL_DELIVERY_FAILED`, retry applies the label, webhook confirms |
+
+Run the scenarios through the real endpoints (the simulator signs requests
+with the configured secrets and never prints them):
 
 ```bash
-uv run python scripts/simulate.py --scenario all --wait
-uv run python scripts/simulate.py --scenario good --repeat 2
+uv run python scripts/simulate.py --scenario all --wait      # Phase 1/2 + Phase 3
+uv run python scripts/simulate.py --scenario phase3 --wait
+uv run python scripts/simulate.py --scenario approve --wait
 uv run python scripts/simulate.py --scenario good --bad-signature
 ```
 
@@ -111,10 +151,26 @@ uv run python scripts/simulate.py --scenario good --bad-signature
 | `DEVIN_HTTP_MAX_RETRIES` | `3` | Bounded retries with backoff and jitter for GET/list only |
 | `DEVIN_REPOS_FORMAT` | `https://github.com/{repository}` | How the allowlisted repository is passed in `repos`. **Unverified against the live API** — the v3 spec types `repos` as `array[string]` without documenting the entry format; confirm with one minimal live session (or Devin support) before enabling live mode |
 | `GITHUB_BASE_REF` | `master` | Ref resolved to the exact base SHA pinned in each session |
-| `GITHUB_API_TOKEN` | unset | Optional token for the GitHub commits API used to resolve the base SHA |
 | `RECONCILE_MAX_ATTEMPTS` | `3` | Bounded list-by-tag lookups after an uncertain create |
 | `MAX_ATTEMPTS_PER_KIND` | `3` | Per-case triage/remediation spend cap |
-| `SIMULATION_AUTO_APPROVE_REMEDIATION` | `true` | Fake-only; must be `false` in live mode |
+| `GITHUB_CLIENT_MODE` | `fake` | `fake` or `live` GitHub issues/labels/comments client |
+| `GITHUB_TOKEN` | unset | GitHub token (also used to resolve the base SHA); required in live mode, never logged or persisted |
+| `GITHUB_API_BASE_URL` | `https://api.github.com` | Must be HTTPS in live mode |
+| `GITHUB_REMEDIATION_LABEL` | `devin:remediate` | Label applied on approval and awaited from the webhook |
+| `GITHUB_FAKE_FAIL_LABELS` | `false` | Fake-only: fail every label call (fixture #4688 fails regardless) |
+| `SLACK_CLIENT_MODE` | `fake` | `fake` (messages stored in Postgres) or `live` |
+| `SLACK_BOT_TOKEN` | unset | Bot token for `chat.postMessage`/`chat.update`; required in live mode |
+| `SLACK_SIGNING_SECRET` | `change-me-slack-signing` | Verifies `X-Slack-Signature`; placeholder refused in live mode |
+| `SLACK_CHANNEL_ID` | `C0000000000` | Approval channel |
+| `SLACK_APPROVER_USER_IDS` | `U0000000001` | Comma-separated Slack user ids allowed to approve/reject |
+| `SLACK_MAX_TIMESTAMP_SKEW_SECONDS` | `300` | Replay window for `X-Slack-Request-Timestamp` |
+| `SLACK_ACTION_TOKEN_TTL_SECONDS` | `604800` | Lifetime of the opaque action token |
+| `SLACK_API_BASE_URL` | `https://slack.com/api` | Must be HTTPS in live mode |
+| `SLACK_FAKE_FAIL_POSTS` | `false` | Fake-only: fail every post (fixture #4699 fails regardless) |
+| `DASHBOARD_BASE_URL` | `http://localhost:8000` | Base for the dashboard links placed in Slack/GitHub |
+| `OUTBOX_MAX_ATTEMPTS` | `5` | Bounded outbox retries before terminal `FAILED` |
+| `OUTBOX_BASE_BACKOFF_SECONDS` / `OUTBOX_MAX_BACKOFF_SECONDS` | `2` / `300` | Exponential backoff bounds |
+| `OUTBOX_LEASE_SECONDS` | `120` | Outbox row claim lease |
 | `LOG_LEVEL` | `INFO` | Application log level |
 | `COOKIE_SECURE` | `false` | Set `true` when dashboard traffic is behind TLS |
 
@@ -122,8 +178,11 @@ uv run python scripts/simulate.py --scenario good --bad-signature
 simulation finishes in seconds and placeholder `change-me` secrets. Live mode
 fails closed on startup when the API key or org id is missing, the base URL is
 not HTTPS, the poll interval is under 10 seconds, the triage timeout is under
-300 seconds, `GITHUB_WEBHOOK_SECRET`/`OPERATOR_TOKEN` are `change-me` or
-shorter than 16 characters, or auto-approve is enabled.
+300 seconds, or `GITHUB_WEBHOOK_SECRET`/`OPERATOR_TOKEN` are `change-me` or
+shorter than 16 characters. `SLACK_CLIENT_MODE=live` additionally requires a
+non-placeholder `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, `SLACK_CHANNEL_ID`,
+at least one approver, and an HTTPS API URL; `GITHUB_CLIENT_MODE=live`
+requires `GITHUB_TOKEN` and an HTTPS API URL.
 
 A live session is never left without a local owner: worker errors, operator
 cancel (including mid-poll), and retries all go through `TERMINATION_PENDING`
@@ -140,7 +199,6 @@ DEVIN_ORG_ID=...
 DEVIN_TRIAGE_MAX_ACU=5
 DEVIN_TRIAGE_TIMEOUT_SECONDS=1800
 DEVIN_POLL_INTERVAL_SECONDS=15
-SIMULATION_AUTO_APPROVE_REMEDIATION=false
 ```
 
 Each session is created with exactly one allowlisted repository at the exact
@@ -152,6 +210,40 @@ data inside the prompt. No automated test calls the real API.
 
 The worker's Docker `stop_grace_period` must exceed
 `WORKER_SHUTDOWN_TIMEOUT_SECONDS` so in-flight jobs can drain before SIGKILL.
+
+### Slack setup (live)
+
+1. Create a Slack app; add bot scopes `chat:write` (and `chat:write.public`
+   if the bot is not invited to the channel). Install it and copy the
+   **Bot User OAuth Token** into `SLACK_BOT_TOKEN`.
+2. Copy **Basic Information → Signing Secret** into `SLACK_SIGNING_SECRET`.
+3. Enable **Interactivity & Shortcuts** and set the request URL to
+   `https://<host>/webhooks/slack/actions`. Slack signs each request with
+   `X-Slack-Signature` / `X-Slack-Request-Timestamp` over
+   `v0:{timestamp}:{raw body}`; the endpoint verifies before parsing and
+   rejects requests outside `SLACK_MAX_TIMESTAMP_SKEW_SECONDS`.
+4. Set `SLACK_CHANNEL_ID` to the approval channel and
+   `SLACK_APPROVER_USER_IDS` to the member ids allowed to decide. Anyone else
+   clicking gets a 403 and an audit event; the case is unchanged.
+5. The endpoint returns a JSON body Slack ignores for `block_actions`; the
+   message itself is updated asynchronously through `chat.update` by the
+   worker (awaiting → approved/dispatch pending → label applied / rejected /
+   delivery failed / expired), and the decision buttons are removed after a
+   terminal decision.
+
+### GitHub setup (live)
+
+For this take-home a **fine-grained personal access token** scoped to the
+Superset fork only, with *Issues: read/write* and *Metadata: read*, is
+sufficient (`GITHUB_TOKEN`). For production prefer a **GitHub App** with
+short-lived installation tokens: the App identity shows up in the audit
+comment, tokens expire hourly, and permissions are granted per installation
+rather than per user. The client refuses any repository outside
+`GITHUB_REPOSITORY` before making a request.
+
+Add `labeled` to `GITHUB_ALLOWED_ACTIONS` (default already includes it) so the
+`issues/labeled` webhook for `GITHUB_REMEDIATION_LABEL` can confirm delivery.
+The label is created in the repository by the client if missing.
 
 ## Development and test database
 
@@ -168,12 +260,13 @@ defaulting to
 `postgresql+asyncpg://remediator:remediator@localhost:5432/remediator_test`.
 They require the local test database and skip clearly if it is unavailable.
 
-Set `SIMULATION_AUTO_APPROVE_REMEDIATION=false` to park eligible cases at
-`AWAITING_REMEDIATION_APPROVAL`. With that setting, `simulate.py --wait` stops
-at the approval state and prints the operator approve curl command. The Slack
-approval request is written to the outbox; a later phase will dispatch it and
-Slack interactivity will call the same approval service used by the operator
-endpoint.
+No automated test calls Slack, GitHub, or Devin. `tests/test_phase3_units.py`
+covers the Slack signature algorithm against a reference HMAC, Block Kit
+escaping/limits, live-mode fail-closed validation, GitHub allowlisting and
+idempotent labels, and a secret-hygiene scan of tracked files, fixtures, and
+images. `tests/integration/test_phase3_approval.py` runs the full approval,
+rejection, replay, duplicate, failure/retry, webhook-gating, and restart
+scenarios against Postgres with the fake adapters.
 
 ## Project layout
 
@@ -183,16 +276,19 @@ remediator/
   devin/           DevinClient protocol, live (httpx) + fake clients, status
                    mapping, Draft 7 triage schema, versioned prompt, tags
   github_refs.py   Base commit SHA resolution (GitHub API or fake)
-  github/          Signature verification
+  github/          Webhook signature verification; fake + live issues client
+  slack/           Slack request signing, Block Kit builder, fake + live client
+  approvals.py     Approval request creation, Slack action processing, label
+                   webhook confirmation
   templates/       Jinja2 pages and HTMX partials
   static/          CSS and vendored HTMX
-  worker/          Claims, lifecycle processing, DevinRunner, worker entrypoint
+  worker/          Claims, lifecycle processing, DevinRunner, outbox dispatcher
   config.py        Environment settings
   db.py            Async engine/session helpers
   lifecycle.py     States, transitions, and transition audit writes
   models.py        SQLAlchemy models
   rubric.py        Pure deterministic issue evaluation
-alembic/            Async migration environment; 0001 schema, 0002 Phase 2 attempts
+alembic/            0001 schema, 0002 Phase 2 attempts, 0003 Phase 3 approvals/outbox
 fixtures/github/    Simulation webhook payloads
 scripts/            Endpoint-only simulator
 tests/              Unit and Postgres integration tests
@@ -202,8 +298,9 @@ docs/threat-model.md
 
 ## Scope
 
-Phase 2 performs triage only and does not dispatch GitHub, Slack, or outbox
-notifications, create remediation sessions, open PRs, or merge. See
+Phase 3 stops at `REMEDIATION_APPROVED`. It never creates a Devin remediation
+session, opens PRs, or merges; Slack never calls the Devin API. Phase 4 will
+consume `REMEDIATION_APPROVED` cases. See
 [docs/architecture.md](docs/architecture.md) for component boundaries,
 lifecycle semantics, status mapping, and
 [docs/threat-model.md](docs/threat-model.md) for the spend and secret

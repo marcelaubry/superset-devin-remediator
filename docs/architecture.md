@@ -9,9 +9,12 @@
   PostgreSQL row locks, evaluates the zero-ACU deterministic eligibility
   filter, coordinates fake Devin sessions, and records every lifecycle change.
 - **PostgreSQL:** The operational source of truth for webhook payloads, cases,
-  attempts, append-only transitions, and notification outbox intents.
+  attempts, append-only transitions, approval requests/events, Slack action
+  dedupe records, and the transactional notification outbox.
 - **Dashboard:** Jinja2 and HTMX pages for state counts, throughput, active
-  work, case history, and operator retry/cancel/approval actions.
+  work, case history, approval/delivery status, outbox attempts and errors,
+  and operator retry/cancel/outbox-retry/token-expire actions. There is no
+  dashboard approve/reject: the only decision surface is Slack.
 - **Devin client (`remediator/devin`):** One `DevinClient` protocol with two
   implementations selected by `DEVIN_CLIENT_MODE`. `LiveDevinClient` calls the
   official Devin v3 API (`POST/GET/DELETE /v3/organizations/{org_id}/sessions…`)
@@ -22,6 +25,22 @@
 - **DevinRunner (`remediator/worker/devin_runner.py`):** The bounded session
   state machine: durable create intent → single create → reconcile-by-tag →
   poll until deadline → final GET → remote termination → schema validation.
+- **Slack adapter (`remediator/slack`):** request signature verification
+  (`v0:{ts}:{raw body}` HMAC-SHA256, replay window, constant-time compare),
+  a Block Kit builder that escapes untrusted text and enforces Slack limits,
+  and `SlackClient` implementations: `FakeSlackClient` persists messages in
+  `slack_fake_messages`; `LiveSlackClient` calls `chat.postMessage` /
+  `chat.update`.
+- **GitHub client (`remediator/github/client.py`):** `FakeGitHubClient` and
+  `LiveGitHubClient` (issues GET, labels POST, comments POST). Every call
+  checks the repository allowlist before any network I/O.
+- **Approval service (`remediator/approvals.py`):** creates approval requests
+  after a valid `remediation_candidate` triage, processes verified Slack
+  actions (token → expiry → approver → state → dedupe) in one transaction,
+  and confirms delivery from the signed `issues/labeled` webhook.
+- **Outbox dispatcher (`remediator/worker/outbox.py`):** claims outbox rows
+  with leases, performs the Slack/GitHub call, applies bounded exponential
+  backoff, and marks terminal failures visibly.
 
 ```mermaid
 flowchart LR
@@ -32,11 +51,17 @@ flowchart LR
   W -->|DEVIN_CLIENT_MODE=fake| D[Fake Devin]
   W -->|base SHA| GHAPI[GitHub commits API]
   DB --> UI[Operator browser dashboard]
-  DB --> O[Notification outbox]
-  O -. Phase 2 dispatcher .-> SL[Slack]
-  SL -. human approval .-> API
+  DB --> O[Transactional outbox]
+  W -->|dispatch| O
+  O -->|chat.postMessage / chat.update| SL[Slack channel]
+  SL -->|signed block_actions| API
+  O -->|devin:remediate label + audit comment| GHAPI2[GitHub issues API]
+  GH -->|signed issues/labeled webhook| API
   GH -. audit ledger .- UI
 ```
+
+Slack has no path to Devin: the API records the decision, the worker talks
+only to GitHub, and the case advances only on GitHub's own webhook.
 
 GitHub remains the audit ledger for issue history and eventual comments or
 pull requests. PostgreSQL is the operational source of truth for work state.
@@ -52,6 +77,52 @@ GitHub issue opened
 → schema-validated triage result                   (structured_output_required + Draft 7 validation)
 → awaiting remediation approval                    (AWAITING_REMEDIATION_APPROVAL)
 ```
+
+## Phase 3 approval flow
+
+```text
+validated remediation_candidate                    (worker _finish_triage)
+→ approval_requests row + slack outbox row         (same transaction as the triage result)
+→ worker posts Block Kit message                   (fake or live; failure never touches the triage result)
+→ token generated, sha256 stored, channel/ts stored
+→ POST /webhooks/slack/actions                     (raw body → timestamp window → HMAC → parse)
+   approve: decision recorded (actor, time, action id, triage hash, label op)
+            + outbox apply_remediation_label + slack update
+   reject:  REMEDIATION_REJECTED + outbox rejection_comment + slack update
+→ worker apply_remediation_label                   (issue exists? allowlisted? triage hash current?
+                                                    label idempotent → applied once → audit comment)
+→ GitHub issues/labeled webhook (signed)           → REMEDIATION_APPROVED
+```
+
+Design points:
+
+- **Only candidates notify.** `approval_requests` is created only when the
+  triage output validated against the schema and `outcome ==
+  remediation_candidate`; a unique constraint on `case_id` prevents a second
+  notification for the same case.
+- **Opaque tokens.** The button value is `secrets.token_urlsafe(32)`; only its
+  SHA-256 and expiry are stored. Repository, issue number, and case id are
+  resolved from the token row, never from the Slack payload.
+- **Dedupe.** `slack_actions` has a unique `(approval_request_id, action_ts,
+  slack_user_id)` key; a repeated click returns `duplicate` and the current
+  state. A click after a decision returns `already_decided`.
+- **Fast acknowledgement.** The Slack endpoint does one short transaction and
+  returns; Slack HTTP (message updates) and GitHub HTTP run in the worker.
+- **GitHub is the authority.** After the worker applies the label the
+  approval request shows `LABEL_APPLIED`, but the case stays in
+  `AWAITING_REMEDIATION_APPROVAL` (or `APPROVAL_DELIVERY_FAILED` after a retry)
+  until the signed `issues/labeled` webhook for `GITHUB_REMEDIATION_LABEL`
+  arrives; then `confirm_label_webhook` moves it to `REMEDIATION_APPROVED`.
+  A `labeled` webhook for a case without a recorded `APPROVED` decision is
+  treated as an ordinary ingest and does not advance the case.
+- **Failure isolation.** Slack post failures leave the triage result and
+  case untouched; after `OUTBOX_MAX_ATTEMPTS` the row is `FAILED` with
+  `last_error`. GitHub label failures keep the approval decision and move the
+  case to `APPROVAL_DELIVERY_FAILED`; `POST /operator/outbox/{id}/retry`
+  re-queues the same row and never requires a second human decision.
+- **Nothing calls Devin.** No Phase 3 code path creates a `REMEDIATION`
+  attempt or reaches `REMEDIATION_CREATE_INTENT`; the integration tests assert
+  the fake Devin create count is unchanged across approval.
 
 ### Create intent and spend-boundary idempotency
 
@@ -139,11 +210,12 @@ pending termination is retried.
 ## Lifecycle
 
 The eligibility filter runs without ACU cost. Eligible cases go directly to
-triage; there is no approval or notification before triage. A feasible triage
-verdict creates one Slack approval outbox intent. The Phase 2 Slack outbox
-worker dispatches it, and a human approves or rejects from Slack. Phase 1
-provides operator endpoints as the stand-in; both paths call the same approval
-service.
+triage; there is no approval or notification before triage. A
+`remediation_candidate` verdict creates one approval request and one Slack
+outbox row; an authorized human approves or rejects from Slack, and the case
+reaches `REMEDIATION_APPROVED` only through GitHub's signed `labeled` webhook.
+`REMEDIATION_APPROVED → REMEDIATION_CREATE_INTENT` exists in the transition
+table for Phase 4 but nothing in this release performs it.
 
 ```mermaid
 stateDiagram-v2
@@ -165,9 +237,19 @@ stateDiagram-v2
   TRIAGED --> FAILED
   TRIAGED --> CANCELLED
   TRIAGED --> TERMINATION_PENDING
-  AWAITING_REMEDIATION_APPROVAL --> REMEDIATION_CREATE_INTENT
+  AWAITING_REMEDIATION_APPROVAL --> REMEDIATION_APPROVED: signed labeled webhook
+  AWAITING_REMEDIATION_APPROVAL --> REMEDIATION_REJECTED: Slack reject
+  AWAITING_REMEDIATION_APPROVAL --> APPROVAL_DELIVERY_FAILED: label outbox exhausted
   AWAITING_REMEDIATION_APPROVAL --> CANCELLED
   AWAITING_REMEDIATION_APPROVAL --> FAILED
+  APPROVAL_DELIVERY_FAILED --> REMEDIATION_APPROVED: retry + signed labeled webhook
+  APPROVAL_DELIVERY_FAILED --> CANCELLED
+  APPROVAL_DELIVERY_FAILED --> FAILED
+  APPROVAL_DELIVERY_FAILED --> TERMINATION_PENDING
+  REMEDIATION_APPROVED --> REMEDIATION_CREATE_INTENT: Phase 4
+  REMEDIATION_APPROVED --> CANCELLED
+  REMEDIATION_APPROVED --> FAILED
+  REMEDIATION_REJECTED --> [*]
   REMEDIATION_CREATE_INTENT --> REMEDIATING
   REMEDIATION_CREATE_INTENT --> RECONCILING_CREATE
   REMEDIATION_CREATE_INTENT --> FAILED
@@ -231,7 +313,11 @@ returns directly to `REMEDIATION_CREATE_INTENT`.
 | `cases` | issue identity, state, recommendation, Devin/PR fields | Current operational case record |
 | `attempts` | case, kind, `operation_key` (unique), `create_state`, Devin session id/url/tags/status/detail, ACU telemetry, `base_sha`, `prompt_version`, poll timestamps, `timeout_at`, validated `structured_output`, `reconciliation_reason` | Durable create intent and bounded session audit; partial unique index = one unfinished attempt per (case, kind) |
 | `state_transitions` | case, from/to state, reason, actor | Append-only lifecycle audit |
-| `notification_outbox` | case, channel, kind, payload, status | Notification intents; not dispatched in Phase 1 |
+| `notification_outbox` | case, channel, kind, payload, status, `attempts_count`, `next_attempt_at`, `last_error`, lease, `dedupe_key`, `terminal_failure` | Transactional outbox dispatched by the worker with bounded backoff |
+| `approval_requests` | case (unique), triage attempt, `triage_result_hash`, `action_token_hash` + expiry, Slack channel/ts, notification status, decision/actor/time/action id/reason, label operation, delivery status, GitHub comment id | One approval per case; authoritative record of the human decision |
+| `slack_actions` | approval request, `action_ts`, Slack user, action id, outcome | Unique dedupe key and append-only audit of every verified click |
+| `approval_events` | approval request, kind, actor, detail | Append-only approval timeline shown in the dashboard |
+| `slack_fake_messages` | channel, ts, text, blocks | Fake adapter store, readable only via the authenticated operator API |
 
 ## Webhook request path
 
@@ -244,6 +330,25 @@ returns directly to `REMEDIATION_CREATE_INTENT`.
 
 Filtered requests are acknowledged but never persisted, and the API performs no
 worker processing inline.
+
+`issues/labeled` deliveries are additionally routed to
+`approvals.confirm_label_webhook` when the label equals
+`GITHUB_REMEDIATION_LABEL`; every other labeled delivery is a normal ingest.
+
+### Slack request path (`POST /webhooks/slack/actions`)
+
+1. Read the raw body.
+2. Require `X-Slack-Request-Timestamp`; reject non-integer or
+   `|now - ts| > SLACK_MAX_TIMESTAMP_SKEW_SECONDS` (401).
+3. Compute `v0={hex(hmac_sha256(secret, "v0:" + ts + ":" + body))}` and
+   compare with `X-Slack-Signature` via `hmac.compare_digest` (401).
+4. Only then `application/x-www-form-urlencoded` → `payload` JSON →
+   `block_actions`. Non-decision actions (the reason select) are acknowledged
+   with `200 {"ok": true, "outcome": "ignored"}`.
+5. Look up the token hash (404 unknown, 410 expired), the approver allowlist
+   (403, audited), the case state (409), and the dedupe key.
+6. Record the decision and outbox rows in one transaction and return the
+   current state.
 
 ## Worker claiming and failure isolation
 
@@ -286,22 +391,49 @@ the Devin client closes and the database engine is disposed.
 - Secrets are environment values and are not committed to the repository.
   `DEVIN_API_KEY` is a `SecretStr`: it is excluded from `repr`, redacted from
   API error messages and log records, and never written to the database.
-- Live mode fails closed: missing key/org, non-HTTPS base URL, poll interval
-  below 10 s, or `SIMULATION_AUTO_APPROVE_REMEDIATION=true` refuse to start.
+- Live mode fails closed: missing key/org, non-HTTPS base URL, or poll
+  interval below 10 s refuse to start. `SLACK_CLIENT_MODE=live` and
+  `GITHUB_CLIENT_MODE=live` likewise refuse missing/placeholder tokens and
+  non-HTTPS API URLs. `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, and
+  `GITHUB_TOKEN` are `SecretStr`s covered by the same log redaction filter.
 - Issue title/body/labels are untrusted data inside the Devin prompt, fenced
   by a per-attempt nonce delimiter; the prompt instructs Devin to ignore any
   instructions inside the fence. See [threat-model.md](threat-model.md).
-- Outbox rows are recorded but not dispatched in Phase 2.
+- Slack payloads are never trusted for identity: repository, issue, and case
+  come from the token row; the approver id must be in
+  `SLACK_APPROVER_USER_IDS`. Slack user ids appear only behind operator auth.
+- Slack messages and GitHub comments contain escaped, length-capped triage
+  fields; never the raw issue body, tokens, or secrets. The optional rejection
+  reason is a fixed vocabulary and is stripped of markup before rendering.
+- Fake-adapter state (`slack_fake_messages`) is exposed only through the
+  authenticated `/api/slack/fake/messages` route.
 - Accepted webhook payloads are stored verbatim; deployments should consider
   retention and possible personal information in issue bodies.
 
-## Deferred to Phase 3
+## API assumptions verified against current documentation
 
-- **Remediation sessions:** live mode refuses `REMEDIATION` attempts; the fake
-  remediation path remains only so the Phase 1 simulation still runs.
-- **GitHub App writes:** publish comments, branches, pull requests, and statuses.
-- **Slack dispatcher:** dispatch pending outbox rows and retry delivery.
-- **Slack approval interactivity:** call the existing approval service from Slack.
+- Slack request signing: `v0:{timestamp}:{raw body}` HMAC-SHA256, hex digest
+  prefixed with `v0=`, in `X-Slack-Signature`; Slack recommends a 5-minute
+  replay window. Matches the spec.
+- Slack interactivity: `block_actions` payloads arrive as
+  `application/x-www-form-urlencoded` with a single `payload` field. A
+  `static_select` in the message is echoed under `state.values[block_id]
+  [action_id].selected_option.value` on the subsequent button click, which is
+  how the optional rejection reason is collected without a modal. Selecting a
+  reason also triggers its own `block_actions` request, which the endpoint
+  acknowledges and ignores.
+- GitHub `POST /repos/{owner}/{repo}/issues/{n}/labels` creates missing
+  labels and is a no-op for labels already present; the client still checks
+  the issue's current labels first so `applied` is reported truthfully.
+- GitHub sends `issues` `labeled` events with `payload.label.name`; the
+  webhook signature is `X-Hub-Signature-256`.
+
+## Deferred to Phase 4
+
+- **Remediation sessions:** consume `REMEDIATION_APPROVED` cases; live mode
+  still refuses `REMEDIATION` attempts.
+- **GitHub App writes:** branches, pull requests, and statuses (comments and
+  labels are implemented here).
 - **Stage deadline reconciliation:** apply longer-lived stage deadlines and operational escalation to `TIMED_OUT`.
 - **CI webhook ingestion:** advance `CI_PENDING` from GitHub CI events.
 - **Retention and cleanup:** expire old payloads, attempts, and notification records.
