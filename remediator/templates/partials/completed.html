@@ -1,0 +1,1 @@
+<section><h2>Completed jobs</h2><ul>{% for case in completed %}<li><a href="/cases/{{case.id}}">#{{case.issue_number}} {{case.issue_title}}</a> {{case.state}} {{case.ci_status or ""}}</li>{% else %}<li>None</li>{% endfor %}</ul></section>

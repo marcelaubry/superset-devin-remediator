@@ -1,0 +1,41 @@
+from functools import lru_cache
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    database_url: str = "postgresql+asyncpg://remediator:remediator@localhost:5432/remediator"
+    github_webhook_secret: str = "change-me"
+    operator_token: str = "change-me"
+    github_repository: str = "apache/superset"
+    github_allowed_events: str = "issues"
+    github_allowed_actions: str = "opened,labeled"
+    github_required_label: str = "devin-candidate"
+    worker_poll_interval_seconds: float = 1.0
+    worker_concurrency: int = 2
+    worker_lease_seconds: int = 300
+    worker_shutdown_timeout_seconds: int = 30
+    event_max_attempts: int = 3
+    reconcile_retry_delay_seconds: float = 1.0
+    devin_client: str = "fake"
+    devin_poll_interval_seconds: float = 0.01
+    devin_max_polls: int = 5
+    max_attempts_per_kind: int = 3
+    log_level: str = "INFO"
+    simulation_auto_approve_remediation: bool = True
+    cookie_secure: bool = False
+
+    model_config = SettingsConfigDict(env_file=".env", case_sensitive=False, extra="ignore")
+
+    @property
+    def allowed_events(self) -> set[str]:
+        return {x.strip() for x in self.github_allowed_events.split(",") if x.strip()}
+
+    @property
+    def allowed_actions(self) -> set[str]:
+        return {x.strip() for x in self.github_allowed_actions.split(",") if x.strip()}
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()

@@ -1,0 +1,30 @@
+{% if error %}<p role="alert">{{error}}</p>{% endif %}
+<p><strong>State:</strong> <span class="state-badge">{{case.state}}</span></p>
+<p><strong>Elapsed in stage:</strong> {{humanize(case.state_entered_at)}}</p>
+<p><strong>Age:</strong> {{humanize(case.created_at)}}</p>
+<dl>
+  <dt>Recommendation</dt><dd>{{case.recommendation or "-"}}</dd>
+  <dt>Issue</dt><dd><a href="{{case.issue_url}}">{{case.issue_url}}</a></dd>
+  <dt>Devin session</dt><dd>{{case.devin_session_url or "-"}}</dd>
+  <dt>PR</dt><dd>{{case.pr_url or "-"}}</dd>
+  <dt>CI</dt><dd>{{case.ci_status or "-"}}</dd>
+</dl>
+<section id="case-status">
+  <h2>Actions</h2>
+  {% if case.state in ["FAILED","TIMED_OUT","HUMAN_BLOCKED"] %}
+  <form method="post" action="/operator/cases/{{case.id}}/retry" hx-post="/operator/cases/{{case.id}}/retry" hx-target="#case-detail" hx-swap="innerHTML"><button>Retry</button></form>
+  {% endif %}
+  {% if case.state == "AWAITING_REMEDIATION_APPROVAL" %}
+  <form method="post" action="/operator/cases/{{case.id}}/approve-remediation" hx-post="/operator/cases/{{case.id}}/approve-remediation" hx-target="#case-detail" hx-swap="innerHTML"><button>Approve remediation</button></form>
+  <form method="post" action="/operator/cases/{{case.id}}/reject-remediation" hx-post="/operator/cases/{{case.id}}/reject-remediation" hx-target="#case-detail" hx-swap="innerHTML"><button>Reject remediation</button></form>
+  {% endif %}
+  {% if case.state not in ["CI_PASSED","TIMED_OUT","POLICY_REJECTED","FAILED","CANCELLED"] %}
+  <form method="post" action="/operator/cases/{{case.id}}/cancel" hx-post="/operator/cases/{{case.id}}/cancel" hx-target="#case-detail" hx-swap="innerHTML"><button>Cancel</button></form>
+  {% endif %}
+</section>
+<h2>Rubric</h2>
+<ul>{% for check in case.rubric or [] %}<li><strong>{{check.name}}</strong>: {{check.passed}} — {{check.reason}}</li>{% else %}<li>None</li>{% endfor %}</ul>
+<h2>Attempts</h2>
+<ul>{% for attempt in case.attempts %}<li>{{attempt.kind}} {{attempt.status}} {{attempt.devin_session_id}}</li>{% else %}<li>None</li>{% endfor %}</ul>
+<h2>Timeline</h2>
+<ol>{% for item in case.transitions %}<li>{{item.created_at}}: {{item.from_state or "-"}} → {{item.to_state}} ({{item.actor}}) — {{item.reason}}</li>{% else %}<li>None</li>{% endfor %}</ol>

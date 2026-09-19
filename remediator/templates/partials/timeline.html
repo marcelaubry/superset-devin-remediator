@@ -1,0 +1,1 @@
+<section><h2>Recent transition timeline</h2><ol>{% for item in transitions %}<li>{{item.created_at}} case {{item.case_id}}: {{item.from_state or "-"}} → {{item.to_state}} ({{item.actor}})</li>{% else %}<li>None</li>{% endfor %}</ol></section>

@@ -1,0 +1,1 @@
+{"action":"opened","repository":{"full_name":"apache/superset"},"sender":{"login":"simulator"},"issue":{"number":4501,"title":"Architecture breaking change","body":"This security architecture change is a breaking change across backend and frontend. Expected behavior is documented.","html_url":"https://github.com/apache/superset/issues/4501","labels":[{"name":"devin-candidate"}]}}

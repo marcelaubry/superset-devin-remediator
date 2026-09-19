@@ -1,0 +1,1 @@
+{"action":"opened","repository":{"full_name":"other/project"},"sender":{"login":"simulator"},"issue":{"number":4600,"title":"Fix issue","body":"Steps to reproduce:\n1. Test.\nExpected behavior works.","html_url":"https://github.com/other/project/issues/4600","labels":[{"name":"devin-candidate"}]}}
