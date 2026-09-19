@@ -154,6 +154,14 @@ class Worker:
             )
             await session.commit()
 
+    async def _release_event_case(self, event_id: object) -> None:
+        async with self.session_factory() as session:
+            case_id = await session.scalar(
+                select(WebhookEvent.case_id).where(WebhookEvent.id == event_id)
+            )
+        if case_id is not None:
+            await self._release_case(case_id)
+
     async def _heartbeat(
         self, case_id: object | None = None, event_id: object | None = None
     ) -> None:
@@ -305,6 +313,7 @@ class Worker:
                         await session.commit()
             finally:
                 if event:
+                    await self._release_event_case(event.id)
                     await self._release_event(event.id)
                 if case:
                     await self._release_case(case.id)

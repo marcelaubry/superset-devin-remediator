@@ -199,3 +199,53 @@ async def test_remediation_intent_case_is_claimed(
     finally:
         await worker.devin.aclose()
         await worker.engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_event_processing_releases_case_lease(
+    integration_session_factory: async_sessionmaker[AsyncSession],
+    test_database_url: str,
+) -> None:
+    async with integration_session_factory() as session:
+        session.add(
+            WebhookEvent(
+                delivery_id="lease-release",
+                event_type="issues",
+                action="opened",
+                repository="apache/superset",
+                payload=payload(4213),
+                status=EventStatus.PENDING,
+            )
+        )
+        await session.commit()
+
+    worker = Worker(
+        Settings(
+            database_url=test_database_url,
+            worker_poll_interval_seconds=0.01,
+            worker_concurrency=1,
+        )
+    )
+
+    async def stop_when_done() -> None:
+        for _ in range(500):
+            async with integration_session_factory() as session:
+                status = await session.scalar(select(WebhookEvent.status))
+            if status == EventStatus.PROCESSED:
+                worker.stop()
+                return
+            await asyncio.sleep(0.01)
+        worker.stop()
+
+    try:
+        await asyncio.wait_for(asyncio.gather(worker._run_loop(), stop_when_done()), timeout=10)
+    finally:
+        await worker.devin.aclose()
+        await worker.engine.dispose()
+
+    async with integration_session_factory() as session:
+        case = await session.scalar(select(Case).where(Case.issue_number == 4213))
+    assert case is not None
+    assert case.state == CaseState.CI_PASSED
+    assert case.claimed_by is None
+    assert case.lease_expires_at is None

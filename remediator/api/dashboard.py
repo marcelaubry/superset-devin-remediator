@@ -1,6 +1,6 @@
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -12,7 +12,15 @@ from sqlalchemy.orm import selectinload
 
 from ..db import get_session
 from ..lifecycle import TERMINAL_STATES, CaseState
-from ..models import Attempt, Case, EventStatus, StateTransition, WebhookEvent
+from ..models import (
+    Attempt,
+    AttemptKind,
+    AttemptStatus,
+    Case,
+    EventStatus,
+    StateTransition,
+    WebhookEvent,
+)
 from .auth import require_operator
 
 router = APIRouter()
@@ -46,11 +54,19 @@ def _attempt_elapsed(attempt: Attempt) -> str:
     return _humanize(start)
 
 
-def latest_attempt(case: Case) -> Attempt | None:
-    if not case.attempts:
+def latest_attempt(case: Case, kind: AttemptKind | None = None) -> Attempt | None:
+    attempts = [a for a in case.attempts if kind is None or a.kind == kind]
+    if not attempts:
         return None
     floor = datetime.min.replace(tzinfo=UTC)
-    return max(case.attempts, key=lambda attempt: attempt.started_at or floor)
+    return max(attempts, key=lambda attempt: attempt.started_at or floor)
+
+
+def latest_triage_result(case: Case) -> dict[str, Any] | None:
+    attempt = latest_attempt(case, AttemptKind.TRIAGE)
+    if attempt is None or attempt.status != AttemptStatus.SUCCEEDED:
+        return None
+    return attempt.structured_output
 
 
 TEMPLATE_HELPERS: dict[str, object] = {
@@ -58,6 +74,7 @@ TEMPLATE_HELPERS: dict[str, object] = {
     "until": _until,
     "attempt_elapsed": _attempt_elapsed,
     "latest_attempt": latest_attempt,
+    "latest_triage_result": latest_triage_result,
 }
 
 

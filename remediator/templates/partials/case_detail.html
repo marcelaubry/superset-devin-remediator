@@ -27,10 +27,17 @@
     {% if attempt.reconciliation_reason %}<dt>Reconciliation</dt><dd>{{attempt.reconciliation_reason}}</dd>{% endif %}
     {% if attempt.error %}<dt>Error</dt><dd>{{attempt.error}}</dd>{% endif %}
   </dl>
-  {% if attempt.structured_output %}
-  <h3>Validated triage result</h3>
+  {% if attempt.kind != "TRIAGE" and attempt.structured_output %}
+  <h3>{{attempt.kind|capitalize}} output</h3>
   <pre>{{attempt.structured_output|tojson(indent=2)}}</pre>
   {% endif %}
+</section>
+{% endif %}
+{% set triage_result = latest_triage_result(case) %}
+{% if triage_result %}
+<section id="triage-result">
+  <h2>Validated triage result</h2>
+  <pre>{{triage_result|tojson(indent=2)}}</pre>
 </section>
 {% endif %}
 <section id="case-status">
