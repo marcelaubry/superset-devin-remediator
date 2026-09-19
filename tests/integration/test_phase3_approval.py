@@ -11,8 +11,9 @@ import json
 import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
+from datetime import UTC, datetime
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import parse_qsl, urlencode
 
 import httpx
 import pytest
@@ -20,34 +21,37 @@ import pytest_asyncio
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from remediator.approvals import hash_action_token
+from remediator.approvals import hash_action_token, retired_token_hash
 from remediator.config import Settings
 from remediator.devin.fake import FakeDevinClient, FakeScenario
-from remediator.github.client import FakeGitHubClient
-from remediator.lifecycle import CaseState
+from remediator.github.client import FakeGitHubClient, GitHubApiError
+from remediator.lifecycle import CaseState, transition
 from remediator.models import (
     OUTBOX_KIND_GITHUB_APPLY_LABEL,
     OUTBOX_KIND_GITHUB_REJECTION_COMMENT,
     OUTBOX_KIND_SLACK_APPROVAL_REQUEST,
+    OUTBOX_RECORD_ONLY_KINDS,
     ApprovalDecision,
     ApprovalEvent,
     ApprovalRequest,
     Attempt,
     AttemptKind,
+    AttemptStatus,
     Case,
     DeliveryStatus,
     EventStatus,
     NotificationOutbox,
     NotificationStatus,
+    OutboxChannel,
     OutboxStatus,
     SlackAction,
     SlackFakeMessage,
     WebhookEvent,
 )
 from remediator.slack.blocks import ACTION_APPROVE, ACTION_REJECT
-from remediator.slack.client import FakeSlackClient
+from remediator.slack.client import FakeSlackClient, SlackApiError
 from remediator.worker.outbox import OutboxDispatcher
-from remediator.worker.processor import process_event
+from remediator.worker.processor import process_case, process_event
 
 ELIGIBLE_BODY = (
     "Steps to reproduce:\n1. Run.\nExpected behavior works. "
@@ -420,14 +424,18 @@ async def test_unknown_token_unauthorized_user_and_duplicates(harness: Harness) 
     await harness.drain()
     token = await harness.token_from_slack()
 
-    # Unknown token: 404 and nothing recorded.
+    # Unknown token: acknowledged to Slack (200) but refused, nothing recorded or leaked.
     response = await harness.click("not-the-token")
-    assert response.status_code == 404
+    assert response.status_code == 200
+    assert response.json()["ok"] is False
+    assert response.json()["outcome"] == "unknown_token"
     assert "case_state" not in response.json()
 
     # Unauthorized user: refused, recorded on the timeline, no decision.
     response = await harness.click(token, user=OUTSIDER)
-    assert response.status_code == 403
+    assert response.status_code == 200
+    assert response.json()["ok"] is False
+    assert response.json()["outcome"] == "unauthorized"
     assert "case_state" not in response.json()
     request = await harness.approval(case.id)
     assert request.decision == ApprovalDecision.PENDING
@@ -465,10 +473,12 @@ async def test_expired_token_is_rejected(harness: Harness) -> None:
     )
     assert expire.status_code == 200
     response = await harness.click(token)
-    assert response.status_code == 410
+    assert response.status_code == 200
+    assert response.json()["ok"] is False
     assert response.json()["outcome"] == "expired_token"
     request = await harness.approval(case.id)
     assert request.decision == ApprovalDecision.EXPIRED
+    assert request.action_token_hash == retired_token_hash(hash_action_token(token))
     assert await harness.outbox(case.id, OUTBOX_KIND_GITHUB_APPLY_LABEL) == []
     # Operator expire needs auth and is idempotent.
     unauth = await harness.client.post(f"/operator/approvals/{request.id}/expire")
@@ -486,9 +496,13 @@ async def test_expired_token_is_rejected(harness: Harness) -> None:
 async def test_full_approval_flow_reaches_remediation_approved_only_after_webhook(
     harness: Harness,
 ) -> None:
-    case, request, _ = await harness.notify_and_approve()
+    case, request, token = await harness.notify_and_approve()
     assert request.decision == ApprovalDecision.APPROVED
     assert request.decided_at is not None
+    # The live token hash is retired on decision; a repeat click still resolves to the
+    # current state without ever being approvable again.
+    assert request.action_token_hash == retired_token_hash(hash_action_token(token))
+    assert request.action_token_hash != hash_action_token(token)
     assert request.decision_action_id.startswith(f"{ACTION_APPROVE}:")
     assert request.label_operation == "add_label:devin:remediate"
     assert request.delivery_status == DeliveryStatus.PENDING
@@ -738,3 +752,341 @@ async def test_dashboard_and_api_visibility_without_leaking_ids(harness: Harness
     assert (await harness.client.get("/api/slack/fake/messages")).status_code == 401
     messages = await harness.client.get("/api/slack/fake/messages", headers=harness.operator)
     assert messages.status_code == 200 and len(messages.json()) == 1
+
+
+# ------------------------------------------------------------------ review regressions
+
+
+async def _requests_for(harness: Harness, case_id: Any) -> list[ApprovalRequest]:
+    async with harness.factory() as session:
+        rows = await session.scalars(
+            select(ApprovalRequest)
+            .where(ApprovalRequest.case_id == case_id)
+            .order_by(ApprovalRequest.created_at)
+        )
+        return list(rows.all())
+
+
+async def _retriage(harness: Harness, case: Case) -> None:
+    """Legitimate lifecycle: AWAITING → FAILED → operator retry → RECEIVED → re-triage."""
+    async with harness.factory() as session:
+        fresh = await session.get(Case, case.id)
+        assert fresh is not None
+        await transition(session, fresh, CaseState.FAILED, "simulated failure", "test")
+        await session.commit()
+    retry = await harness.client.post(f"/operator/cases/{case.id}/retry", headers=harness.operator)
+    assert retry.status_code == 200 and retry.json()["state"] == CaseState.RECEIVED
+    async with harness.factory() as session:
+        fresh = await session.get(Case, case.id)
+        assert fresh is not None
+        await process_case(session, fresh, FakeDevinClient(), harness.settings)
+        await session.commit()
+        assert fresh.state == CaseState.AWAITING_REMEDIATION_APPROVAL
+
+
+@pytest.mark.asyncio
+async def test_retriage_supersedes_old_round_and_old_token_never_approves(
+    harness: Harness,
+) -> None:
+    case = await harness.triage(4213)
+    await harness.drain()
+    old_token = await harness.token_from_slack()
+    old_hash = hash_action_token(old_token)
+
+    await _retriage(harness, case)
+    rounds = await _requests_for(harness, case.id)
+    assert len(rounds) == 2
+    old, new = rounds
+    assert old.decision == ApprovalDecision.SUPERSEDED and old.action_token_hash is None
+    assert new.decision == ApprovalDecision.PENDING and new.attempt_id != old.attempt_id
+    assert "superseded" in await harness.events(old.id)
+
+    await harness.drain()  # new Slack notification + old-message update
+    messages = await harness.fake_messages()
+    assert len(messages) == 2
+    old_message = next(m for m in messages if m.ts == old.slack_message_ts)
+    assert ACTION_APPROVE not in json.dumps(old_message.blocks)
+    assert ACTION_REJECT not in json.dumps(old_message.blocks)
+    assert "superseded" in json.dumps(old_message.blocks).lower()
+
+    # The old click is verified, acknowledged, and refused: no decision, no label work.
+    response = await harness.click(old_token)
+    assert response.status_code == 200
+    assert response.json()["ok"] is False
+    assert response.json()["outcome"] in {"unknown_token", "stale_token"}
+    assert "case_state" not in response.json()
+    rounds = await _requests_for(harness, case.id)
+    assert rounds[0].decision == ApprovalDecision.SUPERSEDED
+    assert rounds[1].decision == ApprovalDecision.PENDING
+    assert await harness.outbox(case.id, OUTBOX_KIND_GITHUB_APPLY_LABEL) == []
+    assert harness.github.label_calls == []
+    async with harness.factory() as session:
+        assert (
+            await session.scalar(
+                select(ApprovalRequest).where(ApprovalRequest.action_token_hash == old_hash)
+            )
+        ) is None
+
+    # The new round works normally.
+    new_message = next(m for m in messages if m.ts != old.slack_message_ts)
+    new_token = next(
+        str(el["value"])
+        for block in new_message.blocks
+        if block.get("type") == "actions"
+        for el in block["elements"]
+        if el.get("action_id") == ACTION_APPROVE
+    )
+    approved = await harness.click(new_token, action_ts="2.000")
+    assert approved.status_code == 200 and approved.json()["outcome"] == "approved"
+    await harness.drain()
+    assert harness.github.label_calls == [("apache/superset", 4213, "devin:remediate")]
+    assert (await _requests_for(harness, case.id))[1].delivery_status == (
+        DeliveryStatus.LABEL_APPLIED
+    )
+
+
+@pytest.mark.asyncio
+async def test_stale_token_with_hash_still_present_is_refused(harness: Harness) -> None:
+    """Defence in depth: even if an old round kept its hash, the current-attempt check holds."""
+    case = await harness.triage(4213)
+    await harness.drain()
+    old_token = await harness.token_from_slack()
+    await _retriage(harness, case)
+    old, _new = await _requests_for(harness, case.id)
+    async with harness.factory() as session:
+        row = await session.get(ApprovalRequest, old.id)
+        assert row is not None
+        row.action_token_hash = hash_action_token(old_token)
+        row.decision = ApprovalDecision.PENDING
+        await session.commit()
+    response = await harness.click(old_token)
+    assert response.status_code == 200 and response.json()["outcome"] == "stale_token"
+    rounds = await _requests_for(harness, case.id)
+    assert rounds[0].decision == ApprovalDecision.PENDING  # untouched, not approved
+    assert "stale_action" in await harness.events(old.id)
+    assert await harness.outbox(case.id, OUTBOX_KIND_GITHUB_APPLY_LABEL) == []
+    assert harness.github.label_calls == []
+
+
+@pytest.mark.asyncio
+async def test_label_outbox_refuses_when_approved_attempt_is_no_longer_current(
+    harness: Harness,
+) -> None:
+    case, request, _ = await harness.notify_and_approve()
+    rows = await harness.outbox(case.id, OUTBOX_KIND_GITHUB_APPLY_LABEL)
+    assert len(rows) == 1
+    # A newer triage attempt appears before the worker delivers the label.
+    async with harness.factory() as session:
+        session.add(
+            Attempt(
+                case_id=case.id,
+                kind=AttemptKind.TRIAGE,
+                idempotency_key=f"triage-{case.id}-2",
+                operation_key=f"triage-{case.id}-2",
+                status=AttemptStatus.SUCCEEDED,
+                started_at=datetime.now(UTC),
+            )
+        )
+        await session.commit()
+    await harness.drain()
+    async with harness.factory() as session:
+        row = await session.get(NotificationOutbox, rows[0].id)
+        assert row is not None
+        assert row.status == OutboxStatus.FAILED
+        assert row.last_error and "no longer the case's current attempt" in row.last_error
+    assert harness.github.label_calls == []
+
+
+@pytest.mark.asyncio
+async def test_early_signed_label_webhook_does_not_advance_before_our_delivery(
+    harness: Harness,
+) -> None:
+    case, request, _ = await harness.notify_and_approve()
+    assert request.delivery_status == DeliveryStatus.PENDING
+    # Someone applies the label by hand and GitHub tells us before the worker has run.
+    response = await harness.label_webhook(4213, delivery="early-label")
+    assert response.status_code in {200, 202}
+    async with harness.factory() as session:
+        event = await session.scalar(
+            select(WebhookEvent).where(WebhookEvent.delivery_id == "early-label")
+        )
+        assert event is not None
+        await process_event(session, event, harness.devin, harness.settings)
+    assert (await harness.case(case.id)).state == CaseState.AWAITING_REMEDIATION_APPROVAL
+    request = await harness.approval(case.id)
+    assert request.delivery_status == DeliveryStatus.PENDING
+    assert request.label_confirmed_at is None
+    assert "label_webhook_unexpected" in await harness.events(request.id)
+
+    # The outbox still owns delivery: label (already present → no second write) + comment.
+    await harness.github.add_label("apache/superset", 4213, "devin:remediate")
+    harness.github.label_calls.clear()
+    await harness.drain()
+    request = await harness.approval(case.id)
+    assert request.delivery_status == DeliveryStatus.LABEL_APPLIED
+    assert request.github_comment_id is not None
+    assert harness.github.issues[("apache/superset", 4213)].labels == ["devin:remediate"]
+    assert len(harness.github.comment_calls) == 1
+
+    # Now a signed webhook confirms.
+    await harness.label_webhook(4213, delivery="late-label")
+    async with harness.factory() as session:
+        event = await session.scalar(
+            select(WebhookEvent).where(WebhookEvent.delivery_id == "late-label")
+        )
+        assert event is not None
+        await process_event(session, event, harness.devin, harness.settings)
+    assert (await harness.case(case.id)).state == CaseState.REMEDIATION_APPROVED
+    assert harness.devin.create_calls == 1  # triage only; approval never creates a session
+
+
+@pytest.mark.asyncio
+async def test_slack_post_accepted_but_commit_lost_does_not_duplicate_message(
+    harness: Harness,
+) -> None:
+    case = await harness.triage(4213)
+    rows = await harness.outbox(case.id, OUTBOX_KIND_SLACK_APPROVAL_REQUEST)
+    assert len(rows) == 1
+
+    original_post = harness.slack.post_message
+
+    async def post_then_crash(*args: Any, **kwargs: Any) -> Any:
+        await original_post(*args, **kwargs)
+        raise SlackApiError("chat.postMessage", "ReadTimeout", retryable=True)
+
+    harness.slack.post_message = post_then_crash  # type: ignore[method-assign]
+    claimed = await harness.dispatcher.claim()
+    assert claimed is not None
+    await harness.dispatcher.dispatch(claimed.id)
+    request = await harness.approval(case.id)
+    assert request.notification_status == NotificationStatus.SENDING
+    assert request.action_token_hash is not None
+    assert len(await harness.fake_messages()) == 1
+    async with harness.factory() as session:
+        row = await session.get(NotificationOutbox, rows[0].id)
+        assert row is not None
+        assert row.status == OutboxStatus.PENDING and row.attempts_count == 1
+        row.next_attempt_at = datetime.now(UTC)
+        await session.commit()
+
+    harness.slack.post_message = original_post  # type: ignore[method-assign]
+    await harness.drain()
+    messages = await harness.fake_messages()
+    assert len(messages) == 1  # reconciled, not re-posted
+    request = await harness.approval(case.id)
+    assert request.notification_status == NotificationStatus.SENT
+    assert request.slack_message_ts == messages[0].ts
+    assert "slack_notified" in await harness.events(request.id)
+    # The token on the (single) message is the one that is live.
+    token = await harness.token_from_slack()
+    assert hash_action_token(token) == request.action_token_hash
+    approved = await harness.click(token)
+    assert approved.status_code == 200 and approved.json()["outcome"] == "approved"
+
+
+@pytest.mark.asyncio
+async def test_github_label_and_comment_posts_survive_lost_commits(harness: Harness) -> None:
+    case, request, _ = await harness.notify_and_approve()
+    rows = await harness.outbox(case.id, OUTBOX_KIND_GITHUB_APPLY_LABEL)
+
+    original_label = harness.github.add_label
+    original_comment = harness.github.create_comment
+
+    async def label_then_crash(*args: Any, **kwargs: Any) -> Any:
+        await original_label(*args, **kwargs)
+        raise GitHubApiError("connection dropped after POST", retryable=True)
+
+    async def comment_then_crash(*args: Any, **kwargs: Any) -> Any:
+        await original_comment(*args, **kwargs)
+        raise GitHubApiError("connection dropped after POST", retryable=True)
+
+    async def reschedule() -> None:
+        async with harness.factory() as session:
+            row = await session.get(NotificationOutbox, rows[0].id)
+            assert row is not None and row.status == OutboxStatus.PENDING
+            row.next_attempt_at = datetime.now(UTC)
+            await session.commit()
+
+    async def dispatch_once() -> None:
+        """Dispatch rows until the label row has had exactly one more attempt."""
+        while (claimed := await harness.dispatcher.claim()) is not None:
+            await harness.dispatcher.dispatch(claimed.id)
+            if claimed.id == rows[0].id:
+                return
+        raise AssertionError("label row was not claimable")
+
+    harness.github.add_label = label_then_crash  # type: ignore[method-assign]
+    await dispatch_once()
+    request = await harness.approval(case.id)
+    assert request.label_requested_at is not None and request.label_applied_at is None
+    assert harness.github.issues[("apache/superset", 4213)].labels == ["devin:remediate"]
+    harness.github.add_label = original_label  # type: ignore[method-assign]
+
+    harness.github.create_comment = comment_then_crash  # type: ignore[method-assign]
+    await reschedule()
+    await dispatch_once()
+    request = await harness.approval(case.id)
+    assert request.label_applied_at is not None
+    assert request.delivery_status == DeliveryStatus.LABEL_APPLIED
+    assert request.comment_requested_at is not None and request.github_comment_id is None
+    assert len(harness.github.comment_calls) == 1
+    harness.github.create_comment = original_comment  # type: ignore[method-assign]
+
+    await reschedule()
+    await harness.drain()
+    request = await harness.approval(case.id)
+    assert request.github_comment_id is not None
+    # Exactly one label write and one comment across three attempts.
+    assert harness.github.label_calls == [("apache/superset", 4213, "devin:remediate")]
+    assert len(harness.github.comment_calls) == 1
+    assert f"<!-- remediator:approval:{request.id} -->" in harness.github.comment_calls[0][2]
+    async with harness.factory() as session:
+        row = await session.get(NotificationOutbox, rows[0].id)
+        assert row is not None and row.status == OutboxStatus.SENT
+
+
+@pytest.mark.asyncio
+async def test_legacy_phase2_outbox_kinds_are_record_only(harness: Harness) -> None:
+    case = await harness.triage(4213)
+    async with harness.factory() as session:
+        for kind in ("eligibility_rejected", "case_failed", "human_blocked", "case_completed"):
+            session.add(
+                NotificationOutbox(
+                    case_id=case.id,
+                    channel=OutboxChannel.GITHUB,
+                    kind=kind,
+                    payload={"reason": "legacy"},
+                )
+            )
+        await session.commit()
+    await harness.drain()
+    rows = await harness.outbox(case.id)
+    legacy = [row for row in rows if row.kind in OUTBOX_RECORD_ONLY_KINDS]
+    assert len(legacy) == 4
+    assert all(row.status == OutboxStatus.SENT and row.last_error is None for row in legacy)
+    assert harness.github.comment_calls == [] and harness.github.label_calls == []
+
+
+@pytest.mark.asyncio
+async def test_ephemeral_feedback_uses_response_url_only(harness: Harness) -> None:
+    case = await harness.triage(4213)
+    await harness.drain()
+    token = await harness.token_from_slack()
+    body_payload = json.loads(dict(parse_qsl(slack_body(token, user=OUTSIDER).decode()))["payload"])
+    body_payload["response_url"] = "https://hooks.slack.com/actions/T1/B1/xyz"
+    body = urlencode({"payload": json.dumps(body_payload)}).encode()
+    response = await harness.click(token, body=body)
+    assert response.status_code == 200 and response.json()["outcome"] == "unauthorized"
+    await harness.drain()
+    ephemeral = [m for m in await harness.fake_messages() if m.ephemeral]
+    assert len(ephemeral) == 1 and "not an authorized approver" in ephemeral[0].text
+    assert token not in ephemeral[0].text
+    # An untrusted response_url is ignored entirely.
+    body_payload["response_url"] = "https://evil.example/collect"
+    body_payload["actions"][0]["action_ts"] = "3.000"
+    body = urlencode({"payload": json.dumps(body_payload)}).encode()
+    await harness.click(token, body=body)
+    await harness.drain()
+    assert len([m for m in await harness.fake_messages() if m.ephemeral]) == 1
+    request = await harness.approval(case.id)
+    assert request.decision == ApprovalDecision.PENDING

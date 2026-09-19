@@ -430,11 +430,18 @@ class Simulator:
         self.check(missing.status_code == 401, f"missing headers rejected ({missing.status_code})")
         outsider = self.slack_click(token, user="U_NOT_AN_APPROVER")
         self.check(
-            outsider.status_code == 403 and outsider.json().get("outcome") == "unauthorized",
+            outsider.status_code == 200
+            and outsider.json().get("ok") is False
+            and outsider.json().get("outcome") == "unauthorized",
             f"unauthorized approver rejected ({outsider.status_code})",
         )
         unknown = self.slack_click("not-a-real-token")
-        self.check(unknown.status_code == 404, f"unknown token rejected ({unknown.status_code})")
+        self.check(
+            unknown.status_code == 200
+            and unknown.json().get("ok") is False
+            and unknown.json().get("outcome") == "unknown_token",
+            f"unknown token rejected ({unknown.status_code})",
+        )
         case = self.case(repository, number) or case
         self.check(
             case["state"] == "AWAITING_REMEDIATION_APPROVAL"
@@ -468,7 +475,9 @@ class Simulator:
         )
         click = self.slack_click(token)
         self.check(
-            click.status_code == 410 and click.json().get("outcome") == "expired_token",
+            click.status_code == 200
+            and click.json().get("ok") is False
+            and click.json().get("outcome") == "expired_token",
             f"expired token rejected ({click.status_code})",
         )
         case = self.wait_approval(repository, number, decision="EXPIRED")

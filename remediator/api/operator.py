@@ -306,6 +306,8 @@ async def retry_outbox(
     error: str | None = None
     if row.status != OutboxStatus.FAILED:
         error = f"outbox row is {row.status.value}, only FAILED rows can be retried"
+        if request.headers.get("HX-Request") != "true":
+            raise HTTPException(status_code=409, detail=error)
     else:
         row.status = OutboxStatus.PENDING
         row.attempts_count = 0

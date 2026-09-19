@@ -63,7 +63,17 @@ def _extract_action(payload: dict[str, Any]) -> SlackActionInput | None:
         action_id=action_id,
         action_ts=action_ts,
         reason=_extract_reason(payload),
+        response_url=_extract_response_url(payload),
     )
+
+
+def _extract_response_url(payload: dict[str, Any]) -> str | None:
+    """Slack's one-shot URL for ephemeral feedback to the clicking user; only the Slack
+    hooks host is accepted so the outbox never posts to an attacker-chosen URL."""
+    raw = payload.get("response_url")
+    if not isinstance(raw, str) or not raw.startswith("https://hooks.slack.com/"):
+        return None
+    return raw[:2000]
 
 
 def _extract_reason(payload: dict[str, Any]) -> str | None:
@@ -138,7 +148,12 @@ async def slack_actions(
         result = await process_slack_action(session, settings, action)
         await session.rollback()
         if result.outcome not in {ActionOutcome.DUPLICATE, ActionOutcome.ALREADY_DECIDED}:
-            return _reject("conflict", 409, "concurrent action; retry")
+            # Verified request that lost a race: still a 200 ack for Slack.
+            slack_action_requests_total.labels(result="conflict").inc()
+            return JSONResponse(
+                {"ok": False, "outcome": "conflict", "detail": "concurrent action; retry"},
+                status_code=200,
+            )
     slack_action_requests_total.labels(result=result.outcome.value).inc()
     logger.info(
         "slack action %s -> %s (case state %s)",
@@ -154,6 +169,7 @@ async def slack_actions(
     if result.request is not None and result.outcome not in {
         ActionOutcome.UNAUTHORIZED,
         ActionOutcome.UNKNOWN_TOKEN,
+        ActionOutcome.STALE_TOKEN,
     }:
         body_out["decision"] = result.request.decision.value
         body_out["case_state"] = result.case_state.value if result.case_state else None

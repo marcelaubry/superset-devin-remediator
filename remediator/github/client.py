@@ -6,6 +6,7 @@ a thin REST wrapper (https://docs.github.com/en/rest/issues): `GET /repos/{r}/is
 """
 
 import logging
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -20,10 +21,18 @@ FAKE_LABEL_FAILURE_ISSUES: frozenset[int] = frozenset({4688})
 
 
 class GitHubApiError(Exception):
-    def __init__(self, message: str, *, status_code: int | None = None, retryable: bool) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        retryable: bool,
+        retry_after_seconds: float | None = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.retryable = retryable
+        self.retry_after_seconds = retry_after_seconds
 
 
 class RepositoryNotAllowed(GitHubApiError):
@@ -59,7 +68,15 @@ class GitHubIssuesClient(Protocol):
 
     async def create_comment(self, repository: str, issue_number: int, body: str) -> int: ...
 
+    async def find_comment(self, repository: str, issue_number: int, marker: str) -> int | None:
+        """Id of an existing issue comment containing `marker`, for crash-safe idempotency."""
+        ...
+
     async def aclose(self) -> None: ...
+
+
+def comment_marker(kind: str, approval_request_id: str) -> str:
+    return f"<!-- remediator:{kind}:{approval_request_id} -->"
 
 
 def _check_allowed(allowed: frozenset[str], repository: str) -> str:
@@ -74,6 +91,7 @@ class _FakeIssue:
     title: str
     labels: list[str] = field(default_factory=list)
     comments: list[str] = field(default_factory=list)
+    comment_ids: list[int] = field(default_factory=list)
     label_calls: int = 0
 
 
@@ -152,10 +170,42 @@ class FakeGitHubClient:
         issue.comments.append(body)
         self.comment_calls.append((repo, issue_number, body))
         self._next_comment_id += 1
+        issue.comment_ids.append(self._next_comment_id)
         return self._next_comment_id
+
+    async def find_comment(self, repository: str, issue_number: int, marker: str) -> int | None:
+        repo = _check_allowed(self._allowed, repository)
+        issue = self._issue(repo, issue_number)
+        for comment_id, body in zip(issue.comment_ids, issue.comments, strict=True):
+            if marker in body:
+                return comment_id
+        return None
 
 
 RETRYABLE_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
+
+
+def _is_rate_limited(headers: httpx.Headers) -> bool:
+    """GitHub signals primary/secondary rate limits with 403 + these headers."""
+    if headers.get("retry-after") is not None:
+        return True
+    return str(headers.get("x-ratelimit-remaining")) == "0"
+
+
+def _retry_after(headers: httpx.Headers) -> float | None:
+    header = headers.get("retry-after")
+    if header is not None:
+        try:
+            return max(float(header), 0.0)
+        except ValueError:
+            return None
+    reset = headers.get("x-ratelimit-reset")
+    if reset is not None and headers.get("x-ratelimit-remaining") == "0":
+        try:
+            return max(float(reset) - time.time(), 0.0)
+        except ValueError:
+            return None
+    return None
 
 
 class LiveGitHubClient:
@@ -196,11 +246,16 @@ class LiveGitHubClient:
             ) from exc
         if response.status_code == 404:
             raise GitHubApiError(f"{method} {path}: not found", status_code=404, retryable=False)
-        if response.status_code in RETRYABLE_STATUS_CODES:
+        retry_after = _retry_after(response.headers)
+        if response.status_code in RETRYABLE_STATUS_CODES or (
+            response.status_code == 403 and _is_rate_limited(response.headers)
+        ):
             raise GitHubApiError(
-                f"{method} {path}: HTTP {response.status_code}",
+                f"{method} {path}: HTTP {response.status_code}"
+                + (" (rate limited)" if response.status_code == 403 else ""),
                 status_code=response.status_code,
                 retryable=True,
+                retry_after_seconds=retry_after,
             )
         if response.status_code >= 400:
             raise GitHubApiError(
@@ -250,6 +305,23 @@ class LiveGitHubClient:
             else current.labels + (label,)
         )
         return LabelResult(applied=True, labels=labels)
+
+    async def find_comment(self, repository: str, issue_number: int, marker: str) -> int | None:
+        repo = _check_allowed(self._allowed, repository)
+        for page in range(1, 6):
+            payload = await self._request(
+                "GET",
+                f"/repos/{repo}/issues/{issue_number}/comments"
+                f"?per_page=100&page={page}&sort=created&direction=desc",
+            )
+            if not isinstance(payload, list):
+                return None
+            for item in payload:
+                if isinstance(item, dict) and marker in str(item.get("body", "")):
+                    return int(item["id"])
+            if len(payload) < 100:
+                break
+        return None
 
     async def create_comment(self, repository: str, issue_number: int, body: str) -> int:
         repo = _check_allowed(self._allowed, repository)

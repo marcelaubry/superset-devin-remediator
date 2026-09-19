@@ -6,15 +6,24 @@ import json
 import logging
 import re
 import subprocess
+import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 from remediator.adapters import SettingsRedactingFilter, build_github_client, build_slack_client
 from remediator.config import Settings
 from remediator.devin.fake import sample_triage_output
-from remediator.github.client import FakeGitHubClient, LiveGitHubClient, RepositoryNotAllowed
+from remediator.github.client import (
+    FakeGitHubClient,
+    GitHubApiError,
+    LiveGitHubClient,
+    RepositoryNotAllowed,
+    comment_marker,
+)
 from remediator.slack.blocks import (
     ACTION_APPROVE,
     ACTION_REASON,
@@ -24,7 +33,12 @@ from remediator.slack.blocks import (
     build_approval_blocks,
     escape_mrkdwn,
 )
-from remediator.slack.client import FakeSlackClient, LiveSlackClient
+from remediator.slack.client import (
+    FakeSlackClient,
+    LiveSlackClient,
+    SlackApiError,
+    approval_metadata,
+)
 from remediator.slack.signature import (
     SlackVerificationFailure,
     compute_signature,
@@ -367,3 +381,137 @@ async def test_fake_slack_client_repr_has_no_state_and_live_repr_has_no_token() 
         assert "xoxb" not in repr(live)
     finally:
         await live.aclose()
+
+
+# ---------------------------------------------------------------- rate limits / retry hints
+
+
+@pytest.mark.asyncio
+async def test_live_github_rate_limited_403_is_retryable_with_retry_after() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        if request.url.path.endswith("/comments") and request.method == "POST":
+            return httpx.Response(
+                403,
+                headers={"Retry-After": "7", "X-RateLimit-Remaining": "0"},
+                json={"message": "secondary rate limit"},
+            )
+        if request.url.path.endswith("/labels") and request.method == "POST":
+            return httpx.Response(
+                403,
+                headers={
+                    "X-RateLimit-Remaining": "0",
+                    "X-RateLimit-Reset": str(int(time.time()) + 30),
+                },
+                json={"message": "API rate limit exceeded"},
+            )
+        if request.method == "GET" and request.url.path.endswith("/issues/1"):
+            return httpx.Response(
+                200, json={"number": 1, "state": "open", "title": "t", "labels": []}
+            )
+        return httpx.Response(403, json={"message": "Resource not accessible"})
+
+    client = LiveGitHubClient(
+        "github_pat_" + "z" * 40,
+        ["apache/superset"],
+        base_url="https://api.github.test",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        with pytest.raises(GitHubApiError) as comment_error:
+            await client.create_comment("apache/superset", 1, "x")
+        assert comment_error.value.retryable is True
+        assert comment_error.value.retry_after_seconds == 7.0
+        with pytest.raises(GitHubApiError) as label_error:
+            await client.add_label("apache/superset", 1, "devin:remediate")
+        assert label_error.value.retryable is True
+        assert label_error.value.retry_after_seconds is not None
+        assert 0 < label_error.value.retry_after_seconds <= 31
+        # A plain 403 (no rate-limit headers) stays a permanent failure.
+        with pytest.raises(GitHubApiError) as forbidden:
+            await client.get_issue("apache/superset", 2)
+        assert forbidden.value.retryable is False
+        assert forbidden.value.retry_after_seconds is None
+    finally:
+        await client.aclose()
+    assert seen  # every call went through the mock, none to the network
+
+
+@pytest.mark.asyncio
+async def test_live_github_find_comment_matches_marker() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET" and request.url.path.endswith("/comments")
+        assert request.url.params["per_page"] == "100"
+        return httpx.Response(
+            200,
+            json=[
+                {"id": 11, "body": "unrelated"},
+                {"id": 12, "body": "Approved.\n\n<!-- remediator:approval:abc -->"},
+            ],
+        )
+
+    client = LiveGitHubClient(
+        "github_pat_" + "z" * 40,
+        ["apache/superset"],
+        base_url="https://api.github.test",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        assert (
+            await client.find_comment("apache/superset", 1, comment_marker("approval", "abc")) == 12
+        )
+        assert (
+            await client.find_comment("apache/superset", 1, comment_marker("approval", "zzz"))
+            is None
+        )
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_live_slack_retry_after_and_metadata_reconciliation() -> None:
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content or b"{}")
+        calls.append((request.url.path, body))
+        if request.url.path.endswith("chat.postMessage"):
+            return httpx.Response(429, headers={"Retry-After": "12"}, json={"ok": False})
+        if request.url.path.endswith("conversations.history"):
+            assert body["include_all_metadata"] is True
+            return httpx.Response(
+                200,
+                json={
+                    "ok": True,
+                    "messages": [
+                        {"ts": "1.0", "text": "other"},
+                        {"ts": "2.0", "metadata": approval_metadata("req-1")},
+                    ],
+                    "response_metadata": {"next_cursor": ""},
+                },
+            )
+        if request.url.host == "hooks.slack.com":
+            assert "authorization" not in {k.lower() for k in request.headers}
+            return httpx.Response(200, text="ok")
+        return httpx.Response(200, json={"ok": True})
+
+    client = LiveSlackClient(
+        "xoxb-" + "k" * 40,
+        base_url="https://slack.test/api",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        with pytest.raises(SlackApiError) as error:
+            await client.post_message("C1", "t", [], metadata=approval_metadata("req-1"))
+        assert error.value.retryable is True and error.value.retry_after_seconds == 12.0
+        assert calls[-1][1]["metadata"] == approval_metadata("req-1")
+        found = await client.find_message("C1", "req-1", oldest=datetime.now(UTC))
+        assert found is not None and found.ts == "2.0"
+        assert await client.find_message("C1", "req-2", oldest=datetime.now(UTC)) is None
+        await client.post_response("https://hooks.slack.com/actions/T/B/x", "hello")
+        with pytest.raises(SlackApiError):
+            await client.post_response("https://evil.example/x", "hello")
+    finally:
+        await client.aclose()

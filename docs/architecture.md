@@ -84,28 +84,52 @@ GitHub issue opened
 validated remediation_candidate                    (worker _finish_triage)
 → approval_requests row + slack outbox row         (same transaction as the triage result)
 → worker posts Block Kit message                   (fake or live; failure never touches the triage result)
-→ token generated, sha256 stored, channel/ts stored
+   token generated, sha256 + SENDING committed BEFORE chat.postMessage; message carries
+   request metadata; retry reconciles by metadata before reposting; then SENT + channel/ts
 → POST /webhooks/slack/actions                     (raw body → timestamp window → HMAC → parse)
    approve: decision recorded (actor, time, action id, triage hash, label op)
             + outbox apply_remediation_label + slack update
    reject:  REMEDIATION_REJECTED + outbox rejection_comment + slack update
-→ worker apply_remediation_label                   (issue exists? allowlisted? triage hash current?
-                                                    label idempotent → applied once → audit comment)
-→ GitHub issues/labeled webhook (signed)           → REMEDIATION_APPROVED
+→ worker apply_remediation_label                   (issue exists? allowlisted? request current? attempt current?
+                                                    label_requested_at committed → add label → LABEL_APPLIED
+                                                    comment_requested_at committed → marker search → comment once)
+→ GitHub issues/labeled webhook (signed)           → REMEDIATION_APPROVED (only when our delivery is LABEL_APPLIED)
 ```
 
 Design points:
 
 - **Only candidates notify.** `approval_requests` is created only when the
   triage output validated against the schema and `outcome ==
-  remediation_candidate`; a unique constraint on `case_id` prevents a second
-  notification for the same case.
+  remediation_candidate`; a unique constraint on `attempt_id` prevents a
+  second notification for the same triage result.
 - **Opaque tokens.** The button value is `secrets.token_urlsafe(32)`; only its
   SHA-256 and expiry are stored. Repository, issue number, and case id are
-  resolved from the token row, never from the Slack payload.
+  resolved from the token row, never from the Slack payload. On approval,
+  rejection or expiry the stored hash is rotated to
+  `sha256("retired:" + hash)`, so the live token no longer resolves to a
+  decidable row while a repeat click can still be answered with the current
+  state.
+- **One current round per case.** A re-triage (operator retry after `FAILED`)
+  creates a new `approval_requests` row and, in the same transaction, marks
+  every earlier `PENDING` row `SUPERSEDED`, nulls its token hash, and queues a
+  Slack update that removes its buttons. Slack actions, the label outbox job
+  and the label webhook all require the request to be the case's newest round
+  *and* bound to the case's newest triage attempt (`is_current_request`);
+  anything else is `stale_token` / a permanent outbox failure and never
+  labels.
 - **Dedupe.** `slack_actions` has a unique `(approval_request_id, action_ts,
   slack_user_id)` key; a repeated click returns `duplicate` and the current
   state. A click after a decision returns `already_decided`.
+- **Exactly-once external writes.** Every non-idempotent outbound call is
+  bracketed by a committed intent marker: `notification_status=SENDING` +
+  token hash before `chat.postMessage` (messages carry
+  `metadata.event_type=remediator_approval_request` and are looked up before a
+  repost), `label_requested_at` before `POST .../labels` (the issue's labels
+  are re-read before a retry), and `comment_requested_at` before
+  `POST .../comments` (comments end with `<!-- remediator:approval:<id> -->`
+  / `<!-- remediator:rejection:<id> -->` and are searched before a retry). A
+  crash between the provider accepting the write and our commit therefore
+  never produces a second message, label or comment.
 - **Fast acknowledgement.** The Slack endpoint does one short transaction and
   returns; Slack HTTP (message updates) and GitHub HTTP run in the worker.
 - **GitHub is the authority.** After the worker applies the label the
@@ -113,13 +137,27 @@ Design points:
   `AWAITING_REMEDIATION_APPROVAL` (or `APPROVAL_DELIVERY_FAILED` after a retry)
   until the signed `issues/labeled` webhook for `GITHUB_REMEDIATION_LABEL`
   arrives; then `confirm_label_webhook` moves it to `REMEDIATION_APPROVED`.
-  A `labeled` webhook for a case without a recorded `APPROVED` decision is
-  treated as an ordinary ingest and does not advance the case.
+  Confirmation additionally requires that *our* delivery has recorded
+  `LABEL_APPLIED` for the current request and attempt: a `labeled` webhook
+  that arrives before the worker applied the label (someone else added it, or
+  the delivery is still pending/failed) is audited as
+  `label_webhook_unexpected`, leaves the case unchanged, and does not cancel
+  the outbox job, which still reconciles the label and posts the audit
+  comment. A `labeled` webhook for a case without a recorded `APPROVED`
+  decision is treated as an ordinary ingest and does not advance the case.
 - **Failure isolation.** Slack post failures leave the triage result and
   case untouched; after `OUTBOX_MAX_ATTEMPTS` the row is `FAILED` with
   `last_error`. GitHub label failures keep the approval decision and move the
   case to `APPROVAL_DELIVERY_FAILED`; `POST /operator/outbox/{id}/retry`
-  re-queues the same row and never requires a second human decision.
+  re-queues the same row (409 unless it is `FAILED`) and never requires a
+  second human decision. If the label landed but only the audit comment
+  failed, delivery stays `LABEL_APPLIED` and `approval_comment_failed` is
+  recorded instead. Backoff is exponential with jitter, but a provider
+  `Retry-After` / `X-RateLimit-Reset` hint (Slack 429, GitHub 403/429 rate
+  limits, which are classified retryable) is honoured up to
+  `OUTBOX_MAX_BACKOFF_SECONDS`. Phase 1/2 record-only outbox kinds
+  (`eligibility_rejected`, `case_completed`, `case_failed`, `human_blocked`)
+  are audit rows and complete as `SENT` without any external call.
 - **Nothing calls Devin.** No Phase 3 code path creates a `REMEDIATION`
   attempt or reaches `REMEDIATION_CREATE_INTENT`; the integration tests assert
   the fake Devin create count is unchanged across approval.
@@ -345,10 +383,19 @@ worker processing inline.
 4. Only then `application/x-www-form-urlencoded` → `payload` JSON →
    `block_actions`. Non-decision actions (the reason select) are acknowledged
    with `200 {"ok": true, "outcome": "ignored"}`.
-5. Look up the token hash (404 unknown, 410 expired), the approver allowlist
-   (403, audited), the case state (409), and the dedupe key.
+5. Look up the token hash, the approver allowlist (audited), the current
+   round/attempt, the case state, and the dedupe key.
 6. Record the decision and outbox rows in one transaction and return the
    current state.
+
+Slack renders any non-2xx acknowledgement as a generic "something went wrong"
+warning, so every *verified* request is acknowledged with `200` and a JSON
+body `{"ok": bool, "outcome": ...}` (`unknown_token`, `expired_token`,
+`stale_token`, `unauthorized`, `incompatible_state`, `already_decided`,
+`duplicate`, `conflict`). When the payload carries a `response_url` on
+`hooks.slack.com`, the worker posts an ephemeral explanation to the clicking
+user through it. Signature and replay failures stay `401`, an unknown
+`action_id` is `400`.
 
 ## Worker claiming and failure isolation
 

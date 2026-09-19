@@ -360,6 +360,17 @@ async def _active_kind(session: AsyncSession, case: Case) -> AttemptKind | None:
     return kind
 
 
+def _issue_label_names(issue: Any) -> tuple[str, ...] | None:
+    """Label names from the webhook's issue snapshot; None when the payload has none."""
+    if not isinstance(issue, dict) or not isinstance(issue.get("labels"), list):
+        return None
+    return tuple(
+        str(label.get("name", ""))
+        for label in issue["labels"]
+        if isinstance(label, dict) and label.get("name")
+    )
+
+
 def _is_remediation_label_event(event: WebhookEvent, settings: Settings) -> bool:
     if event.event_type != "issues" or event.action != "labeled":
         return False
@@ -386,7 +397,11 @@ async def process_event(
         confirmed = False
         if case is not None:
             confirmed = await confirm_label_webhook(
-                session, case, settings.github_remediation_label, event.delivery_id
+                session,
+                case,
+                settings.github_remediation_label,
+                event.delivery_id,
+                issue_labels=_issue_label_names(issue),
             )
             event.case_id = case.id
         logger.info(
@@ -394,7 +409,7 @@ async def process_event(
             event.delivery_id,
             event.repository,
             issue.get("number"),
-            "confirmed approval" if confirmed else "ignored (no recorded approval)",
+            "confirmed approval" if confirmed else "ignored (no matching delivered approval)",
         )
         event.status = EventStatus.PROCESSED
         event.last_error = None if confirmed else "label webhook without matching approval"

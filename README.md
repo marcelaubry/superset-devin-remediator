@@ -109,8 +109,8 @@ this release enters `REMEDIATION_CREATE_INTENT`.
 | --- | ---: | --- |
 | `approve` | 4213 | Slack post → signed approve click → worker applies label (state still waiting) → signed `labeled` webhook → `REMEDIATION_APPROVED`; no Devin remediation attempt exists |
 | `reject` | 4219 | Signed reject click with a reason → `REMEDIATION_REJECTED`, GitHub comment queued, no label operation |
-| `slack-negative` | 4217 | Bad signature, stale timestamp, missing headers (401), outsider (403), unknown token (404); then duplicate/late clicks are no-ops and exactly one label op is queued |
-| `expired-token` | 4216 | Operator expires the token; the click returns 410 and the case is untouched |
+| `slack-negative` | 4217 | Bad signature, stale timestamp, missing headers (401); outsider and unknown token acknowledged with 200 `ok: false` (Slack shows the reason via `response_url`); then duplicate/late clicks are no-ops and exactly one label op is queued |
+| `expired-token` | 4216 | Operator expires the token; the click is acknowledged with 200 `outcome: expired_token` and the case is untouched |
 | `slack-delivery-failure` | 4699 | Fake Slack fails all attempts; triage result survives, outbox shows `FAILED`, authenticated retry delivers |
 | `github-label-failure` | 4688 | Fake GitHub fails all attempts; approval retained, case `APPROVAL_DELIVERY_FAILED`, retry applies the label, webhook confirms |
 
@@ -224,7 +224,8 @@ The worker's Docker `stop_grace_period` must exceed
    rejects requests outside `SLACK_MAX_TIMESTAMP_SKEW_SECONDS`.
 4. Set `SLACK_CHANNEL_ID` to the approval channel and
    `SLACK_APPROVER_USER_IDS` to the member ids allowed to decide. Anyone else
-   clicking gets a 403 and an audit event; the case is unchanged.
+   clicking gets an ephemeral "not an authorized approver" reply and an audit
+   event; the case is unchanged.
 5. The endpoint returns a JSON body Slack ignores for `block_actions`; the
    message itself is updated asynchronously through `chat.update` by the
    worker (awaiting → approved/dispatch pending → label applied / rejected /

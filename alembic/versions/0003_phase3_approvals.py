@@ -11,8 +11,8 @@ branch_labels = None
 depends_on = None
 
 _NEW_CASE_STATES = ("APPROVAL_DELIVERY_FAILED", "REMEDIATION_APPROVED", "REMEDIATION_REJECTED")
-_NOTIFICATION_STATUSES = ("PENDING", "SENT", "FAILED")
-_APPROVAL_DECISIONS = ("PENDING", "APPROVED", "REJECTED", "EXPIRED")
+_NOTIFICATION_STATUSES = ("PENDING", "SENDING", "SENT", "FAILED")
+_APPROVAL_DECISIONS = ("PENDING", "APPROVED", "REJECTED", "EXPIRED", "SUPERSEDED")
 _DELIVERY_STATUSES = ("NOT_REQUESTED", "PENDING", "LABEL_APPLIED", "CONFIRMED", "FAILED")
 
 
@@ -68,8 +68,10 @@ def upgrade() -> None:
             nullable=False,
             server_default="NOT_REQUESTED",
         ),
+        sa.Column("label_requested_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("label_applied_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("label_confirmed_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("comment_requested_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("github_comment_id", sa.BigInteger(), nullable=True),
         sa.Column(
             "created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False
@@ -130,6 +132,8 @@ def upgrade() -> None:
         sa.Column("ts", sa.String(64), nullable=False),
         sa.Column("text", sa.Text(), nullable=False),
         sa.Column("blocks", postgresql.JSONB(), nullable=False),
+        sa.Column("message_metadata", postgresql.JSONB(), nullable=True),
+        sa.Column("ephemeral", sa.Boolean(), nullable=False, server_default="false"),
         sa.Column("update_count", sa.Integer(), nullable=False, server_default="0"),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),

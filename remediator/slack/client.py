@@ -25,12 +25,18 @@ FAKE_POST_FAILURE_ISSUES: frozenset[int] = frozenset({4699})
 _ISSUE_REF = re.compile(r"#(\d+)")
 
 
+METADATA_EVENT_TYPE = "remediator_approval_request"
+
+
 class SlackApiError(Exception):
-    def __init__(self, method: str, error: str, *, retryable: bool) -> None:
+    def __init__(
+        self, method: str, error: str, *, retryable: bool, retry_after_seconds: float | None = None
+    ) -> None:
         super().__init__(f"Slack {method} failed: {error}")
         self.method = method
         self.error = error
         self.retryable = retryable
+        self.retry_after_seconds = retry_after_seconds
 
 
 @dataclass(frozen=True)
@@ -41,14 +47,48 @@ class SlackMessageRef:
 
 class SlackClient(Protocol):
     async def post_message(
-        self, channel: str, text: str, blocks: list[dict[str, Any]]
+        self,
+        channel: str,
+        text: str,
+        blocks: list[dict[str, Any]],
+        *,
+        metadata: dict[str, Any] | None = None,
     ) -> SlackMessageRef: ...
 
     async def update_message(
         self, ref: SlackMessageRef, text: str, blocks: list[dict[str, Any]]
     ) -> SlackMessageRef: ...
 
+    async def find_message(
+        self, channel: str, approval_request_id: str, *, oldest: datetime
+    ) -> SlackMessageRef | None:
+        """Locate a message previously posted with `approval_request_id` metadata.
+
+        Used to reconcile a chat.postMessage whose result was lost before commit so the
+        same approval never produces two messages.
+        """
+        ...
+
+    async def post_response(self, response_url: str, text: str) -> None:
+        """Send an ephemeral follow-up to the user who clicked, via Slack's `response_url`."""
+        ...
+
     async def aclose(self) -> None: ...
+
+
+def approval_metadata(approval_request_id: str) -> dict[str, Any]:
+    return {
+        "event_type": METADATA_EVENT_TYPE,
+        "event_payload": {"approval_request_id": approval_request_id},
+    }
+
+
+def _metadata_request_id(metadata: Any) -> str | None:
+    if not isinstance(metadata, dict) or metadata.get("event_type") != METADATA_EVENT_TYPE:
+        return None
+    payload = metadata.get("event_payload")
+    value = payload.get("approval_request_id") if isinstance(payload, dict) else None
+    return value if isinstance(value, str) else None
 
 
 class FakeSlackClient:
@@ -75,7 +115,12 @@ class FakeSlackClient:
         return None
 
     async def post_message(
-        self, channel: str, text: str, blocks: list[dict[str, Any]]
+        self,
+        channel: str,
+        text: str,
+        blocks: list[dict[str, Any]],
+        *,
+        metadata: dict[str, Any] | None = None,
     ) -> SlackMessageRef:
         if self._fail_posts:
             raise SlackApiError("chat.postMessage", FAKE_POST_FAILURE, retryable=True)
@@ -96,11 +141,47 @@ class FakeSlackClient:
         async with self._sessions() as session:
             session.add(
                 SlackFakeMessage(
-                    channel=channel, ts=ts, text=text, blocks=blocks, created_at=now, updated_at=now
+                    channel=channel,
+                    ts=ts,
+                    text=text,
+                    blocks=blocks,
+                    message_metadata=metadata,
+                    created_at=now,
+                    updated_at=now,
                 )
             )
             await session.commit()
         return SlackMessageRef(channel=channel, ts=ts)
+
+    async def find_message(
+        self, channel: str, approval_request_id: str, *, oldest: datetime
+    ) -> SlackMessageRef | None:
+        async with self._sessions() as session:
+            rows = await session.scalars(
+                select(SlackFakeMessage)
+                .where(SlackFakeMessage.channel == channel, SlackFakeMessage.ephemeral.is_(False))
+                .order_by(SlackFakeMessage.created_at)
+            )
+            for row in rows:
+                if _metadata_request_id(row.message_metadata) == approval_request_id:
+                    return SlackMessageRef(channel=row.channel, ts=row.ts)
+        return None
+
+    async def post_response(self, response_url: str, text: str) -> None:
+        now = datetime.now(UTC)
+        async with self._sessions() as session:
+            session.add(
+                SlackFakeMessage(
+                    channel=response_url[:64],
+                    ts=f"{self._clock():.6f}-{uuid.uuid4().hex[:8]}",
+                    text=text,
+                    blocks=[],
+                    ephemeral=True,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            await session.commit()
 
     async def update_message(
         self, ref: SlackMessageRef, text: str, blocks: list[dict[str, Any]]
@@ -146,6 +227,15 @@ _NON_RETRYABLE_ERRORS = frozenset(
 )
 
 
+def _retry_after(header: str | None) -> float | None:
+    if header is None:
+        return None
+    try:
+        return max(float(header), 0.0)
+    except ValueError:
+        return None
+
+
 class LiveSlackClient:
     """Minimal Web API client for chat.postMessage / chat.update (https://api.slack.com/methods)."""
 
@@ -167,12 +257,19 @@ class LiveSlackClient:
             timeout=httpx.Timeout(timeout_seconds),
             transport=transport,
         )
+        # response_url posts are unauthenticated; never send the bot token there.
+        self._hooks = httpx.AsyncClient(
+            headers={"User-Agent": "superset-devin-remediator/phase3"},
+            timeout=httpx.Timeout(timeout_seconds),
+            transport=transport,
+        )
 
     def __repr__(self) -> str:
         return "LiveSlackClient()"
 
     async def aclose(self) -> None:
         await self._http.aclose()
+        await self._hooks.aclose()
 
     async def _call(self, method: str, body: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -180,7 +277,12 @@ class LiveSlackClient:
         except httpx.HTTPError as exc:
             raise SlackApiError(method, exc.__class__.__name__, retryable=True) from exc
         if response.status_code == 429 or response.status_code >= 500:
-            raise SlackApiError(method, f"http_{response.status_code}", retryable=True)
+            raise SlackApiError(
+                method,
+                f"http_{response.status_code}",
+                retryable=True,
+                retry_after_seconds=_retry_after(response.headers.get("retry-after")),
+            )
         try:
             payload = response.json()
         except ValueError as exc:
@@ -191,13 +293,69 @@ class LiveSlackClient:
         return payload
 
     async def post_message(
-        self, channel: str, text: str, blocks: list[dict[str, Any]]
+        self,
+        channel: str,
+        text: str,
+        blocks: list[dict[str, Any]],
+        *,
+        metadata: dict[str, Any] | None = None,
     ) -> SlackMessageRef:
-        payload = await self._call(
-            "chat.postMessage",
-            {"channel": channel, "text": text, "blocks": blocks, "unfurl_links": False},
-        )
+        body: dict[str, Any] = {
+            "channel": channel,
+            "text": text,
+            "blocks": blocks,
+            "unfurl_links": False,
+        }
+        if metadata is not None:
+            body["metadata"] = metadata
+        payload = await self._call("chat.postMessage", body)
         return SlackMessageRef(channel=str(payload["channel"]), ts=str(payload["ts"]))
+
+    async def find_message(
+        self, channel: str, approval_request_id: str, *, oldest: datetime
+    ) -> SlackMessageRef | None:
+        """conversations.history with include_all_metadata (needs the channels:history or
+        groups:history scope); scans at most a few pages after `oldest`."""
+        cursor: str | None = None
+        for _ in range(5):
+            body: dict[str, Any] = {
+                "channel": channel,
+                "oldest": f"{oldest.timestamp():.6f}",
+                "limit": 200,
+                "include_all_metadata": True,
+            }
+            if cursor:
+                body["cursor"] = cursor
+            payload = await self._call("conversations.history", body)
+            for message in payload.get("messages") or []:
+                if not isinstance(message, dict):
+                    continue
+                if _metadata_request_id(message.get("metadata")) == approval_request_id:
+                    return SlackMessageRef(channel=channel, ts=str(message["ts"]))
+            cursor = (payload.get("response_metadata") or {}).get("next_cursor") or None
+            if not cursor:
+                break
+        return None
+
+    async def post_response(self, response_url: str, text: str) -> None:
+        if not response_url.startswith("https://hooks.slack.com/"):
+            raise SlackApiError("response_url", "untrusted_response_url", retryable=False)
+        try:
+            response = await self._hooks.post(
+                response_url,
+                json={"response_type": "ephemeral", "replace_original": False, "text": text},
+            )
+        except httpx.HTTPError as exc:
+            raise SlackApiError("response_url", exc.__class__.__name__, retryable=True) from exc
+        if response.status_code == 429 or response.status_code >= 500:
+            raise SlackApiError(
+                "response_url",
+                f"http_{response.status_code}",
+                retryable=True,
+                retry_after_seconds=_retry_after(response.headers.get("retry-after")),
+            )
+        if response.status_code >= 400:
+            raise SlackApiError("response_url", f"http_{response.status_code}", retryable=False)
 
     async def update_message(
         self, ref: SlackMessageRef, text: str, blocks: list[dict[str, Any]]

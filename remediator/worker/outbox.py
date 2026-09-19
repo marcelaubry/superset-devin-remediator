@@ -21,18 +21,21 @@ from ..approvals import (
     enqueue_slack_status_update,
     generate_action_token,
     hash_action_token,
+    is_current_request,
     record_event,
     triage_result_hash,
 )
 from ..config import Settings
-from ..github.client import GitHubApiError, GitHubIssuesClient, IssueNotFound
+from ..github.client import GitHubApiError, GitHubIssuesClient, IssueNotFound, comment_marker
 from ..lifecycle import CaseState, InvalidTransition, transition
 from ..models import (
     OUTBOX_KIND_GITHUB_APPLY_LABEL,
     OUTBOX_KIND_GITHUB_NOT_FEASIBLE,
     OUTBOX_KIND_GITHUB_REJECTION_COMMENT,
     OUTBOX_KIND_SLACK_APPROVAL_REQUEST,
+    OUTBOX_KIND_SLACK_EPHEMERAL_RESPONSE,
     OUTBOX_KIND_SLACK_STATUS_UPDATE,
+    OUTBOX_RECORD_ONLY_KINDS,
     ApprovalDecision,
     ApprovalRequest,
     Attempt,
@@ -49,7 +52,7 @@ from ..slack.blocks import (
     build_approval_blocks,
     fallback_text,
 )
-from ..slack.client import SlackApiError, SlackClient, SlackMessageRef
+from ..slack.client import SlackApiError, SlackClient, SlackMessageRef, approval_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +76,8 @@ def message_status(request: ApprovalRequest) -> ApprovalMessageStatus:
         return ApprovalMessageStatus.REJECTED
     if request.decision == ApprovalDecision.EXPIRED:
         return ApprovalMessageStatus.EXPIRED
+    if request.decision == ApprovalDecision.SUPERSEDED:
+        return ApprovalMessageStatus.SUPERSEDED
     if request.decision == ApprovalDecision.APPROVED:
         if request.delivery_status == DeliveryStatus.CONFIRMED:
             return ApprovalMessageStatus.LABEL_APPLIED
@@ -158,21 +163,21 @@ class OutboxDispatcher:
             if row is None or row.claimed_by != self.worker_id:
                 return
             channel = row.channel.value
-            failure: tuple[str, bool] | None = None
+            failure: tuple[str, bool, float | None] | None = None
             try:
                 await self._handle(session, row)
             except OutboxSkip as exc:
                 row.last_error = f"skipped: {exc}"
                 outbox_deliveries_total.labels(channel=channel, result="skipped").inc()
             except OutboxPermanentFailure as exc:
-                failure = (str(exc), True)
+                failure = (str(exc), True, None)
             except (SlackApiError, GitHubApiError) as exc:
-                failure = (str(exc), not exc.retryable)
+                failure = (str(exc), not exc.retryable, exc.retry_after_seconds)
             except InvalidTransition as exc:
-                failure = (f"case changed concurrently: {exc}", True)
+                failure = (f"case changed concurrently: {exc}", True, None)
             except Exception as exc:
                 logger.exception("outbox %s raised", row_id)
-                failure = (f"{type(exc).__name__}: {exc}", False)
+                failure = (f"{type(exc).__name__}: {exc}", False, None)
             else:
                 row.last_error = None
                 outbox_deliveries_total.labels(channel=channel, result="sent").inc()
@@ -183,12 +188,20 @@ class OutboxDispatcher:
                 row.lease_expires_at = None
                 await session.commit()
                 return
-            # Discard whatever the handler changed; only retry bookkeeping is persisted.
+            # Discard whatever the handler changed since its last explicit commit; only
+            # retry bookkeeping is persisted.
             await session.rollback()
             await self._fail(session, row_id, *failure)
             await session.commit()
 
-    async def _fail(self, session: AsyncSession, row_id: Any, error: str, permanent: bool) -> None:
+    async def _fail(
+        self,
+        session: AsyncSession,
+        row_id: Any,
+        error: str,
+        permanent: bool,
+        retry_after_seconds: float | None = None,
+    ) -> None:
         row = await session.get(NotificationOutbox, row_id, with_for_update=True)
         assert row is not None
         terminal = permanent or row.attempts_count >= self.settings.outbox_max_attempts
@@ -208,9 +221,12 @@ class OutboxDispatcher:
             )
             await self._on_terminal_failure(session, row, error)
         else:
-            row.next_attempt_at = datetime.now(UTC) + backoff_delay(
-                self.settings, row.attempts_count
-            )
+            delay = backoff_delay(self.settings, row.attempts_count)
+            if retry_after_seconds is not None:
+                # Honour the provider's Retry-After, capped like ordinary backoff.
+                hinted = min(retry_after_seconds, self.settings.outbox_max_backoff_seconds)
+                delay = max(delay, timedelta(seconds=hinted))
+            row.next_attempt_at = datetime.now(UTC) + delay
             outbox_deliveries_total.labels(channel=row.channel.value, result="retry").inc()
             logger.warning(
                 "outbox %s %s/%s attempt %s failed, retrying at %s: %s",
@@ -236,6 +252,17 @@ class OutboxDispatcher:
                 session, request, "slack_notification_failed", "worker", f"outbox {row.id}: {error}"
             )
         elif row.kind == OUTBOX_KIND_GITHUB_APPLY_LABEL:
+            if request.label_applied_at is not None:
+                # The label itself landed; only the audit comment is missing. Keep the
+                # delivery status truthful so the signed webhook can still confirm it.
+                record_event(
+                    session,
+                    request,
+                    "approval_comment_failed",
+                    "worker",
+                    f"outbox {row.id}: {error}",
+                )
+                return
             request.delivery_status = DeliveryStatus.FAILED
             record_event(
                 session, request, "label_delivery_failed", "worker", f"outbox {row.id}: {error}"
@@ -259,6 +286,10 @@ class OutboxDispatcher:
             record_event(
                 session, request, "slack_update_failed", "worker", f"outbox {row.id}: {error}"
             )
+        elif row.kind == OUTBOX_KIND_SLACK_EPHEMERAL_RESPONSE:
+            record_event(
+                session, request, "slack_response_failed", "worker", f"outbox {row.id}: {error}"
+            )
 
     # -- handlers ------------------------------------------------------------------
 
@@ -273,8 +304,15 @@ class OutboxDispatcher:
             row.channel == OutboxChannel.GITHUB and row.kind == OUTBOX_KIND_GITHUB_REJECTION_COMMENT
         ):
             await self._github_rejection_comment(session, row)
+        elif (
+            row.channel == OutboxChannel.SLACK and row.kind == OUTBOX_KIND_SLACK_EPHEMERAL_RESPONSE
+        ):
+            await self._slack_ephemeral_response(session, row)
         elif row.channel == OutboxChannel.GITHUB and row.kind == OUTBOX_KIND_GITHUB_NOT_FEASIBLE:
             await self._github_not_feasible(session, row)
+        elif row.kind in OUTBOX_RECORD_ONLY_KINDS:
+            # Phase 1/2 intents are audit records; nothing is delivered for them.
+            logger.debug("outbox %s %s/%s is record-only", row.id, row.channel.value, row.kind)
         else:
             raise OutboxPermanentFailure(f"unknown outbox kind {row.channel.value}/{row.kind}")
 
@@ -321,12 +359,39 @@ class OutboxDispatcher:
             raise OutboxSkip(f"approval request already {request.decision.value}")
         if CaseState(case.state) != CaseState.AWAITING_REMEDIATION_APPROVAL:
             raise OutboxSkip(f"case is {case.state}, not awaiting approval")
+        channel = self.settings.slack_channel_id
+        if request.notification_status == NotificationStatus.SENDING:
+            # A previous attempt may have posted before its commit was lost; find that
+            # message by its metadata instead of posting a second one.
+            ref = await self.slack.find_message(
+                channel, str(request.id), oldest=request.created_at - timedelta(minutes=5)
+            )
+            if ref is not None:
+                self._mark_notified(session, request, ref, reconciled=True)
+                return
         token = generate_action_token()
         request.action_token_hash = hash_action_token(token)
+        request.notification_status = NotificationStatus.SENDING
+        # Commit the token and the SENDING marker before the network call so a crash after
+        # Slack accepted the post leaves a reconcilable record rather than a fresh token.
+        await session.commit()
         message = self._message_input(request, case, attempt, token=token)
         ref = await self.slack.post_message(
-            self.settings.slack_channel_id, fallback_text(message), build_approval_blocks(message)
+            channel,
+            fallback_text(message),
+            build_approval_blocks(message),
+            metadata=approval_metadata(str(request.id)),
         )
+        self._mark_notified(session, request, ref, reconciled=False)
+
+    def _mark_notified(
+        self,
+        session: AsyncSession,
+        request: ApprovalRequest,
+        ref: SlackMessageRef,
+        *,
+        reconciled: bool,
+    ) -> None:
         request.notification_status = NotificationStatus.SENT
         request.slack_channel = ref.channel
         request.slack_message_ts = ref.ts
@@ -335,7 +400,25 @@ class OutboxDispatcher:
             request,
             "slack_notified",
             "worker",
-            f"approval request posted to Slack channel {ref.channel} (ts {ref.ts})",
+            f"approval request {'reconciled with' if reconciled else 'posted to'} Slack "
+            f"channel {ref.channel} (ts {ref.ts})",
+        )
+
+    async def _slack_ephemeral_response(
+        self, session: AsyncSession, row: NotificationOutbox
+    ) -> None:
+        request, _case, _attempt = await self._load_request(session, row)
+        response_url = str(row.payload.get("response_url") or "")
+        text = str(row.payload.get("text") or "")
+        if not response_url or not text:
+            raise OutboxSkip("no response_url to answer")
+        await self.slack.post_response(response_url, text)
+        record_event(
+            session,
+            request,
+            "slack_responded",
+            "worker",
+            f"ephemeral `{row.payload.get('outcome', '')}` explanation sent to the clicking user",
         )
 
     async def _slack_status_update(self, session: AsyncSession, row: NotificationOutbox) -> None:
@@ -368,12 +451,20 @@ class OutboxDispatcher:
                 "approved triage result is no longer current "
                 f"(approved {request.triage_result_hash[:12]}, current {current_hash[:12]})"
             )
+        expected_attempt = str(row.payload.get("attempt_id") or request.attempt_id)
+        if expected_attempt != str(request.attempt_id) or not await is_current_request(
+            session, request
+        ):
+            raise OutboxPermanentFailure(
+                "approved triage attempt is no longer the case's current attempt"
+            )
         state = CaseState(case.state)
-        if state == CaseState.REMEDIATION_APPROVED and request.label_applied_at is not None:
-            raise OutboxSkip("label already applied and confirmed")
+        if state == CaseState.REMEDIATION_APPROVED and request.label_applied_at is None:
+            raise OutboxPermanentFailure("case was approved without our label delivery")
         if state not in {
             CaseState.AWAITING_REMEDIATION_APPROVAL,
             CaseState.APPROVAL_DELIVERY_FAILED,
+            CaseState.REMEDIATION_APPROVED,
         }:
             raise OutboxPermanentFailure(f"case is {state.value}; refusing to label")
         if not self.settings.repository_allowed(case.repository):
@@ -386,7 +477,14 @@ class OutboxDispatcher:
         if issue.state != "open":
             raise OutboxPermanentFailure(f"issue is {issue.state}; refusing to label")
         if request.label_applied_at is None:
-            result = await self.github.add_label(case.repository, case.issue_number, label)
+            if request.label_requested_at is not None and label in issue.labels:
+                # A previous attempt's POST succeeded but its commit was lost.
+                applied_now = False
+            else:
+                request.label_requested_at = datetime.now(UTC)
+                await session.commit()
+                result = await self.github.add_label(case.repository, case.issue_number, label)
+                applied_now = result.applied
             request.label_applied_at = datetime.now(UTC)
             request.delivery_status = DeliveryStatus.LABEL_APPLIED
             record_event(
@@ -394,16 +492,20 @@ class OutboxDispatcher:
                 request,
                 "label_applied",
                 "worker",
-                f"`{label}` {'added to' if result.applied else 'already present on'} "
+                f"`{label}` {'added to' if applied_now else 'already present on'} "
                 f"{case.repository}#{case.issue_number}; awaiting signed GitHub webhook",
             )
             # Persist the label bookkeeping before the comment so a comment failure can
             # never cause a second label write on retry.
             await session.commit()
         if request.github_comment_id is None:
-            body = self._approval_comment(request, case, attempt)
-            request.github_comment_id = await self.github.create_comment(
-                case.repository, case.issue_number, body
+            marker = comment_marker("approval", str(request.id))
+            request.github_comment_id = await self._ensure_comment(
+                session,
+                request,
+                case,
+                marker,
+                self._approval_comment(request, case, attempt) + f"\n\n{marker}",
             )
             record_event(
                 session,
@@ -415,6 +517,28 @@ class OutboxDispatcher:
         if request.delivery_status == DeliveryStatus.FAILED:
             request.delivery_status = DeliveryStatus.LABEL_APPLIED
         enqueue_slack_status_update(session, request)
+
+    async def _ensure_comment(
+        self,
+        session: AsyncSession,
+        request: ApprovalRequest,
+        case: Case,
+        marker: str,
+        body: str,
+    ) -> int:
+        """Create the comment exactly once across crash/retry windows.
+
+        The intent is committed before the POST; on a later attempt with the intent set, the
+        issue's comments are searched for the request-specific marker before posting again.
+        """
+        if request.comment_requested_at is not None:
+            existing = await self.github.find_comment(case.repository, case.issue_number, marker)
+            if existing is not None:
+                return existing
+        else:
+            request.comment_requested_at = datetime.now(UTC)
+            await session.commit()
+        return await self.github.create_comment(case.repository, case.issue_number, body)
 
     def _approval_comment(self, request: ApprovalRequest, case: Case, attempt: Attempt) -> str:
         when = request.decided_at.isoformat(timespec="seconds") if request.decided_at else "?"
@@ -454,8 +578,9 @@ class OutboxDispatcher:
             f"{reason}\n\n"
             "No remediation label was applied and no remediation session will be started."
         )
-        request.github_comment_id = await self.github.create_comment(
-            case.repository, case.issue_number, body
+        marker = comment_marker("rejection", str(request.id))
+        request.github_comment_id = await self._ensure_comment(
+            session, request, case, marker, body + f"\n\n{marker}"
         )
         record_event(
             session,

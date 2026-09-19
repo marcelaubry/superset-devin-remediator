@@ -24,11 +24,13 @@ from .models import (
     OUTBOX_KIND_GITHUB_APPLY_LABEL,
     OUTBOX_KIND_GITHUB_REJECTION_COMMENT,
     OUTBOX_KIND_SLACK_APPROVAL_REQUEST,
+    OUTBOX_KIND_SLACK_EPHEMERAL_RESPONSE,
     OUTBOX_KIND_SLACK_STATUS_UPDATE,
     ApprovalDecision,
     ApprovalEvent,
     ApprovalRequest,
     Attempt,
+    AttemptKind,
     Case,
     DeliveryStatus,
     NotificationOutbox,
@@ -54,6 +56,18 @@ def hash_action_token(token: str) -> str:
 
 def generate_action_token() -> str:
     return secrets.token_urlsafe(32)
+
+
+def retired_token_hash(token_hash: str) -> str:
+    """Hash stored once a request is decided or expired: the live token no longer resolves to
+    a decidable request, but a repeat click can still be answered with the current state."""
+    return hashlib.sha256(f"retired:{token_hash}".encode()).hexdigest()
+
+
+def retire_token(request: ApprovalRequest) -> None:
+    """Call exactly once, on the PENDING → terminal transition."""
+    if request.action_token_hash is not None:
+        request.action_token_hash = retired_token_hash(request.action_token_hash)
 
 
 def record_event(
@@ -104,6 +118,26 @@ async def open_request_for_case(
     return request
 
 
+async def latest_triage_attempt_id(session: AsyncSession, case_id: Any) -> Any | None:
+    """The triage attempt whose result is current for the case (newest by start time)."""
+    return await session.scalar(
+        select(Attempt.id)
+        .where(Attempt.case_id == case_id, Attempt.kind == AttemptKind.TRIAGE)
+        .order_by(Attempt.started_at.desc(), Attempt.id.desc())
+        .limit(1)
+    )
+
+
+async def is_current_request(session: AsyncSession, request: ApprovalRequest) -> bool:
+    """True when `request` is the newest approval round for its case and is bound to the
+    case's newest triage attempt. Anything else is a stale round left over from a retry or
+    re-triage and must never approve or label."""
+    current = await open_request_for_case(session, request.case_id)
+    if current is None or current.id != request.id:
+        return False
+    return await latest_triage_attempt_id(session, request.case_id) == request.attempt_id
+
+
 async def create_approval_request(
     session: AsyncSession,
     case: Case,
@@ -114,7 +148,9 @@ async def create_approval_request(
     """Create the approval round for a validated `remediation_candidate` and enqueue Slack.
 
     Idempotent per triage attempt: a second call for the same attempt returns the existing
-    request without enqueueing another notification.
+    request without enqueueing another notification. Every earlier undecided round for the
+    same case is superseded in this transaction: its token stops resolving to an approvable
+    request and its Slack message is updated to drop the buttons.
     """
     existing: ApprovalRequest | None = await session.scalar(
         select(ApprovalRequest).where(ApprovalRequest.attempt_id == attempt.id)
@@ -122,6 +158,26 @@ async def create_approval_request(
     if existing is not None:
         return existing
     now = datetime.now(UTC)
+    stale_rounds = await session.scalars(
+        select(ApprovalRequest)
+        .where(
+            ApprovalRequest.case_id == case.id,
+            ApprovalRequest.decision == ApprovalDecision.PENDING,
+        )
+        .with_for_update()
+    )
+    for stale in stale_rounds:
+        stale.decision = ApprovalDecision.SUPERSEDED
+        stale.decided_at = now
+        stale.action_token_hash = None
+        record_event(
+            session,
+            stale,
+            "superseded",
+            "worker",
+            f"superseded by new triage attempt {attempt.operation_key}",
+        )
+        _enqueue_status_update(session, stale)
     request = ApprovalRequest(
         case_id=case.id,
         attempt_id=attempt.id,
@@ -161,6 +217,7 @@ class ActionOutcome(StrEnum):
     ALREADY_DECIDED = "already_decided"
     UNKNOWN_TOKEN = "unknown_token"
     EXPIRED_TOKEN = "expired_token"
+    STALE_TOKEN = "stale_token"
     UNAUTHORIZED = "unauthorized"
     INCOMPATIBLE_STATE = "incompatible_state"
     UNKNOWN_ACTION = "unknown_action"
@@ -176,6 +233,7 @@ class SlackActionInput:
     action_id: str
     action_ts: str
     reason: str | None = None
+    response_url: str | None = None
 
 
 @dataclass(frozen=True)
@@ -187,17 +245,24 @@ class SlackActionResult:
 
     @property
     def http_status(self) -> int:
+        """Slack treats any non-2xx as a failed interaction and shows a generic warning, so
+        every verified request is acknowledged with 200; the user-facing explanation goes out
+        through `response_url` (queued on the outbox) and the outcome is in the JSON body."""
+        return 200 if self.outcome != ActionOutcome.UNKNOWN_ACTION else 400
+
+    @property
+    def user_message(self) -> str | None:
+        """Ephemeral text for the clicking user when their click did not count."""
         return {
-            ActionOutcome.APPROVED: 200,
-            ActionOutcome.REJECTED: 200,
-            ActionOutcome.DUPLICATE: 200,
-            ActionOutcome.ALREADY_DECIDED: 200,
-            ActionOutcome.UNKNOWN_TOKEN: 404,
-            ActionOutcome.EXPIRED_TOKEN: 410,
-            ActionOutcome.UNAUTHORIZED: 403,
-            ActionOutcome.INCOMPATIBLE_STATE: 409,
-            ActionOutcome.UNKNOWN_ACTION: 400,
-        }[self.outcome]
+            ActionOutcome.UNAUTHORIZED: "You are not an authorized approver for this request.",
+            ActionOutcome.EXPIRED_TOKEN: "This approval request has expired.",
+            ActionOutcome.STALE_TOKEN: (
+                "This approval request is stale: the issue was re-triaged. "
+                "Use the newest message for this issue."
+            ),
+            ActionOutcome.ALREADY_DECIDED: f"No change: {self.detail}.",
+            ActionOutcome.INCOMPATIBLE_STATE: f"No change: {self.detail}.",
+        }.get(self.outcome)
 
 
 def _dedupe_key(token_hash: str, action: SlackActionInput) -> str:
@@ -217,7 +282,7 @@ async def process_slack_action(
     token_hash = hash_action_token(action.token)
     request: ApprovalRequest | None = await session.scalar(
         select(ApprovalRequest)
-        .where(ApprovalRequest.action_token_hash == token_hash)
+        .where(ApprovalRequest.action_token_hash.in_([token_hash, retired_token_hash(token_hash)]))
         .with_for_update()
     )
     if request is None:
@@ -253,16 +318,20 @@ async def process_slack_action(
             )
         )
 
+    def _reply(outcome: ActionOutcome, detail: str) -> SlackActionResult:
+        result = SlackActionResult(outcome, request, state, detail)
+        _enqueue_ephemeral_response(session, request, action, result)
+        return result
+
     if action.slack_user_id not in settings.approver_user_ids:
         _record(ActionOutcome.UNAUTHORIZED)
         record_event(session, request, "unauthorized_action", actor, f"{action.action_id} refused")
-        return SlackActionResult(
-            ActionOutcome.UNAUTHORIZED, request, state, "user is not an authorized approver"
-        )
+        return _reply(ActionOutcome.UNAUTHORIZED, "user is not an authorized approver")
     now = datetime.now(UTC)
     if request.decision == ApprovalDecision.PENDING and request.token_expires_at <= now:
         request.decision = ApprovalDecision.EXPIRED
         request.decided_at = now
+        retire_token(request)
         record_event(session, request, "expired", "system", "action token expired before decision")
         _enqueue_status_update(session, request)
     if request.decision != ApprovalDecision.PENDING:
@@ -272,15 +341,20 @@ async def process_slack_action(
             else ActionOutcome.ALREADY_DECIDED
         )
         if request.decision == ApprovalDecision.EXPIRED:
-            return SlackActionResult(
-                ActionOutcome.EXPIRED_TOKEN, request, state, "action token has expired"
-            )
-        return SlackActionResult(
-            ActionOutcome.ALREADY_DECIDED,
-            request,
-            state,
-            f"request already {request.decision.value.lower()}",
+            return _reply(ActionOutcome.EXPIRED_TOKEN, "action token has expired")
+        return _reply(
+            ActionOutcome.ALREADY_DECIDED, f"request already {request.decision.value.lower()}"
         )
+    if not await is_current_request(session, request):
+        _record(ActionOutcome.STALE_TOKEN)
+        record_event(
+            session,
+            request,
+            "stale_action",
+            actor,
+            f"{action.action_id} refused: request is not the case's current triage round",
+        )
+        return _reply(ActionOutcome.STALE_TOKEN, "approval request is stale (issue re-triaged)")
     if state != CaseState.AWAITING_REMEDIATION_APPROVAL:
         _record(ActionOutcome.INCOMPATIBLE_STATE)
         record_event(
@@ -290,9 +364,7 @@ async def process_slack_action(
             actor,
             f"{action.action_id} ignored while case is {state.value}",
         )
-        return SlackActionResult(
-            ActionOutcome.INCOMPATIBLE_STATE, request, state, f"case is in {state.value}"
-        )
+        return _reply(ActionOutcome.INCOMPATIBLE_STATE, f"case is in {state.value}")
     reason = (action.reason or "").strip()[:MAX_REASON_LENGTH] or None
     if action.action_id == ACTION_APPROVE:
         request.decision = ApprovalDecision.APPROVED
@@ -302,6 +374,7 @@ async def process_slack_action(
         request.decision_reason = reason
         request.label_operation = f"add_label:{settings.github_remediation_label}"
         request.delivery_status = DeliveryStatus.PENDING
+        retire_token(request)
         _record(ActionOutcome.APPROVED)
         record_event(
             session,
@@ -318,6 +391,7 @@ async def process_slack_action(
             OUTBOX_KIND_GITHUB_APPLY_LABEL,
             {
                 "approval_request_id": str(request.id),
+                "attempt_id": str(request.attempt_id),
                 "triage_result_hash": request.triage_result_hash,
                 "label": settings.github_remediation_label,
             },
@@ -332,6 +406,7 @@ async def process_slack_action(
     request.decision_action_id = f"{action.action_id}:{action.action_ts}"
     request.decision_reason = reason
     request.delivery_status = DeliveryStatus.NOT_REQUESTED
+    retire_token(request)
     _record(ActionOutcome.REJECTED)
     record_event(
         session,
@@ -376,17 +451,57 @@ def enqueue_slack_status_update(session: AsyncSession, request: ApprovalRequest)
     _enqueue_status_update(session, request)
 
 
+def _enqueue_ephemeral_response(
+    session: AsyncSession,
+    request: ApprovalRequest,
+    action: SlackActionInput,
+    result: SlackActionResult,
+) -> None:
+    text = result.user_message
+    if text is None or not action.response_url:
+        return
+    enqueue(
+        session,
+        request,
+        OutboxChannel.SLACK,
+        OUTBOX_KIND_SLACK_EPHEMERAL_RESPONSE,
+        {
+            "approval_request_id": str(request.id),
+            "response_url": action.response_url,
+            "text": text,
+            "outcome": result.outcome.value,
+        },
+    )
+
+
 async def confirm_label_webhook(
-    session: AsyncSession, case: Case, label: str, delivery_id: str
+    session: AsyncSession,
+    case: Case,
+    label: str,
+    delivery_id: str,
+    *,
+    issue_labels: tuple[str, ...] | None = None,
 ) -> bool:
     """Handle a signed GitHub `labeled` webhook for the remediation label.
 
-    The case advances to REMEDIATION_APPROVED only when a recorded APPROVED decision
-    exists; a label applied without one never advances state.
+    The case advances to REMEDIATION_APPROVED only when the case's current approval round
+    is APPROVED *and* the worker has already applied the label through the outbox
+    (`label_applied_at` set). A label applied by anyone else, or a webhook arriving before
+    our own delivery, is recorded and ignored: the outbox row stays authoritative, so the
+    audit comment is still posted and the label call is never skipped.
     """
     request = await open_request_for_case(session, case.id, for_update=True)
     state = CaseState(case.state)
     if request is None or request.decision != ApprovalDecision.APPROVED:
+        return False
+    if not await is_current_request(session, request):
+        record_event(
+            session,
+            request,
+            "label_webhook_unexpected",
+            "github",
+            f"delivery {delivery_id}: approval round is not the case's current triage round",
+        )
         return False
     if state not in {CaseState.AWAITING_REMEDIATION_APPROVAL, CaseState.APPROVAL_DELIVERY_FAILED}:
         if state == CaseState.REMEDIATION_APPROVED:
@@ -397,6 +512,25 @@ async def confirm_label_webhook(
                 "github",
                 f"delivery {delivery_id} repeated `{label}` confirmation",
             )
+        return False
+    if request.label_applied_at is None or request.delivery_status != DeliveryStatus.LABEL_APPLIED:
+        record_event(
+            session,
+            request,
+            "label_webhook_unexpected",
+            "github",
+            f"delivery {delivery_id} reported `{label}` before the remediator applied it "
+            f"(delivery status {request.delivery_status.value}); state unchanged",
+        )
+        return False
+    if issue_labels is not None and label not in issue_labels:
+        record_event(
+            session,
+            request,
+            "label_webhook_unexpected",
+            "github",
+            f"delivery {delivery_id}: issue label snapshot does not contain `{label}`",
+        )
         return False
     now = datetime.now(UTC)
     request.delivery_status = DeliveryStatus.CONFIRMED
@@ -429,6 +563,7 @@ async def expire_request(session: AsyncSession, request: ApprovalRequest, actor:
     request.token_expires_at = now
     request.decision = ApprovalDecision.EXPIRED
     request.decided_at = now
+    retire_token(request)
     record_event(session, request, "expired", actor, "action token expired by operator")
     _enqueue_status_update(session, request)
     return True

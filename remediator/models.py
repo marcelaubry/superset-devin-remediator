@@ -5,6 +5,7 @@ from typing import Any
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     DateTime,
     Enum,
     Float,
@@ -92,6 +93,7 @@ class OutboxStatus(str, enum.Enum):
 
 class NotificationStatus(str, enum.Enum):
     PENDING = "PENDING"
+    SENDING = "SENDING"
     SENT = "SENT"
     FAILED = "FAILED"
 
@@ -101,6 +103,7 @@ class ApprovalDecision(str, enum.Enum):
     APPROVED = "APPROVED"
     REJECTED = "REJECTED"
     EXPIRED = "EXPIRED"
+    SUPERSEDED = "SUPERSEDED"
 
 
 class DeliveryStatus(str, enum.Enum):
@@ -116,6 +119,11 @@ OUTBOX_KIND_SLACK_STATUS_UPDATE = "approval_status_update"
 OUTBOX_KIND_GITHUB_NOT_FEASIBLE = "triage_not_feasible"
 OUTBOX_KIND_GITHUB_APPLY_LABEL = "apply_remediation_label"
 OUTBOX_KIND_GITHUB_REJECTION_COMMENT = "rejection_comment"
+OUTBOX_KIND_SLACK_EPHEMERAL_RESPONSE = "slack_ephemeral_response"
+# Phase 1/2 record-only intents: kept on the outbox as an audit trail, never delivered.
+OUTBOX_RECORD_ONLY_KINDS: frozenset[str] = frozenset(
+    {"eligibility_rejected", "case_completed", "case_failed", "human_blocked"}
+)
 
 
 class WebhookEvent(Base):
@@ -316,8 +324,10 @@ class ApprovalRequest(Base):
     delivery_status: Mapped[DeliveryStatus] = mapped_column(
         Enum(DeliveryStatus, name="delivery_status"), default=DeliveryStatus.NOT_REQUESTED
     )
+    label_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     label_applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     label_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    comment_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     github_comment_id: Mapped[int | None] = mapped_column(BigInteger)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC), server_default=func.now()
@@ -387,6 +397,8 @@ class SlackFakeMessage(Base):
     ts: Mapped[str] = mapped_column(String(64))
     text: Mapped[str] = mapped_column(Text)
     blocks: Mapped[list[dict[str, Any]]] = mapped_column(JSONB)
+    message_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    ephemeral: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     update_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False

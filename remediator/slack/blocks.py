@@ -41,6 +41,7 @@ class ApprovalMessageStatus(StrEnum):
     REJECTED = "rejected"
     DELIVERY_FAILED = "delivery_failed"
     EXPIRED = "expired"
+    SUPERSEDED = "superseded"
 
 
 STATUS_LINES: dict[ApprovalMessageStatus, str] = {
@@ -57,6 +58,9 @@ STATUS_LINES: dict[ApprovalMessageStatus, str] = {
         "no re-approval is needed"
     ),
     ApprovalMessageStatus.EXPIRED: ":clock3: *Expired* — the approval window closed",
+    ApprovalMessageStatus.SUPERSEDED: (
+        ":arrows_counterclockwise: *Superseded* — the issue was re-triaged; use the newer message"
+    ),
 }
 
 
