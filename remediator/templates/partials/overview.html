@@ -1,0 +1,1 @@
+<section><h2>Cases by state</h2><ul>{% for state,count in state_counts.items() %}<li>{{ state }}: {{ count }}</li>{% endfor %}</ul><h2>Cases by recommendation</h2><ul>{% for name,count in recommendation_counts.items() %}<li>{{ name }}: {{ count }}</li>{% endfor %}</ul></section>

@@ -1,0 +1,1 @@
+{"action":"opened","repository":{"full_name":"apache/superset"},"sender":{"login":"simulator"},"issue":{"number":4601,"title":"Fix issue","body":"Steps to reproduce:\n1. Test.\nExpected behavior works.","html_url":"https://github.com/apache/superset/issues/4601","labels":[{"name":"bug"}]}}

@@ -1,0 +1,5 @@
+:root { font-family: system-ui, sans-serif; color: #222; background: #f6f7f9; }
+body { margin: 0; } main { max-width: 1200px; margin: 2rem auto; padding: 0 1rem; }
+section, dl, form { background: white; padding: 1rem; margin: 1rem 0; border: 1px solid #ddd; border-radius: .4rem; }
+table { width: 100%; border-collapse: collapse; background: white; } th, td { padding: .5rem; border: 1px solid #ddd; text-align: left; }
+button { padding: .5rem 1rem; cursor: pointer; } dt { font-weight: bold; margin-top: .5rem; } dd { margin-left: 0; }

@@ -1,0 +1,1 @@
+{"action":"opened","repository":{"full_name":"apache/superset"},"sender":{"login":"simulator"},"issue":{"number":4422,"title":"chore: bump ruff to 0.6","body":"Update the pinned version.","html_url":"https://github.com/apache/superset/issues/4422","labels":[{"name":"dependencies"},{"name":"devin-candidate"}]}}

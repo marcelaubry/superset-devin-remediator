@@ -1,0 +1,1 @@
+<section><h2>Failures requiring action</h2><ul>{% for item in failures %}<li>{{item.issue_number or item.delivery_id}} {{item.state or item.status}}</li>{% else %}<li>None</li>{% endfor %}</ul></section>

@@ -1,0 +1,1 @@
+{"action":"opened","repository":{"full_name":"apache/superset"},"sender":{"login":"simulator"},"issue":{"number":4321,"title":"Something is broken","body":"It does not work. Please investigate.","html_url":"https://github.com/apache/superset/issues/4321","labels":[{"name":"devin-candidate"}]}}
