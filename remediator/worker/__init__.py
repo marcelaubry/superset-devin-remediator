@@ -52,7 +52,7 @@ class Worker:
                 case = await session.scalar(
                     select(Case)
                     .where(
-                        Case.state == CaseState.RECEIVED,
+                        Case.state.in_({CaseState.RECEIVED, CaseState.REMEDIATION_CREATE_INTENT}),
                         Case.state_entered_at < cutoff,
                         ~pending_event,
                     )

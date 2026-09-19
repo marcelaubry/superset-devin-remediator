@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     worker_concurrency: int = 2
     devin_client: str = "fake"
     log_level: str = "INFO"
-    simulation_auto_approve: bool = True
+    simulation_auto_approve_remediation: bool = True
 
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=False, extra="ignore")
 

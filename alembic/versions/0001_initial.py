@@ -15,7 +15,6 @@ def upgrade() -> None:
     case_state = postgresql.ENUM(
         "RECEIVED",
         "ELIGIBILITY_EVALUATED",
-        "AWAITING_TRIAGE_APPROVAL",
         "TRIAGE_CREATE_INTENT",
         "TRIAGING",
         "TRIAGED",
@@ -42,7 +41,12 @@ def upgrade() -> None:
         ("attempt_status", ["RUNNING", "SUCCEEDED", "FAILED", "BLOCKED", "CANCELLED"]),
         (
             "recommendation",
-            ["GOOD_CANDIDATE", "NEEDS_SCOPING", "USE_DETERMINISTIC_AUTOMATION", "HUMAN_LED"],
+            [
+                "ELIGIBLE_FOR_DEVIN_TRIAGE",
+                "NEEDS_SCOPING",
+                "USE_DETERMINISTIC_AUTOMATION",
+                "HUMAN_LED",
+            ],
         ),
         ("outbox_channel", ["github", "slack"]),
         ("outbox_status", ["PENDING", "SENT", "FAILED"]),

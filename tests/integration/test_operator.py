@@ -38,6 +38,12 @@ async def test_operator_retry_cancel_and_case_auth(
     triaging_id = await add_case(integration_session_factory, 5003, CaseState.TRIAGING)
     cancelled_id = await add_case(integration_session_factory, 5004, CaseState.CANCELLED)
     blocked_id = await add_case(integration_session_factory, 5005, CaseState.HUMAN_BLOCKED)
+    approval_id = await add_case(
+        integration_session_factory, 5006, CaseState.AWAITING_REMEDIATION_APPROVAL
+    )
+    reject_id = await add_case(
+        integration_session_factory, 5007, CaseState.AWAITING_REMEDIATION_APPROVAL
+    )
     headers = {"Authorization": "Bearer operator"}
     transport = httpx.ASGITransport(app=test_app)
     async with httpx.AsyncClient(
@@ -67,6 +73,23 @@ async def test_operator_retry_cancel_and_case_auth(
         hx_cancel = await client.post(f"/operator/cases/{blocked_id}/cancel", headers=hx_headers)
         assert hx_cancel.status_code == 200
         assert "CANCELLED" in hx_cancel.text
+
+        approve = await client.post(
+            f"/operator/cases/{approval_id}/approve-remediation", headers=headers
+        )
+        assert approve.status_code == 200
+        assert approve.json()["state"] == CaseState.REMEDIATION_CREATE_INTENT
+
+        reject = await client.post(
+            f"/operator/cases/{reject_id}/reject-remediation", headers=headers
+        )
+        assert reject.status_code == 200
+        assert reject.json()["state"] == CaseState.CANCELLED
+
+        invalid_approve = await client.post(
+            f"/operator/cases/{passed_id}/approve-remediation", headers=headers
+        )
+        assert invalid_approve.status_code == 409
 
         missing_json_auth = await client.get("/api/cases/apache/superset/5001")
         assert missing_json_auth.status_code == 401

@@ -1,11 +1,12 @@
 import asyncio
 import logging
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ..approvals import approve_remediation
 from ..config import Settings
 from ..devin.client import DevinClient, DevinSession
 from ..lifecycle import CaseState, transition
@@ -78,9 +79,7 @@ async def _run_devin(
     return current
 
 
-async def process_case(
-    session: AsyncSession, case: Case, devin: DevinClient, settings: Settings
-) -> None:
+async def _source_issue(session: AsyncSession, case: Case) -> dict[str, Any]:
     source_event = await session.scalar(
         select(WebhookEvent)
         .where(WebhookEvent.case_id == case.id)
@@ -89,7 +88,13 @@ async def process_case(
     )
     if source_event is None:
         raise ValueError(f"case {case.id} has no source webhook event")
-    issue: dict[str, Any] = source_event.payload.get("issue", {})
+    return cast(dict[str, Any], source_event.payload.get("issue", {}))
+
+
+async def _process_eligibility_and_triage(
+    session: AsyncSession, case: Case, devin: DevinClient, settings: Settings
+) -> None:
+    issue = await _source_issue(session, case)
     result = evaluate(
         IssueSnapshot(
             str(issue.get("title", "")),
@@ -110,7 +115,7 @@ async def process_case(
         "worker",
     )
     await session.commit()
-    if result.recommendation != Recommendation.GOOD_CANDIDATE:
+    if result.recommendation != Recommendation.ELIGIBLE_FOR_DEVIN_TRIAGE:
         await transition(
             session,
             case,
@@ -128,26 +133,45 @@ async def process_case(
         )
         await session.commit()
         return
-    await transition(
-        session, case, CaseState.AWAITING_TRIAGE_APPROVAL, "triage approval requested", "worker"
-    )
-    await session.commit()
-    if not settings.simulation_auto_approve:
-        return
-    await transition(
-        session,
-        case,
-        CaseState.TRIAGE_CREATE_INTENT,
-        "auto-approved: SIMULATION_AUTO_APPROVE=true",
-        "worker",
-    )
+
+    await transition(session, case, CaseState.TRIAGE_CREATE_INTENT, "triage requested", "worker")
     await session.commit()
     await transition(session, case, CaseState.TRIAGING, "triage session created", "worker")
     triage = await _run_devin(session, case, devin, AttemptKind.TRIAGE, settings)
     if triage.status != "finished":
         return
     await transition(session, case, CaseState.TRIAGED, "triage finished", "worker")
+    triage_output = triage.output or {}
+    feasible = bool(triage_output.get("remediation_feasible"))
+    summary = str(triage_output.get("summary", ""))
+    if not feasible:
+        reason = f"triage: remediation not feasible — {summary}"
+        await transition(session, case, CaseState.POLICY_REJECTED, reason, "worker")
+        session.add(
+            NotificationOutbox(
+                case_id=case.id,
+                channel=OutboxChannel.GITHUB,
+                kind="triage_not_feasible",
+                payload={"issue_number": case.issue_number, "summary": summary},
+            )
+        )
+        await session.commit()
+        return
+
     await session.commit()
+    session.add(
+        NotificationOutbox(
+            case_id=case.id,
+            channel=OutboxChannel.SLACK,
+            kind="remediation_approval_requested",
+            payload={
+                "issue_number": case.issue_number,
+                "issue_url": case.issue_url,
+                "devin_session_url": case.devin_session_url,
+                "summary": summary,
+            },
+        )
+    )
     await transition(
         session,
         case,
@@ -156,14 +180,14 @@ async def process_case(
         "worker",
     )
     await session.commit()
-    await transition(
-        session,
-        case,
-        CaseState.REMEDIATION_CREATE_INTENT,
-        "auto-approved: SIMULATION_AUTO_APPROVE=true",
-        "worker",
-    )
-    await session.commit()
+    if settings.simulation_auto_approve_remediation:
+        await approve_remediation(session, case, "simulation")
+        await session.commit()
+
+
+async def _process_remediation(
+    session: AsyncSession, case: Case, devin: DevinClient, settings: Settings
+) -> None:
     await transition(session, case, CaseState.REMEDIATING, "remediation session created", "worker")
     remediation = await _run_devin(session, case, devin, AttemptKind.REMEDIATION, settings)
     if remediation.status != "finished":
@@ -177,26 +201,35 @@ async def process_case(
         case.failure_reason = "missing pr_url in structured output"
         await transition(session, case, CaseState.FAILED, case.failure_reason, "worker")
         await session.commit()
-    else:
-        case.pr_url = pr_url
-        case.pr_number = int(pr_url.rsplit("/", 1)[-1])
-        await transition(
-            session, case, CaseState.PR_VALIDATED, "structured PR output validated", "worker"
+        return
+    case.pr_url = pr_url
+    case.pr_number = int(pr_url.rsplit("/", 1)[-1])
+    await transition(
+        session, case, CaseState.PR_VALIDATED, "structured PR output validated", "worker"
+    )
+    await session.commit()
+    await transition(session, case, CaseState.CI_PENDING, "waiting for CI", "worker")
+    await session.commit()
+    case.ci_status = "success"
+    await transition(session, case, CaseState.CI_PASSED, "fake CI passed", "worker")
+    session.add(
+        NotificationOutbox(
+            case_id=case.id,
+            channel=OutboxChannel.GITHUB,
+            kind="case_completed",
+            payload={"pr_url": pr_url},
         )
-        await session.commit()
-        await transition(session, case, CaseState.CI_PENDING, "waiting for CI", "worker")
-        await session.commit()
-        case.ci_status = "success"
-        await transition(session, case, CaseState.CI_PASSED, "fake CI passed", "worker")
-        session.add(
-            NotificationOutbox(
-                case_id=case.id,
-                channel=OutboxChannel.SLACK,
-                kind="case_completed",
-                payload={"pr_url": pr_url},
-            )
-        )
-        await session.commit()
+    )
+    await session.commit()
+
+
+async def process_case(
+    session: AsyncSession, case: Case, devin: DevinClient, settings: Settings
+) -> None:
+    if CaseState(case.state) == CaseState.RECEIVED:
+        await _process_eligibility_and_triage(session, case, devin, settings)
+    if CaseState(case.state) == CaseState.REMEDIATION_CREATE_INTENT:
+        await _process_remediation(session, case, devin, settings)
 
 
 async def process_event(

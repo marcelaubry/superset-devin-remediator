@@ -12,10 +12,12 @@ never dispatched in Phase 1.
   deliveries by repository, event/action, and required label.
 - PostgreSQL stores webhook payloads, current cases, attempts, transitions, and
   notification intents.
-- A worker claims deliveries with `FOR UPDATE SKIP LOCKED` and advances eligible
-  issues through deterministic triage and remediation simulation.
+- A zero-ACU deterministic eligibility filter rejects non-eligible issues or
+  sends eligible issues to fake Devin triage.
+- A worker claims deliveries with `FOR UPDATE SKIP LOCKED` and advances
+  triage-feasible issues through remediation after Slack approval.
 - The dashboard refreshes operational sections with HTMX and supports operator
-  retry/cancel actions.
+  retry/cancel and remediation approve/reject actions.
 - The fake Devin client deterministically produces success, failure, or blocked
   outcomes from the issue number.
 
@@ -33,9 +35,10 @@ Open <http://localhost:8000> and sign in with `OPERATOR_TOKEN`.
 | Scenario | Fixture | Issue | Expected outcome | Why |
 | --- | --- | ---: | --- | --- |
 | `good` | `issue_good_candidate.json` | 4213 | `CI_PASSED` | Complete reproduction, objective checks, acceptance criteria, and existing-pattern evidence |
-| `needs-scoping` | `issue_needs_scoping.json` | 4321 | `POLICY_REJECTED` | Missing reproducibility and acceptance details |
-| `deterministic` | `issue_deterministic.json` | 4422 | `POLICY_REJECTED` | Dependency/version-bump work is deterministic automation |
-| `human-led` | `issue_human_led.json` | 4501 | `POLICY_REJECTED` | Architecture and breaking-change reasoning requires human ownership |
+| `needs-scoping` | `issue_needs_scoping.json` | 4321 | `POLICY_REJECTED` without Devin session | Missing reproducibility and acceptance details |
+| `deterministic` | `issue_deterministic.json` | 4422 | `POLICY_REJECTED` without Devin session | Dependency/version-bump work is deterministic automation |
+| `human-led` | `issue_human_led.json` | 4501 | `POLICY_REJECTED` without Devin session | Architecture and breaking-change reasoning requires human ownership |
+| `triage-infeasible` | `issue_triage_infeasible.json` | 4533 | `POLICY_REJECTED` after triage | Fake triage reports that remediation requires a product decision |
 | `failure` | `issue_fake_failure.json` | 4515 | `FAILED` | Fake Devin fails for issue numbers divisible by five |
 | `blocked` | `issue_human_blocked.json` | 4529 | `HUMAN_BLOCKED` | Fake Devin requests human intervention for issue numbers divisible by seven |
 | `wrong-repo` | `issue_wrong_repo.json` | 4601 | filtered out | Repository does not match `GITHUB_REPOSITORY` |
@@ -63,7 +66,7 @@ uv run python scripts/simulate.py --scenario good --bad-signature
 | `WORKER_POLL_INTERVAL_SECONDS` | `1.0` | Worker idle poll interval |
 | `WORKER_CONCURRENCY` | `2` | Concurrent worker loops |
 | `DEVIN_CLIENT` | `fake` | Phase 1 only accepts `fake` |
-| `SIMULATION_AUTO_APPROVE` | `true` | Auto-advance approval stages in simulation |
+| `SIMULATION_AUTO_APPROVE_REMEDIATION` | `true` | Auto-approve remediation after a feasible triage verdict |
 | `LOG_LEVEL` | `INFO` | Application log level |
 
 ## Development and test database
@@ -80,6 +83,13 @@ The Postgres init script creates both `remediator` and `remediator_test`.
 Integration tests use `TEST_DATABASE_URL`, defaulting to
 `postgresql+asyncpg://remediator:remediator@localhost:5432/remediator_test`.
 They require the local test database and fail clearly if it is unavailable.
+
+Set `SIMULATION_AUTO_APPROVE_REMEDIATION=false` to park eligible cases at
+`AWAITING_REMEDIATION_APPROVAL`. With that setting, `simulate.py --wait` stops
+at the approval state and prints the operator approve curl command. Phase 1
+writes the Slack approval request to the outbox; the Phase 2 Slack outbox worker
+will dispatch it and Slack interactivity will call the same approval service
+used by the operator endpoint.
 
 ## Project layout
 

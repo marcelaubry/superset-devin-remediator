@@ -7,6 +7,7 @@ from fastapi.responses import RedirectResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ..approvals import approve_remediation, reject_remediation
 from ..config import get_settings
 from ..db import get_session
 from ..lifecycle import CaseState, InvalidTransition, transition
@@ -95,3 +96,55 @@ async def cancel_case(
     session: AsyncSession = Depends(get_session),
 ) -> Any:
     return await _case_action(case_id, CaseState.CANCELLED, request, session)
+
+
+async def _remediation_approval_action(
+    case_id: UUID,
+    request: Request,
+    session: AsyncSession,
+    approve: bool,
+) -> Any:
+    case = await session.get(Case, case_id)
+    if not case:
+        raise HTTPException(status_code=404, detail="case not found")
+    try:
+        if approve:
+            await approve_remediation(session, case, "operator")
+        else:
+            await reject_remediation(session, case, "operator")
+        await session.commit()
+    except InvalidTransition as exc:
+        await session.rollback()
+        if request.headers.get("HX-Request") == "true":
+            return templates.TemplateResponse(
+                request,
+                "partials/case_status.html",
+                {"request": request, "case": case, "error": str(exc)},
+                status_code=200,
+            )
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if request.headers.get("HX-Request") == "true":
+        return templates.TemplateResponse(
+            request, "partials/case_status.html", {"request": request, "case": case, "error": None}
+        )
+    return {"id": str(case.id), "state": case.state}
+
+
+@router.post("/operator/cases/{case_id}/approve-remediation")
+async def approve_case(
+    case_id: UUID,
+    request: Request,
+    _: str = Depends(require_operator),
+    session: AsyncSession = Depends(get_session),
+) -> Any:
+    return await _remediation_approval_action(case_id, request, session, True)
+
+
+@router.post("/operator/cases/{case_id}/reject-remediation")
+async def reject_case(
+    case_id: UUID,
+    request: Request,
+    _: str = Depends(require_operator),
+    session: AsyncSession = Depends(get_session),
+) -> Any:
+    return await _remediation_approval_action(case_id, request, session, False)

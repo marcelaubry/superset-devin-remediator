@@ -102,5 +102,5 @@ def evaluate(issue: IssueSnapshot) -> RubricResult:
     ):
         recommendation = Recommendation.NEEDS_SCOPING
     else:
-        recommendation = Recommendation.GOOD_CANDIDATE
+        recommendation = Recommendation.ELIGIBLE_FOR_DEVIN_TRIAGE
     return RubricResult(recommendation, checks)

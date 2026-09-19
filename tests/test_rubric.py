@@ -10,7 +10,7 @@ def test_good_candidate() -> None:
         "Actual behavior fails. Acceptance criteria: fixed. Similar existing code."
     )
     result = evaluate(IssueSnapshot("Fix bug", body, ["bug"]))
-    assert result.recommendation == Recommendation.GOOD_CANDIDATE
+    assert result.recommendation == Recommendation.ELIGIBLE_FOR_DEVIN_TRIAGE
     assert all(check.reason for check in result.checks)
     assert not any("confidence" in check.name for check in result.checks)
 

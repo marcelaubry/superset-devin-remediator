@@ -146,3 +146,46 @@ async def test_retry_case_is_claimed_and_processed(
     finally:
         await worker.devin.aclose()
         await worker.engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_remediation_intent_case_is_claimed(
+    integration_session_factory: async_sessionmaker[AsyncSession],
+    test_database_url: str,
+) -> None:
+    async with integration_session_factory() as session:
+        event = WebhookEvent(
+            delivery_id="remediation-intent-source",
+            event_type="issues",
+            action="opened",
+            repository="apache/superset",
+            payload=payload(4213),
+            status=EventStatus.PROCESSED,
+        )
+        case = Case(
+            issue_number=4213,
+            repository="apache/superset",
+            issue_title="Fix issue",
+            issue_url="https://github.com/apache/superset/issues/4213",
+            state=CaseState.REMEDIATION_CREATE_INTENT,
+            state_entered_at=datetime.now(UTC) - timedelta(seconds=5),
+        )
+        session.add_all([event, case])
+        await session.flush()
+        event.case_id = case.id
+        await session.commit()
+
+    worker = Worker(
+        Settings(
+            database_url=test_database_url,
+            worker_poll_interval_seconds=0.01,
+            worker_concurrency=1,
+        )
+    )
+    try:
+        claimed = await worker._claim_case()
+        assert claimed is not None
+        assert claimed.state == CaseState.REMEDIATION_CREATE_INTENT
+    finally:
+        await worker.devin.aclose()
+        await worker.engine.dispose()

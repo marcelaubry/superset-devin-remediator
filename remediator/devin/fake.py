@@ -37,11 +37,19 @@ class FakeDevinClient:
                 session_id, f"https://app.devin.ai/sessions/{session_id}", "working"
             )
         match = re.search(r"remediation", session_id)
-        output: dict[str, object] | None = (
-            {"pr_url": f"https://github.com/{repository}/pull/{9000 + issue_number}"}
-            if match
-            else None
-        )
+        output: dict[str, object]
+        if match:
+            output = {"pr_url": f"https://github.com/{repository}/pull/{9000 + issue_number}"}
+        else:
+            feasible = issue_number % 3 != 0
+            output = {
+                "remediation_feasible": feasible,
+                "summary": (
+                    "simulated triage: remediation feasible"
+                    if feasible
+                    else "simulated triage: requires product decision"
+                ),
+            }
         return DevinSession(
             session_id, f"https://app.devin.ai/sessions/{session_id}", "finished", output=output
         )

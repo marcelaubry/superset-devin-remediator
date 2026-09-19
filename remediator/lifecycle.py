@@ -11,7 +11,6 @@ if TYPE_CHECKING:
 class CaseState(StrEnum):
     RECEIVED = "RECEIVED"
     ELIGIBILITY_EVALUATED = "ELIGIBILITY_EVALUATED"
-    AWAITING_TRIAGE_APPROVAL = "AWAITING_TRIAGE_APPROVAL"
     TRIAGE_CREATE_INTENT = "TRIAGE_CREATE_INTENT"
     TRIAGING = "TRIAGING"
     TRIAGED = "TRIAGED"
@@ -52,16 +51,8 @@ TRANSITIONS: dict[CaseState, frozenset[CaseState]] = {
     ),
     CaseState.ELIGIBILITY_EVALUATED: frozenset(
         {
-            CaseState.AWAITING_TRIAGE_APPROVAL,
-            CaseState.POLICY_REJECTED,
-            CaseState.FAILED,
-            CaseState.CANCELLED,
-            CaseState.TERMINATION_PENDING,
-        }
-    ),
-    CaseState.AWAITING_TRIAGE_APPROVAL: frozenset(
-        {
             CaseState.TRIAGE_CREATE_INTENT,
+            CaseState.POLICY_REJECTED,
             CaseState.FAILED,
             CaseState.CANCELLED,
             CaseState.TERMINATION_PENDING,
@@ -89,6 +80,7 @@ TRANSITIONS: dict[CaseState, frozenset[CaseState]] = {
     CaseState.TRIAGED: frozenset(
         {
             CaseState.AWAITING_REMEDIATION_APPROVAL,
+            CaseState.POLICY_REJECTED,
             CaseState.FAILED,
             CaseState.CANCELLED,
             CaseState.TERMINATION_PENDING,

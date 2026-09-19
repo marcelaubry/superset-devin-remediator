@@ -5,7 +5,6 @@ def test_happy_path() -> None:
     state = CaseState.RECEIVED
     for next_state in [
         CaseState.ELIGIBILITY_EVALUATED,
-        CaseState.AWAITING_TRIAGE_APPROVAL,
         CaseState.TRIAGE_CREATE_INTENT,
         CaseState.TRIAGING,
         CaseState.TRIAGED,
@@ -27,5 +26,7 @@ def test_illegal_transition() -> None:
 
 def test_terminal_states() -> None:
     assert set(TRANSITIONS) == set(CaseState)
+    assert not hasattr(CaseState, "AWAITING_TRIAGE_APPROVAL")
+    assert CaseState.TRIAGE_CREATE_INTENT in TRANSITIONS[CaseState.ELIGIBILITY_EVALUATED]
     for state in TERMINAL_STATES:
         assert set(TRANSITIONS[state]) <= {CaseState.RECEIVED}
