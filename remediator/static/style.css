@@ -290,6 +290,7 @@ a.ident { color: var(--link); background: none; padding: 0; }
   font-family: var(--mono); font-size: var(--fs-meta); color: var(--copy); background: var(--bg-deep); border: 1px solid var(--rule);
   border-radius: 3px; padding: 0.05rem 0.45rem; line-height: 1.6;
 }
+.tag-wait { max-width: none; font-family: var(--font); }
 .ident-list { display: grid; gap: 0.35rem; margin: 0.5rem 0 0; }
 .ident-list dt { font-size: var(--fs-meta); color: var(--muted); }
 .ident-list dd { margin: 0; }

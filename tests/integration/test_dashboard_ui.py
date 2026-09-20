@@ -7,6 +7,7 @@ pixels, so the suite is platform independent.
 """
 
 import re
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -190,6 +191,43 @@ async def test_active_and_attention_partials(rem: RemediationHarness) -> None:
     assert re.search(r'data-kpi="sessions"[^>]*data-value="1"', kpis)
     topbar = (await rem.base.client.get("/partials/topbar_status", headers=rem.base.operator)).text
     assert 'id="active-sessions"' in topbar
+
+
+@pytest.mark.asyncio
+async def test_phase5_capacity_wait_and_acu_report_render_only_when_present(
+    rem: RemediationHarness,
+) -> None:
+    case = await _run_fixture(rem, RemediationFixture.SUCCESS)
+    active_url, detail_url = "/partials/active", f"/partials/case/{case.id}"
+    async with rem.base.factory() as session:
+        row = await session.get(Case, case.id)
+        assert row is not None
+        row.state = CaseState.REMEDIATING
+        attempt = (await rem.attempts(case.id))[0]
+        live = await session.get(Attempt, attempt.id)
+        assert live is not None
+        live.status = AttemptStatus.RUNNING
+        await session.commit()
+    active = (await rem.base.client.get(active_url, headers=rem.base.operator)).text
+    detail = (await rem.base.client.get(detail_url, headers=rem.base.operator)).text
+    assert "waiting for" not in active and "waiting for" not in detail
+    assert "ACU billed" not in active and "billing unavailable" not in detail
+
+    async with rem.base.factory() as session:
+        row = await session.get(Case, case.id)
+        assert row is not None
+        row.waiting_for = "triage"
+        row.waiting_since = datetime.now(UTC)
+        live = await session.get(Attempt, attempt.id)
+        assert live is not None
+        live.acu_report_status = "simulated"
+        live.acu_reported = 1.5
+        await session.commit()
+    active = (await rem.base.client.get(active_url, headers=rem.base.operator)).text
+    detail = (await rem.base.client.get(detail_url, headers=rem.base.operator)).text
+    assert "waiting for triage" in active and "waiting for triage" in detail
+    assert "1.5 ACU billed" in active and "1.5 ACU billed" in detail
+    assert "simulated" in detail
 
 
 @pytest.mark.asyncio

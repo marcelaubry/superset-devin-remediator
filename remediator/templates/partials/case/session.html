@@ -8,6 +8,7 @@
       <span class="eyebrow">Budget</span>
       <span class="metric-value">{{ ui.acu(attempt) }}</span>
       {% if attempt.max_acu_limit and attempt.devin_acus_consumed is not none %}{% set pct = (100 * attempt.devin_acus_consumed / attempt.max_acu_limit)|round|int %}<span class="metric-sub">{{ pct }}% of limit</span>{% endif %}
+      {% set report = ui.acu_report(attempt) %}{% if report|trim %}<span class="metric-sub">{{ report }}</span>{% endif %}
     </div>
     <div class="metric">
       <span class="eyebrow">Elapsed</span>

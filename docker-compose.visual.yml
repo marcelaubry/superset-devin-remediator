@@ -17,6 +17,7 @@ services:
     env_file: .env
     environment:
       BASE_URL: http://api:8000
+      WORKER_METRICS_URL: http://worker:8001
       VISUAL_OUT_DIR: /app/artifacts/visual
       VISUAL_BASELINE_DIR: ${VISUAL_BASELINE_DIR:-}
     volumes:

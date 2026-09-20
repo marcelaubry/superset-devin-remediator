@@ -42,7 +42,15 @@
 {%- endmacro %}
 
 {% macro acu(attempt) -%}
-{% if attempt.devin_acus_consumed is not none or attempt.max_acu_limit %}<span class="nowrap" title="ACUs consumed / limit">{{ attempt.devin_acus_consumed if attempt.devin_acus_consumed is not none else "?" }} / {{ attempt.max_acu_limit or "?" }} ACU</span>{% else %}<span class="muted">-</span>{% endif %}
+{% if attempt.devin_acus_consumed is not none or attempt.max_acu_limit %}<span class="nowrap" title="ACUs consumed / limit (session object)">{{ attempt.devin_acus_consumed if attempt.devin_acus_consumed is not none else "?" }} / {{ attempt.max_acu_limit or "?" }} ACU</span>{% else %}<span class="muted">-</span>{% endif %}
+{%- endmacro %}
+
+{% macro acu_report(attempt) -%}
+{% if attempt.acu_reported is not none and attempt.acu_report_status in ("available", "simulated") %}<span class="nowrap" title="Official consumption report{% if attempt.acu_report_detail %}: {{ attempt.acu_report_detail }}{% endif %}">{{ "%g"|format(attempt.acu_reported) }} ACU billed{% if attempt.acu_report_status == "simulated" %} <span class="tag tone-neutral">simulated</span>{% endif %}</span>{% elif attempt.acu_report_status == "unavailable" %}<span class="muted nowrap" title="{{ attempt.acu_report_detail or 'Consumption API did not return a figure' }}">billing unavailable</span>{% endif %}
+{%- endmacro %}
+
+{% macro waiting(case) -%}
+{% if case.waiting_for %}<span class="tag tag-wait tone-warn" title="Parked on a saturated concurrency limit; no Devin session is created while waiting">waiting for {{ case.waiting_for }}{% if case.waiting_since %} · {{ humanize(case.waiting_since) }}{% endif %}</span>{% endif %}
 {%- endmacro %}
 
 {% macro empty(text="None") -%}

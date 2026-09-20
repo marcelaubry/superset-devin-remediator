@@ -14,6 +14,7 @@
   <div class="case-title">
     <h1 id="case-title"><span class="issue-no">#{{ case.issue_number }}</span> {{ case.issue_title }}</h1>
     {{ b.badge(state_p, title="Case state") }}
+    {{ ui.waiting(case) }}
   </div>
   <ol class="phase-rail{% if not current_stage %} has-terminal{% endif %}" aria-label="Workflow phase">
     {% for key in stage_keys %}
