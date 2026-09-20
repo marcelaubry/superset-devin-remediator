@@ -29,7 +29,8 @@ STRICT = os.environ.get("VISUAL_STRICT") == "1"
 OPERATOR_TOKEN = os.environ.get("OPERATOR_TOKEN", "change-me")
 REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "apache/superset")
 
-VIEWPORTS = {"desktop": (1440, 900), "mobile": (390, 844)}
+# "narrow" approximates a 390px phone with a classic 15px desktop scrollbar taking layout space.
+VIEWPORTS = {"desktop": (1440, 900), "mobile": (390, 844), "narrow": (360, 780)}
 # Fixture issue numbers exercised by `simulate.py --scenario all`; each lands in a different
 # resting state so the case page is captured across the evidence hierarchy.
 CASE_ISSUES = {
@@ -172,7 +173,7 @@ def _capture(browser: Browser, report: Report, name: str, path: str, *, logged_i
         report.screenshots[key] = str(target)
         a11y = page.evaluate(A11Y_SCRIPT)
         report.pages[key] = a11y
-        _check(report, key, a11y, mobile=viewport == "mobile")
+        _check(report, key, a11y, mobile=viewport != "desktop")
         if BASELINE_DIR:
             baseline = Path(BASELINE_DIR) / f"{key}.png"
             if baseline.exists():

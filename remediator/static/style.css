@@ -146,9 +146,11 @@ main > *, .grid-2 > *, .grid-3 > *, .kpis > *, .panel, details { min-width: 0; }
 .badge {
   display: inline-flex; align-items: center; gap: 0.3rem; padding: 0.1rem 0.5rem; border-radius: 999px;
   border: 1px solid; font-size: 0.8rem; font-weight: 600; white-space: nowrap; line-height: 1.5; vertical-align: middle;
-  font-family: var(--mono);
+  font-family: var(--mono); max-width: 100%; box-sizing: border-box;
 }
 .badge-glyph { font-family: var(--font); }
+/* Long enum names (AWAITING_REMEDIATION_APPROVAL) must break rather than overflow narrow panels. */
+.badge-text { min-width: 0; white-space: normal; overflow-wrap: anywhere; }
 .tone-ok { background: var(--ok-bg); color: var(--ok-fg); border-color: var(--ok-border); }
 .tone-info { background: var(--info-bg); color: var(--info-fg); border-color: var(--info-border); }
 .tone-warn { background: var(--warn-bg); color: var(--warn-fg); border-color: var(--warn-border); }
