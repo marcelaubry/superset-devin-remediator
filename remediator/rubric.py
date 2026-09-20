@@ -24,15 +24,89 @@ class RubricResult:
     checks: list[RubricCheck]
 
 
+AREAS = ("frontend", "backend", "infra", "database", "api")
+
+_CODE = re.compile(r"```.*?```|`[^`\n]*`", re.S)
+_HEADING = re.compile(
+    r"(?:^|\n)[ \t]*(?:#{1,6}[ \t]+([^\n]+?)|\*\*([^\n*]{1,60})\*\*:?|([A-Za-z][A-Za-z /-]{0,40}):)"
+    r"[ \t]*(?=\n|$)"
+)
+_SCOPE_HEADINGS = re.compile(r"^(?:in[- ])?scope|^affected (?:areas?|components?)$", re.I)
+_EXCLUSION_HEADINGS = re.compile(
+    r"^(?:non[- ]goals?|out[- ]of[- ]scope|not in scope|unchanged|no changes? to)\b", re.I
+)
+_NEGATED_SENTENCE = re.compile(
+    r"\b(?:no|not|without|unchanged|untouched|stays? as is|n't|does not|must not)\b", re.I
+)
+_UNRESOLVED_DECISION = re.compile(
+    r"\b(?:needs? (?:a )?decision|decision (?:is )?(?:needed|required|pending)|"
+    r"(?:need|have) to decide|decide (?:whether|which|between)|should we\b|"
+    r"which (?:approach|option|head|revision) (?:should|do we|to)|open question|"
+    r"design (?:choice|question|discussion)|proposal|rfc|trade-?offs?)",
+    re.I,
+)
+
+
 def _has(text: str, *terms: str) -> bool:
     lowered = text.lower()
     return any(term in lowered for term in terms)
 
 
+def _sections(text: str) -> list[tuple[str, str]]:
+    """Split markdown-ish text into (heading, body) pairs; the preamble has heading ''."""
+    matches = list(_HEADING.finditer(text))
+    sections: list[tuple[str, str]] = []
+    cursor = 0
+    heading = ""
+    for match in matches:
+        sections.append((heading, text[cursor : match.start()]))
+        heading = next(group for group in match.groups() if group is not None).strip()
+        cursor = match.end()
+    sections.append((heading, text[cursor:]))
+    return sections
+
+
+def change_areas(text: str) -> set[str]:
+    """Areas the issue asks to CHANGE, not every area it happens to mention.
+
+    Code spans/paths are ignored (a file under `superset-frontend/` says nothing about
+    scope), an explicit scope section wins when present, exclusion sections (non-goals,
+    out of scope) never count, and negated sentences ("no changes to the backend") never
+    count either.
+    """
+    prose = _CODE.sub(" ", text)
+    sections = _sections(prose)
+    scoped = [body for heading, body in sections if _SCOPE_HEADINGS.search(heading)]
+    if scoped:
+        candidate = "\n".join(scoped)
+    else:
+        candidate = "\n".join(
+            body for heading, body in sections if not _EXCLUSION_HEADINGS.search(heading)
+        )
+    sentences = [
+        sentence
+        for sentence in re.split(r"(?<=[.;!?])\s+|\n+", candidate)
+        if not _NEGATED_SENTENCE.search(sentence)
+    ]
+    kept = " ".join(sentences).lower()
+    return {area for area in AREAS if area in kept}
+
+
+def has_unresolved_decision(text: str) -> bool:
+    """True when the issue itself still asks for a product/architecture decision."""
+    return bool(_UNRESOLVED_DECISION.search(_CODE.sub(" ", text)))
+
+
 def evaluate(issue: IssueSnapshot) -> RubricResult:
     text = f"{issue.title}\n{issue.body}"
     labels = {label.lower() for label in issue.labels}
-    areas = sum(_has(text, area) for area in ("frontend", "backend", "infra", "database", "api"))
+    areas = len(change_areas(text))
+    undecided = has_unresolved_decision(text)
+    isolated = (
+        not labels.intersection({"epic", "discussion", "design", "rfc"})
+        and areas <= 1
+        and not undecided
+    )
     checks = [
         RubricCheck(
             "scope",
@@ -70,10 +144,16 @@ def evaluate(issue: IssueSnapshot) -> RubricResult:
         ),
         RubricCheck(
             "isolation",
-            not labels.intersection({"epic", "discussion", "design", "rfc"}) and areas <= 1,
+            isolated,
             "Issue appears isolated."
-            if not labels.intersection({"epic", "discussion", "design", "rfc"}) and areas <= 1
-            else "Issue is a discussion/design item or spans multiple areas.",
+            if isolated
+            else (
+                "Issue is a discussion/design item."
+                if labels.intersection({"epic", "discussion", "design", "rfc"})
+                else "Issue still asks for a product/architecture decision."
+                if undecided
+                else "Issue asks to change more than one area."
+            ),
         ),
         RubricCheck(
             "existing_patterns",

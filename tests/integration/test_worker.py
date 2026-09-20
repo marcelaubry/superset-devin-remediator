@@ -1,4 +1,6 @@
+import json
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 from sqlalchemy import func, select, text, update
@@ -18,6 +20,7 @@ from remediator.models import (
     EventStatus,
     NotificationOutbox,
     OutboxChannel,
+    Recommendation,
     StateTransition,
     WebhookEvent,
 )
@@ -257,6 +260,52 @@ async def test_processor_triage_infeasible(integration_session: AsyncSession) ->
             .order_by(StateTransition.created_at.desc())
         )
     )
+
+
+@pytest.mark.asyncio
+async def test_focused_frontend_bug_reaches_bounded_devin_triage(
+    integration_session: AsyncSession,
+) -> None:
+    """The digit-only temporal formatting issue mentions the backend only as context and in
+    its non-goals; the policy must admit it to triage instead of declaring HUMAN_LED."""
+    fixture = json.loads(
+        (Path(__file__).parents[2] / "fixtures/github/issue_digit_only_temporal.json").read_text()
+    )
+    number = fixture["issue"]["number"]
+    event = WebhookEvent(
+        delivery_id="integration-digit-only-temporal",
+        event_type="issues",
+        action="opened",
+        repository="apache/superset",
+        payload=fixture,
+        status=EventStatus.PENDING,
+    )
+    integration_session.add(event)
+    await integration_session.commit()
+    await process_event(integration_session, event, FakeDevinClient(), Settings())
+    case = await integration_session.scalar(select(Case).where(Case.issue_number == number))
+    assert case and case.recommendation == Recommendation.ELIGIBLE_FOR_DEVIN_TRIAGE
+    assert all(check["passed"] for check in case.rubric or [])
+    states = list(
+        (
+            await integration_session.scalars(
+                select(StateTransition.to_state)
+                .where(StateTransition.case_id == case.id)
+                .order_by(StateTransition.seq)
+            )
+        ).all()
+    )
+    assert states[:3] == [
+        CaseState.ELIGIBILITY_EVALUATED,
+        CaseState.TRIAGE_CREATE_INTENT,
+        CaseState.TRIAGING,
+    ]
+    attempts = list(
+        (await integration_session.scalars(select(Attempt).where(Attempt.case_id == case.id))).all()
+    )
+    assert [attempt.kind for attempt in attempts] == [AttemptKind.TRIAGE]
+    # Only the (fake) Devin triage session decides remediation_candidate; the policy never does.
+    assert case.state == CaseState.AWAITING_REMEDIATION_APPROVAL
 
 
 @pytest.mark.asyncio
