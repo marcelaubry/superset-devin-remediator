@@ -361,6 +361,24 @@ async def test_case_actions_have_consequence_specific_confirmations(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fixture",
+    [RemediationFixture.CI_FAILED, RemediationFixture.PR_WRONG_AUTHOR, RemediationFixture.SUCCESS],
+)
+async def test_terminal_cases_offer_no_cancel_action(
+    rem: RemediationHarness, fixture: RemediationFixture
+) -> None:
+    case = await _run_fixture(rem, fixture)
+    assert CaseState(case.state) in TERMINAL_STATES
+    page = (await rem.base.client.get(f"/cases/{case.id}", headers=rem.base.operator)).text
+    assert f"/operator/cases/{case.id}/cancel" not in page
+    response = await rem.base.client.post(
+        f"/operator/cases/{case.id}/cancel", headers=rem.base.operator
+    )
+    assert response.status_code == 409
+
+
+@pytest.mark.asyncio
 async def test_invalid_transition_message_is_preserved(rem: RemediationHarness) -> None:
     done = await _run_fixture(rem, RemediationFixture.SUCCESS)
     response = await rem.base.client.post(

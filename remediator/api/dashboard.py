@@ -400,6 +400,7 @@ TEMPLATE_HELPERS: dict[str, object] = {
     "FUNNEL_STAGES": FUNNEL_STAGES,
     "FUNNEL_LABELS": FUNNEL_LABELS,
     "STATE_PRESENTATION": STATE_PRESENTATION,
+    "TERMINAL_STATES": TERMINAL_STATES,
 }
 # Globals so imported macros (which do not receive the render context) can use them too.
 templates.env.globals.update(TEMPLATE_HELPERS)

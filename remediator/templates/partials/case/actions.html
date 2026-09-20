@@ -1,4 +1,4 @@
-{% set terminal = case.state in ["CI_PASSED","TIMED_OUT","POLICY_REJECTED","FAILED","CANCELLED","REMEDIATION_REJECTED","REMEDIATION_CANCELLED"] %}
+{% set terminal = case.state in TERMINAL_STATES %}
 {% set legacy_retry = case.state in ["FAILED","TIMED_OUT","HUMAN_BLOCKED"] %}
 <section id="case-status" class="subsection case-actions" aria-labelledby="actions-title">
   <h2 id="actions-title" class="eyebrow">Operator actions</h2>
