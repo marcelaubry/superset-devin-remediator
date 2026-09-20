@@ -1,1 +1,18 @@
-<!doctype html><html><head><title>Operator login</title><link rel="stylesheet" href="/static/style.css"></head><body><main><h1>Operator login</h1><form method="post" action="/login"><label>Token <input name="token" type="password" required></label><button>Sign in</button></form></main></body></html>
+{% extends "base.html" %}
+{% block title %}Operator login{% endblock %}
+{% block banner %}{% endblock %}
+{% block content %}
+<section class="panel login" aria-labelledby="login-title">
+  <h1 id="login-title">Operator login</h1>
+  <p class="muted small">Enter the operator token to open the console. Provider modes shown above apply to this deployment.</p>
+  {% if error %}<p class="alert" role="alert" id="login-error">{{ error }}</p>{% endif %}
+  <form method="post" action="/login">
+    <div class="field">
+      <label for="token">Operator token</label>
+      <input id="token" name="token" type="password" required autocomplete="current-password" autofocus{% if error %} aria-describedby="login-error" aria-invalid="true"{% endif %}>
+    </div>
+    <button type="submit" class="btn-primary">Sign in</button>
+  </form>
+</section>
+{% endblock %}
+{% block scripts %}{% endblock %}

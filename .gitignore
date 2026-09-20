@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Visual verification artifacts (docker-compose.visual.yml)
+artifacts/

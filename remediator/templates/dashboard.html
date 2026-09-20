@@ -1,1 +1,20 @@
-<!doctype html><html><head><title>Remediator dashboard</title><link rel="stylesheet" href="/static/style.css"><script src="/static/htmx.min.js"></script></head><body><main><h1>Superset Devin Remediator</h1><form method="post" action="/logout"><button type="submit">Logout</button></form><div hx-get="/partials/overview" hx-trigger="every 3s" hx-swap="innerHTML">{% include "partials/overview.html" %}</div><div hx-get="/partials/throughput" hx-trigger="every 3s" hx-swap="innerHTML">{% include "partials/throughput.html" %}</div><div hx-get="/partials/active" hx-trigger="every 3s" hx-swap="innerHTML">{% include "partials/active.html" %}</div><div hx-get="/partials/completed" hx-trigger="every 3s" hx-swap="innerHTML">{% include "partials/completed.html" %}</div><div hx-get="/partials/failures" hx-trigger="every 3s" hx-swap="innerHTML">{% include "partials/failures.html" %}</div><div hx-get="/partials/timeline" hx-trigger="every 3s" hx-swap="innerHTML">{% include "partials/timeline.html" %}</div><div hx-get="/partials/cases" hx-trigger="every 3s" hx-swap="innerHTML">{% include "partials/cases.html" %}</div></main></body></html>
+{% extends "base.html" %}
+{% set show_logout = true %}
+{% set poll_topbar = true %}
+{% block title %}Dashboard{% endblock %}
+{% block content %}
+<h1 class="sr-only">Operator dashboard</h1>
+<div id="poll-kpis" hx-get="/partials/kpis" hx-trigger="every 3s" hx-swap="innerHTML">{% include "partials/kpis.html" %}</div>
+<div class="grid-2">
+  <div id="poll-funnel" hx-get="/partials/funnel" hx-trigger="every 3s" hx-swap="innerHTML">{% include "partials/funnel.html" %}</div>
+  <div id="poll-throughput" hx-get="/partials/throughput" hx-trigger="every 3s" hx-swap="innerHTML">{% include "partials/throughput.html" %}</div>
+</div>
+<div id="poll-failures" hx-get="/partials/failures" hx-trigger="every 3s" hx-swap="innerHTML">{% include "partials/failures.html" %}</div>
+<div id="poll-active" hx-get="/partials/active" hx-trigger="every 3s" hx-swap="innerHTML">{% include "partials/active.html" %}</div>
+<div class="grid-2">
+  <div id="poll-timeline" hx-get="/partials/timeline" hx-trigger="every 3s" hx-swap="innerHTML">{% include "partials/timeline.html" %}</div>
+  <div id="poll-completed" hx-get="/partials/completed" hx-trigger="every 3s" hx-swap="innerHTML">{% include "partials/completed.html" %}</div>
+</div>
+<div id="poll-overview" hx-get="/partials/overview" hx-trigger="every 3s" hx-swap="innerHTML">{% include "partials/overview.html" %}</div>
+<div id="poll-cases" hx-get="/partials/cases" hx-trigger="every 3s" hx-swap="innerHTML" hx-include="#case-filters">{% include "partials/cases.html" %}</div>
+{% endblock %}

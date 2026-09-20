@@ -1,0 +1,20 @@
+{# Status badges: glyph + visible label + screen-reader tone word. Never colour alone. #}
+{% macro badge(p, title=None) -%}
+<span class="badge tone-{{ p.tone }}" data-tone="{{ p.tone }}" data-raw="{{ p.raw }}"{% if title %} title="{{ title }}"{% endif %}><span class="badge-glyph" aria-hidden="true">{{ p.glyph }}</span><span class="badge-text">{{ p.label }}</span><span class="sr-only"> ({{ p.word }})</span></span>
+{%- endmacro %}
+
+{% macro state(value) -%}
+{{ badge(present_state(value)) }}
+{%- endmacro %}
+
+{% macro enum(family, value) -%}
+{{ badge(present(family, value)) }}
+{%- endmacro %}
+
+{% macro mode_chip(name, mode) -%}
+<li><span class="chip tone-{{ mode_tone(mode) }}" data-provider="{{ name|lower }}" data-mode="{{ mode }}"><span class="chip-key">{{ name }}</span> {{ mode|upper }}{% if mode == "live" %}<span class="sr-only"> (live: real side effects)</span>{% endif %}</span></li>
+{%- endmacro %}
+
+{% macro check(passed, yes="pass", no="fail") -%}
+{% if passed %}<span class="badge tone-ok" data-check="pass"><span class="badge-glyph" aria-hidden="true">✓</span><span class="badge-text">{{ yes }}</span><span class="sr-only"> (Succeeded)</span></span>{% else %}<span class="badge tone-err" data-check="fail"><span class="badge-glyph" aria-hidden="true">✗</span><span class="badge-text">{{ no }}</span><span class="sr-only"> (Failed)</span></span>{% endif %}
+{%- endmacro %}

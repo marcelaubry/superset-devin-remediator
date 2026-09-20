@@ -5,7 +5,7 @@ from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, Response
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -47,6 +47,7 @@ from .dashboard import (
     TEMPLATE_HELPERS,
     approval_json,
     load_case,
+    page_context,
     remediation_json,
     templates,
 )
@@ -55,9 +56,16 @@ router = APIRouter()
 
 
 @router.post("/login")
-async def login(request: Request, settings: Settings = Depends(get_settings)) -> RedirectResponse:
+async def login(request: Request, settings: Settings = Depends(get_settings)) -> Response:
     form = await request.form()
     if not hmac.compare_digest(str(form.get("token", "")), settings.operator_token):
+        if "text/html" in request.headers.get("accept", ""):
+            return templates.TemplateResponse(
+                request,
+                "login.html",
+                {**page_context(request, settings), "error": "Invalid token"},
+                status_code=401,
+            )
         raise HTTPException(status_code=401, detail="invalid token")
     response = RedirectResponse("/", status_code=303)
     exp = str(int(time.time()) + 43200)
@@ -279,22 +287,13 @@ async def _case_action(
             refreshed = await load_case(session, case_id)
             if not refreshed:
                 raise HTTPException(status_code=404, detail="case not found") from exc
-            return templates.TemplateResponse(
-                request,
-                "partials/case_detail.html",
-                {"request": request, "case": refreshed, **TEMPLATE_HELPERS, "error": str(exc)},
-                status_code=200,
-            )
+            return _render_case(request, refreshed, str(exc))
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     if request.headers.get("HX-Request") == "true":
         refreshed = await load_case(session, case_id)
         if not refreshed:
             raise HTTPException(status_code=404, detail="case not found")
-        return templates.TemplateResponse(
-            request,
-            "partials/case_detail.html",
-            {"request": request, "case": refreshed, **TEMPLATE_HELPERS, "error": None},
-        )
+        return _render_case(request, refreshed)
     refreshed = await load_case(session, case_id)
     if not refreshed:
         raise HTTPException(status_code=404, detail="case not found")
@@ -483,7 +482,13 @@ def _render_case(request: Request, case: Case, error: str | None = None) -> Any:
         return templates.TemplateResponse(
             request,
             "partials/case_detail.html",
-            {"request": request, "case": case, **TEMPLATE_HELPERS, "error": error},
+            {
+                "request": request,
+                "rendered_at": datetime.now(UTC),
+                "case": case,
+                **TEMPLATE_HELPERS,
+                "error": error,
+            },
         )
     if error is not None:
         raise HTTPException(status_code=409, detail=error)

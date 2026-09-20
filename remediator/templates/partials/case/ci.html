@@ -1,0 +1,40 @@
+{% import "macros/badges.html" as b %}
+{% import "macros/ui.html" as ui %}
+{% set ns = namespace(latest=None, attempt=None, total=0) %}
+{% if remediation %}{% for item in remediation.attempts if item.ci_snapshots %}{% set ns.latest = item.ci_snapshots[-1] %}{% set ns.attempt = item %}{% set ns.total = ns.total + item.ci_snapshots|length %}{% endfor %}{% endif %}
+{% if ns.latest %}
+<section id="ci" class="panel" aria-labelledby="ci-title">
+  <header class="panel-head"><h2 id="ci-title">CI <span class="muted">— checks for head {{ ui.sha(ns.latest.head_sha) }}</span></h2>{{ b.enum("ci", ns.latest.overall) }}</header>
+  <dl class="facts">
+    <dt>Overall</dt><dd>{{ b.enum("ci", ns.latest.overall) }} {{ ns.latest.summary }}</dd>
+    <dt>Observed</dt><dd>{{ ns.latest.observed_at or "-" }}</dd>
+    <dt>Required</dt><dd>{{ ns.latest.required_checks|length }} required{% if ns.latest.missing_required %} · missing: <code>{{ ns.latest.missing_required|join(", ") }}</code>{% else %} · none missing{% endif %}</dd>
+    {% if ns.attempt.ci_deadline_at %}<dt>Polling deadline</dt><dd>{{ ns.attempt.ci_deadline_at }}</dd>{% endif %}
+  </dl>
+  <h3>Checks</h3>
+  {% if ns.latest.checks %}
+  <ul class="stack">
+    {% for check in ns.latest.checks %}
+    <li>{{ b.enum("check", check.conclusion or check.status) }} {% if check.html_url %}{{ ui.ext(check.html_url, check.name) }}{% else %}{{ check.name }}{% endif %} <span class="muted small">{{ check.status }}{% if check.conclusion %} / {{ check.conclusion }}{% endif %}</span></li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  {{ ui.empty("No checks reported.") }}
+  {% endif %}
+  {% if ns.total > 1 %}
+  <details><summary>History ({{ ns.total }} snapshots)</summary>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="CI snapshot history">
+      <table>
+        <caption class="sr-only">All CI observations, oldest first</caption>
+        <thead><tr><th scope="col">Observed</th><th scope="col">Head</th><th scope="col">Overall</th><th scope="col">Summary</th><th scope="col">Missing required</th></tr></thead>
+        <tbody>
+          {% for item in remediation.attempts %}{% for ci in item.ci_snapshots %}
+          <tr><th scope="row">{{ ci.observed_at or "-" }}</th><td>{{ ui.sha(ci.head_sha) }}</td><td>{{ b.enum("ci", ci.overall) }}</td><td>{{ ci.summary }}</td><td>{{ ci.missing_required|join(", ") or "-" }}</td></tr>
+          {% endfor %}{% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </details>
+  {% endif %}
+</section>
+{% endif %}

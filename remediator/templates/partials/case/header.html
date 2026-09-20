@@ -1,0 +1,33 @@
+{% import "macros/badges.html" as b %}
+{% import "macros/ui.html" as ui %}
+{% set current_stage = stage_for_state(case.state) %}
+{% set stage_keys = FUNNEL_STAGES|list %}
+{% set current_index = stage_keys.index(current_stage) if current_stage else stage_keys|length %}
+<section class="panel case-header" aria-labelledby="case-title">
+  <div class="case-title">
+    <h1 id="case-title">#{{ case.issue_number }} {{ case.issue_title }}</h1>
+    {{ b.state(case.state) }}
+  </div>
+  <ol class="phase-rail" aria-label="Workflow phase">
+    {% for key in stage_keys %}
+    {% set done = loop.index0 < current_index %}
+    {% set current = key == current_stage %}
+    <li class="{{ 'is-current' if current else ('is-done' if done else '') }}"{% if current %} aria-current="step"{% endif %}><span aria-hidden="true">{{ '●' if current else ('✓' if done else '○') }}</span> {{ FUNNEL_LABELS[key] }}{% if current %}<span class="sr-only"> (current)</span>{% elif done %}<span class="sr-only"> (done)</span>{% endif %}</li>
+    {% endfor %}
+    {% if not current_stage %}<li class="is-terminal" aria-current="step"><span aria-hidden="true">■</span> Terminal</li>{% endif %}
+  </ol>
+  <p class="case-meta">
+    <span><strong>Elapsed in stage:</strong> {{ ui.ago(case.state_entered_at) }}</span>
+    <span><strong>Age:</strong> {{ ui.ago(case.created_at) }}</span>
+    <span><strong>Repository:</strong> {{ case.repository }}</span>
+    <span><strong>Recommendation:</strong> {% if case.recommendation %}<code>{{ case.recommendation.value }}</code>{% else %}<span class="muted">-</span>{% endif %}</span>
+    <span><strong>Issue:</strong> {{ ui.ext(case.issue_url, "#" ~ case.issue_number ~ " on GitHub") }}</span>
+    <span><strong>Session:</strong> {{ ui.session_link(case.devin_session_id, case.devin_session_url) }}</span>
+    <span><strong>PR:</strong> {{ ui.ext(case.pr_url, "PR") }}</span>
+    <span><strong>CI:</strong> {% if case.ci_status %}{{ b.enum("ci", case.ci_status) }}{% else %}<span class="muted">-</span>{% endif %}</span>
+  </p>
+  {% if case.failure_reason %}
+  <p class="alert" data-kind="failure-reason"><strong>Blocked / failure reason:</strong> {{ case.failure_reason }}</p>
+  {% endif %}
+  {% include "partials/case/actions.html" %}
+</section>

@@ -1,0 +1,43 @@
+{% import "macros/badges.html" as b %}
+{% import "macros/ui.html" as ui %}
+<section id="audit" class="panel" aria-labelledby="audit-title">
+  <header class="panel-head"><h2 id="audit-title">Audit</h2><span class="count">{{ case.attempts|length }} attempt{{ '' if case.attempts|length == 1 else 's' }} · {{ case.transitions|length }} transition{{ '' if case.transitions|length == 1 else 's' }}</span></header>
+  <h3>Attempts</h3>
+  {% if case.attempts %}
+  <div class="table-wrap" tabindex="0" role="region" aria-label="All attempts">
+    <table>
+      <caption class="sr-only">Every triage and remediation attempt for this case, oldest first</caption>
+      <thead><tr><th scope="col">Kind</th><th scope="col">Status</th><th scope="col">Create</th><th scope="col">Session</th><th scope="col">Remote status</th><th scope="col">Started</th><th scope="col">Finished</th><th scope="col">Error</th></tr></thead>
+      <tbody>
+        {% for a in case.attempts|sort(attribute="started_at") %}
+        <tr>
+          <th scope="row">{{ a.kind }}</th>
+          <td>{{ b.enum("attempt", a.status) }}</td>
+          <td>{% if a.create_state %}{{ b.enum("create", a.create_state) }}{% else %}<span class="muted">-</span>{% endif %}</td>
+          <td>{{ ui.session_link(a.devin_session_id, a.devin_session_url) }}</td>
+          <td>{% if a.devin_status %}<code>{{ a.devin_status }}</code>{% if a.devin_status_detail %}<span class="muted small"> / {{ a.devin_status_detail }}</span>{% endif %}{% else %}<span class="muted">-</span>{% endif %}</td>
+          <td>{{ ui.at(a.started_at) }}</td>
+          <td>{{ ui.at(a.finished_at) }}</td>
+          <td class="small">{{ a.error or "-" }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  {{ ui.empty("No attempts.") }}
+  {% endif %}
+  <h3 class="subsection">Transitions</h3>
+  {% if case.transitions %}
+  <ol class="timeline" reversed>
+    {% for item in case.transitions|sort(attribute="seq", reverse=true) %}
+    <li>
+      {{ ui.at(item.created_at) }}
+      <span>{% if item.from_state %}<span class="mono small muted">{{ item.from_state }}</span>{% else %}<span class="muted">new</span>{% endif %}<span class="arrow" aria-hidden="true">→</span><span class="sr-only">to</span>{{ b.state(item.to_state) }} <span class="muted small">by {{ item.actor }}</span>{% if item.reason %} — {{ item.reason }}{% endif %}</span>
+    </li>
+    {% endfor %}
+  </ol>
+  {% else %}
+  {{ ui.empty("No transitions.") }}
+  {% endif %}
+</section>

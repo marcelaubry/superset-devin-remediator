@@ -1,0 +1,38 @@
+{% import "macros/badges.html" as b %}
+{% import "macros/ui.html" as ui %}
+{% if attempt %}
+<section id="devin-session" class="panel" aria-labelledby="session-title">
+  <header class="panel-head"><h2 id="session-title">Session <span class="muted">({{ attempt.kind }})</span></h2>{{ b.enum("attempt", attempt.status) }}</header>
+  <dl class="facts">
+    <dt>Create</dt><dd>{% if attempt.create_state %}{{ b.enum("create", attempt.create_state) }}{% else %}<span class="muted">-</span>{% endif %}</dd>
+    <dt>Session</dt><dd>{% if attempt.devin_session_id %}{{ ui.session_link(attempt.devin_session_id, attempt.devin_session_url, 40) }}{% else %}not created{% endif %}</dd>
+    <dt>Remote status</dt><dd>{% if attempt.devin_status %}<code>{{ attempt.devin_status }}</code>{% if attempt.devin_status_detail %} / {{ attempt.devin_status_detail }}{% endif %}{% else %}<span class="muted">-</span>{% endif %}</dd>
+    <dt>Elapsed</dt><dd>{{ attempt_elapsed(attempt) }} <span class="muted small">({{ attempt.poll_count }} polls{% if attempt.last_polled_at %}, last {{ ui.ago(attempt.last_polled_at) }} ago{% endif %})</span></dd>
+    <dt>Deadline</dt><dd>{% if attempt.timeout_at %}{{ ui.at(attempt.timeout_at) }} ({{ until(attempt.timeout_at) }}){% else %}<span class="muted">-</span>{% endif %}</dd>
+    <dt>Budget</dt><dd>{{ ui.acu(attempt) }}{% if attempt.max_acu_limit and attempt.devin_acus_consumed is not none %}{% set pct = (100 * attempt.devin_acus_consumed / attempt.max_acu_limit)|round|int %}<span class="muted small"> · {{ pct }}% of limit</span>{% endif %}</dd>
+    <dt>Base SHA</dt><dd>{{ ui.sha(attempt.base_sha) }}{% if attempt.prompt_version %} · prompt <code>{{ attempt.prompt_version }}</code>{% endif %}</dd>
+    <dt>Tags</dt><dd>{% if attempt.devin_tags %}{{ attempt.devin_tags|join(", ") }}{% else %}<span class="muted">-</span>{% endif %}</dd>
+    <dt>Operation key</dt><dd><code class="small">{{ attempt.operation_key }}</code></dd>
+    <dt>Attempt id</dt><dd><code class="small">{{ attempt.id }}</code></dd>
+    {% if attempt.reconciliation_reason %}<dt>Reconciliation</dt><dd>{{ attempt.reconciliation_reason }}</dd>{% endif %}
+    {% if attempt.error %}<dt>Error</dt><dd class="tone-err-text">{{ attempt.error }}</dd>{% endif %}
+  </dl>
+  {% if attempt.devin_session_url %}<p><a class="button" href="{{ attempt.devin_session_url }}" rel="noopener">Open Devin session</a></p>{% endif %}
+  {% if attempt.kind != "TRIAGE" and attempt.structured_output %}
+  <h3 class="subsection">{{ attempt.kind|capitalize }} output</h3>
+  {% set out = attempt.structured_output %}
+  {% if out.get("summary") %}<p>{{ out["summary"] }}</p>{% endif %}
+  <dl class="facts">
+    {% if "outcome" in out %}<dt>Outcome</dt><dd><code>{{ out["outcome"] }}</code></dd>{% endif %}
+    {% if out.get("pr_url") %}<dt>PR</dt><dd>{{ ui.ext(out["pr_url"]) }}</dd>{% endif %}
+    {% if out.get("branch") %}<dt>Branch</dt><dd><code>{{ out["branch"] }}</code></dd>{% endif %}
+    {% if out.get("head_sha") %}<dt>Head</dt><dd>{{ ui.sha(out["head_sha"]) }}</dd>{% endif %}
+    {% if out.get("changed_files") %}<dt>Changed files</dt><dd><ul class="plain">{% for f in out["changed_files"] %}<li><code>{{ f }}</code></li>{% endfor %}</ul></dd>{% endif %}
+    {% if out.get("tests_run") %}<dt>Tests run</dt><dd><ul class="plain">{% for t in out["tests_run"] %}<li><code>{{ t }}</code></li>{% endfor %}</ul></dd>{% endif %}
+    {% if out.get("risks") %}<dt>Risks</dt><dd><ul class="plain">{% for r in out["risks"] %}<li>{{ r }}</li>{% endfor %}</ul></dd>{% endif %}
+    {% if out.get("blocking_questions") %}<dt>Blocking questions</dt><dd><ul class="plain">{% for q in out["blocking_questions"] %}<li>{{ q }}</li>{% endfor %}</ul></dd>{% endif %}
+  </dl>
+  <details><summary>Raw JSON</summary><pre>{{ out|tojson(indent=2) }}</pre></details>
+  {% endif %}
+</section>
+{% endif %}

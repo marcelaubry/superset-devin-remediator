@@ -1,1 +1,30 @@
-<section><h2>Cases by state</h2><ul>{% for state,count in state_counts.items() %}<li>{{ state }}: {{ count }}</li>{% endfor %}</ul><h2>Cases by recommendation</h2><ul>{% for name,count in recommendation_counts.items() %}<li>{{ name }}: {{ count }}</li>{% endfor %}</ul></section>
+{% import "macros/badges.html" as b %}
+<section class="panel" aria-labelledby="overview-title">
+  <header class="panel-head"><h2 id="overview-title">Cases by state and recommendation</h2><span class="count">all cases</span></header>
+  <div class="grid-2">
+    <div>
+      <h3>Cases by state</h3>
+      <ul class="outcomes" aria-label="Non-zero case states">
+        {% for state, count in state_counts.items() if count %}
+        <li>{{ b.state(state) }} <span class="n">{{ count }}</span></li>
+        {% else %}
+        <li class="empty">No cases yet.</li>
+        {% endfor %}
+      </ul>
+      <details class="small">
+        <summary>All {{ state_counts|length }} states</summary>
+        <ul class="outcomes">{% for state, count in state_counts.items() %}<li><code>{{ state }}</code> <span class="n">{{ count }}</span></li>{% endfor %}</ul>
+      </details>
+    </div>
+    <div>
+      <h3>Cases by recommendation</h3>
+      <ul class="outcomes" aria-label="Triage recommendations">
+        {% for name, count in recommendation_counts.items() %}
+        <li><code>{{ name }}</code> <span class="n">{{ count }}</span></li>
+        {% else %}
+        <li class="empty">No triaged cases yet.</li>
+        {% endfor %}
+      </ul>
+    </div>
+  </div>
+</section>

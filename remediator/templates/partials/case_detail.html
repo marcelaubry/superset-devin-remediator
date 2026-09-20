@@ -1,168 +1,23 @@
-{% if error %}<p role="alert">{{error}}</p>{% endif %}
-<p><strong>State:</strong> <span class="state-badge">{{case.state}}</span></p>
-<p><strong>Elapsed in stage:</strong> {{humanize(case.state_entered_at)}}</p>
-<p><strong>Age:</strong> {{humanize(case.created_at)}}</p>
-<dl>
-  <dt>Recommendation</dt><dd>{{case.recommendation or "-"}}</dd>
-  <dt>Issue</dt><dd><a href="{{case.issue_url}}">{{case.issue_url}}</a></dd>
-  <dt>Devin session</dt><dd>{% if case.devin_session_url %}<a href="{{case.devin_session_url}}">{{case.devin_session_url}}</a>{% else %}-{% endif %}</dd>
-  <dt>PR</dt><dd>{{case.pr_url or "-"}}</dd>
-  <dt>CI</dt><dd>{{case.ci_status or "-"}}</dd>
-  {% if case.failure_reason %}<dt>Blocked / failure reason</dt><dd>{{case.failure_reason}}</dd>{% endif %}
-</dl>
+{% import "macros/badges.html" as b %}
+{% import "macros/ui.html" as ui %}
 {% set attempt = latest_attempt(case) %}
-{% if attempt %}
-<section id="devin-session">
-  <h2>Devin session ({{attempt.kind}})</h2>
-  <dl>
-    <dt>Attempt</dt><dd>{{attempt.id}} · {{attempt.status}} · create {{attempt.create_state or "-"}}</dd>
-    <dt>Operation key</dt><dd><code>{{attempt.operation_key}}</code></dd>
-    <dt>Session</dt><dd>{% if attempt.devin_session_url %}<a href="{{attempt.devin_session_url}}">{{attempt.devin_session_id}}</a>{% else %}{{attempt.devin_session_id or "not created"}}{% endif %}</dd>
-    <dt>Remote status</dt><dd>{{attempt.devin_status or "-"}}{% if attempt.devin_status_detail %} / {{attempt.devin_status_detail}}{% endif %}</dd>
-    <dt>Elapsed</dt><dd>{{attempt_elapsed(attempt)}} ({{attempt.poll_count}} polls, last {{humanize(attempt.last_polled_at)}} ago)</dd>
-    <dt>Deadline</dt><dd>{{attempt.timeout_at or "-"}} ({{until(attempt.timeout_at)}})</dd>
-    <dt>Budget</dt><dd>max {{attempt.max_acu_limit or "-"}} ACU · consumed {{attempt.devin_acus_consumed if attempt.devin_acus_consumed is not none else "-"}}</dd>
-    <dt>Base SHA</dt><dd><code>{{attempt.base_sha or "-"}}</code> · prompt {{attempt.prompt_version or "-"}}</dd>
-    <dt>Tags</dt><dd>{{(attempt.devin_tags or [])|join(", ")}}</dd>
-    {% if attempt.reconciliation_reason %}<dt>Reconciliation</dt><dd>{{attempt.reconciliation_reason}}</dd>{% endif %}
-    {% if attempt.error %}<dt>Error</dt><dd>{{attempt.error}}</dd>{% endif %}
-  </dl>
-  {% if attempt.kind != "TRIAGE" and attempt.structured_output %}
-  <h3>{{attempt.kind|capitalize}} output</h3>
-  <pre>{{attempt.structured_output|tojson(indent=2)}}</pre>
-  {% endif %}
-</section>
-{% endif %}
 {% set triage_result = latest_triage_result(case) %}
-{% if triage_result %}
-<section id="triage-result">
-  <h2>Validated triage result</h2>
-  <pre>{{triage_result|tojson(indent=2)}}</pre>
-</section>
-{% endif %}
 {% set approval = latest_approval(case) %}
-{% if approval %}
-<section id="approval">
-  <h2>Remediation approval</h2>
-  <dl>
-    <dt>Slack notification</dt><dd>{{approval.notification_status.value}}{% if approval.slack_message_ts %} · channel {{approval.slack_channel}} · ts {{approval.slack_message_ts}}{% endif %}</dd>
-    <dt>Decision</dt><dd>{{approval.decision.value}}{% if approval.decided_by_slack_user_id %} by Slack user <code>{{approval.decided_by_slack_user_id}}</code> at {{approval.decided_at}}{% endif %}{% if approval.decision_reason %} — {{approval.decision_reason}}{% endif %}</dd>
-    <dt>Action token</dt><dd>{% if approval.decision.value == "PENDING" %}valid until {{approval.token_expires_at}} ({{until(approval.token_expires_at)}}){% else %}closed{% endif %}</dd>
-    <dt>GitHub label delivery</dt><dd>{{approval.delivery_status.value}}{% if approval.label_operation %} · {{approval.label_operation}}{% endif %}{% if approval.label_applied_at %} · applied {{approval.label_applied_at}}{% endif %}{% if approval.label_confirmed_at %} · confirmed by webhook {{approval.label_confirmed_at}}{% endif %}</dd>
-    <dt>GitHub comment</dt><dd>{{approval.github_comment_id or "-"}}</dd>
-    <dt>Triage result</dt><dd><code>sha256:{{approval.triage_result_hash}}</code> (schema {{approval.triage_schema_version}})</dd>
-  </dl>
-  {% if approval.decision.value == "PENDING" %}
-  <form method="post" action="/operator/approvals/{{approval.id}}/expire" hx-post="/operator/approvals/{{approval.id}}/expire" hx-target="#case-detail" hx-swap="innerHTML"><button>Expire action token</button></form>
-  {% endif %}
-  <h3>Approval timeline</h3>
-  <ol>{% for item in approval.events %}<li>{{item.created_at}}: <strong>{{item.kind}}</strong> ({{item.actor}}) — {{item.detail}}</li>{% else %}<li>None</li>{% endfor %}</ol>
-</section>
-{% endif %}
 {% set remediation = remediation_json(case) %}
-{% if remediation %}
-<section id="remediation">
-  <h2>Remediation (Phase 4)</h2>
-  <dl>
-    <dt>State</dt><dd>{{remediation.state}}{% if remediation.ready_for_human_review %} — <strong>ready for human PR review</strong> (nothing is merged or closed automatically){% endif %}</dd>
-    <dt>CI status</dt><dd>{{remediation.ci_status or "-"}}</dd>
-    {% if remediation.failure_reason %}<dt>Failure / blocked reason</dt><dd>{{remediation.failure_reason}}</dd>{% endif %}
-  </dl>
-  {% for snap in remediation.probe_snapshots %}
-  <details {% if loop.last and not remediation.attempts %}open{% endif %}>
-    <summary>Pre-session probe gate · <code>{{snap.probe_identifier}}</code> · script <code>sha256:{{snap.script_hash[:12]}}</code> · base <code>{{snap.base_sha[:12]}}</code></summary>
-    <p class="muted">The immutable probe must reproduce the defect at the pinned base SHA (expected exit {{snap.expected_base_exit_code}}) before any Devin session is created. Registry commit <code>{{snap.registry_commit or "unknown"}}</code>, manifest <code>sha256:{{snap.manifest_hash}}</code>.</p>
-    {% if snap.pre_session_executions %}
-    <table><thead><tr><th>Target</th><th>Commit</th><th>Runner</th><th>Exit (expected)</th><th>Verdict</th><th>Duration</th><th>Output</th></tr></thead><tbody>
-    {% for run in snap.pre_session_executions %}<tr><td>{{run.target}}</td><td><code>{{run.commit_sha[:12]}}</code></td><td>{{run.runner_mode}} <code>{{run.command_identity}}</code></td><td>{{run.exit_code if run.exit_code is not none else "none"}} ({{run.expected_exit_code}}){% if run.timed_out %} timed out{% endif %}</td><td><strong>{{run.verdict}}</strong>{% if run.error %} — {{run.error}}{% endif %}</td><td>{{run.duration_ms if run.duration_ms is not none else "-"}} ms</td><td><details><summary>stdout/stderr{% if run.output_truncated %} (truncated){% endif %}</summary><pre>{{run.stdout}}</pre><pre>{{run.stderr}}</pre></details></td></tr>{% endfor %}
-    </tbody></table>
-    {% else %}
-    <p class="muted">Base probe not yet executed for this snapshot (or its BASE run authorised an attempt below).</p>
-    {% endif %}
-  </details>
-  {% endfor %}
-  {% for item in remediation.attempts %}
-  <details {% if loop.last %}open{% endif %}>
-    <summary>Attempt <code>{{item.operation_key}}</code> · {{item.status}}{% if item.duration_seconds is not none %} · {{item.duration_seconds}}s{% endif %}{% if item.failure_stage %} · failed at {{item.failure_stage}} ({{item.failure_class}}){% endif %}</summary>
-    <dl>
-      <dt>Devin session</dt><dd>{% if item.devin_session_url %}<a href="{{item.devin_session_url}}">{{item.devin_session_id}}</a>{% else %}{{item.devin_session_id or "not created"}}{% endif %} · {{item.devin_status or "-"}} · ACUs {{item.devin_acus_consumed if item.devin_acus_consumed is not none else "-"}}/{{item.max_acu_limit or "-"}}</dd>
-      <dt>Authorised against</dt><dd>approval <code>{{item.approval_request_id or "-"}}</code> · triage <code>sha256:{{item.triage_result_hash or "-"}}</code> · base <code>{{item.base_sha or "-"}}</code></dd>
-      {% if item.probe_snapshot %}<dt>Immutable probe</dt><dd><code>{{item.probe_snapshot.probe_identifier}}</code> · script <code>sha256:{{item.probe_snapshot.script_hash}}</code> · manifest <code>sha256:{{item.probe_snapshot.manifest_hash}}</code> · registry commit <code>{{item.probe_snapshot.registry_commit or "unknown"}}</code> · expected exit base={{item.probe_snapshot.expected_base_exit_code}} head={{item.probe_snapshot.expected_head_exit_code}}</dd>{% endif %}
-      <dt>Devin pull_requests[]</dt><dd>{% for pr in item.devin_pull_requests %}<a href="{{pr.pr_url}}">{{pr.pr_url}}</a> ({{pr.pr_state or "?"}}){% if not loop.last %}, {% endif %}{% else %}none{% endfor %}</dd>
-      <dt>Verified PR</dt><dd>{% if item.pr_url %}<a href="{{item.pr_url}}">#{{item.pr_number}}</a> · branch <code>{{item.branch}}</code> · head <code>{{item.head_sha}}</code>{% else %}-{% endif %}</dd>
-      {% if item.error %}<dt>Error</dt><dd>{{item.error}}</dd>{% endif %}
-    </dl>
-    {% if item.pull_request_evidence %}
-    <h3>GitHub PR corroboration</h3>
-    <table><thead><tr><th>PR</th><th>State</th><th>Base</th><th>Head</th><th>Author</th><th>Compare</th><th>Closing refs</th><th>Verdict</th></tr></thead><tbody>
-    {% for ev in item.pull_request_evidence %}<tr><td><a href="{{ev.pr_url}}">{{ev.repository}}#{{ev.pr_number}}</a></td><td>{{ev.state}}{% if ev.draft %} (draft){% endif %}{% if ev.merged %} merged{% endif %}</td><td>{{ev.base_ref}} @ {{ev.base_sha[:12]}}</td><td>{{ev.head_ref}} @ {{ev.head_sha[:12]}}</td><td>{{ev.author_login or "?"}} ({{ev.author_type or "?"}})</td><td>{{ev.compare_status or "-"}} +{{ev.ahead_by if ev.ahead_by is not none else "?"}}/-{{ev.behind_by if ev.behind_by is not none else "?"}}</td><td>{{ev.closing_issue_numbers|join(", ") or "-"}} ({{ev.closing_reference_source or "-"}})</td><td>{% if ev.valid %}valid{% else %}<strong>invalid</strong>{% endif %} — {{ev.verdict}}</td></tr>{% endfor %}
-    </tbody></table>
-    {% endif %}
-    {% if item.probe_executions %}
-    <h3>Independent probe executions</h3>
-    <table><thead><tr><th>Target</th><th>Commit</th><th>Runner</th><th>Exit (expected)</th><th>Verdict</th><th>Duration</th><th>Output</th></tr></thead><tbody>
-    {% for run in item.probe_executions %}<tr><td>{{run.target}}</td><td><code>{{run.commit_sha[:12]}}</code></td><td>{{run.runner_mode}} <code>{{run.command_identity}}</code></td><td>{{run.exit_code if run.exit_code is not none else "none"}} ({{run.expected_exit_code}}){% if run.timed_out %} timed out{% endif %}</td><td><strong>{{run.verdict}}</strong>{% if run.error %} — {{run.error}}{% endif %}</td><td>{{run.duration_ms if run.duration_ms is not none else "-"}} ms</td><td><details><summary>stdout/stderr{% if run.output_truncated %} (truncated){% endif %}</summary><pre>{{run.stdout}}</pre><pre>{{run.stderr}}</pre></details></td></tr>{% endfor %}
-    </tbody></table>
-    {% endif %}
-    {% if item.ci_snapshots %}
-    <h3>GitHub checks for head {{item.head_sha[:12] if item.head_sha else "-"}}</h3>
-    <table><thead><tr><th>Observed</th><th>Overall</th><th>Summary</th><th>Missing required</th><th>Checks</th></tr></thead><tbody>
-    {% for ci in item.ci_snapshots %}<tr><td>{{ci.observed_at}}</td><td><strong>{{ci.overall}}</strong></td><td>{{ci.summary}}</td><td>{{ci.missing_required|join(", ") or "-"}}</td><td>{% for check in ci.checks %}{% if check.html_url %}<a href="{{check.html_url}}">{{check.name}}</a>{% else %}{{check.name}}{% endif %}: {{check.status}}{% if check.conclusion %}/{{check.conclusion}}{% endif %}{% if not loop.last %}; {% endif %}{% endfor %}</td></tr>{% endfor %}
-    </tbody></table>
-    {% if item.ci_deadline_at %}<p class="muted">CI polling deadline: {{item.ci_deadline_at}}</p>{% endif %}
-    {% endif %}
-  </details>
-  {% else %}
-  <p class="muted">No remediation attempt has been dispatched yet.</p>
-  {% endfor %}
-</section>
-{% endif %}
-{% if case.outbox %}
-<section id="outbox">
-  <h2>Outbox</h2>
-  <table>
-    <thead><tr><th>Channel</th><th>Kind</th><th>Status</th><th>Attempts</th><th>Next attempt</th><th>Last error</th><th></th></tr></thead>
-    <tbody>
-    {% for row in case.outbox|sort(attribute="created_at") %}
-    <tr>
-      <td>{{row.channel.value}}</td><td>{{row.kind}}</td><td>{{row.status.value}}</td><td>{{row.attempts_count}}</td>
-      <td>{% if row.status.value == "PENDING" %}{{until(row.next_attempt_at)}}{% else %}-{% endif %}</td>
-      <td>{{row.last_error or "-"}}</td>
-      <td>{% if row.status.value == "FAILED" %}<form method="post" action="/operator/outbox/{{row.id}}/retry" hx-post="/operator/outbox/{{row.id}}/retry" hx-target="#case-detail" hx-swap="innerHTML"><button>Retry</button></form>{% endif %}</td>
-    </tr>
-    {% endfor %}
-    </tbody>
-  </table>
-</section>
-{% endif %}
-<section id="case-status">
-  <h2>Actions</h2>
-  {% set actions = remediation_actions(case) %}
-  {% if case.state in ["FAILED","TIMED_OUT","HUMAN_BLOCKED"] %}
-  <form method="post" action="/operator/cases/{{case.id}}/retry" hx-post="/operator/cases/{{case.id}}/retry" hx-target="#case-detail" hx-swap="innerHTML"><button>Retry</button></form>
-  {% endif %}
-  {% if actions.retry %}
-  <form method="post" action="/operator/cases/{{case.id}}/retry" hx-post="/operator/cases/{{case.id}}/retry" hx-target="#case-detail" hx-swap="innerHTML" hx-confirm="Start a NEW paid Devin remediation attempt for this case?"><button>Retry remediation (new attempt)</button></form>
-  {% endif %}
-  {% if actions.retry_ci %}
-  <form method="post" action="/operator/cases/{{case.id}}/retry-ci" hx-post="/operator/cases/{{case.id}}/retry-ci" hx-target="#case-detail" hx-swap="innerHTML"><button>Retry CI synchronisation</button></form>
-  {% endif %}
-  {% if actions.retry_probe %}
-  <form method="post" action="/operator/cases/{{case.id}}/retry-probe" hx-post="/operator/cases/{{case.id}}/retry-probe" hx-target="#case-detail" hx-swap="innerHTML"><button>Retry probe verification (infrastructure failure)</button></form>
-  {% endif %}
-  {% if case.state == "AWAITING_REMEDIATION_APPROVAL" %}
-  <p class="muted">Remediation approval happens in Slack (approve/reject buttons on the notification). Operators cannot approve from the dashboard.</p>
-  {% endif %}
-  {% if case.state == "CI_PASSED" %}
-  <p class="muted">Required checks passed for the verified head SHA. Review and merge the PR on GitHub yourself; this service never merges or closes issues.</p>
-  {% endif %}
-  {% if case.state not in ["CI_PASSED","TIMED_OUT","POLICY_REJECTED","FAILED","CANCELLED","REMEDIATION_REJECTED","REMEDIATION_CANCELLED"] %}
-  <form method="post" action="/operator/cases/{{case.id}}/cancel" hx-post="/operator/cases/{{case.id}}/cancel" hx-target="#case-detail" hx-swap="innerHTML"><button>Cancel</button></form>
-  {% endif %}
-</section>
-<h2>Rubric</h2>
-<ul>{% for check in case.rubric or [] %}<li><strong>{{check.name}}</strong>: {{check.passed}} — {{check.reason}}</li>{% else %}<li>None</li>{% endfor %}</ul>
-<h2>Attempts</h2>
-<ul>{% for attempt in case.attempts|sort(attribute="started_at") %}<li>{{attempt.kind}} {{attempt.status}} {{attempt.create_state or ""}} {{attempt.devin_session_id or ""}} {{attempt.devin_status or ""}}{% if attempt.devin_status_detail %}/{{attempt.devin_status_detail}}{% endif %}{% if attempt.error %} — {{attempt.error}}{% endif %}</li>{% else %}<li>None</li>{% endfor %}</ul>
-<h2>Timeline</h2>
-<ol>{% for item in case.transitions %}<li>{{item.created_at}}: {{item.from_state or "-"}} → {{item.to_state}} ({{item.actor}}) — {{item.reason}}</li>{% else %}<li>None</li>{% endfor %}</ol>
+{% set actions = remediation_actions(case) %}
+{% if error %}<p class="alert" role="alert">{{ error }}</p>{% endif %}
+{% include "partials/case/header.html" %}
+<div class="grid-3 case-body">
+  <div class="span-2 evidence">
+    {% include "partials/case/evidence.html" %}
+    {% include "partials/case/approval.html" %}
+    {% include "partials/case/probe.html" %}
+    {% include "partials/case/pull_request.html" %}
+    {% include "partials/case/ci.html" %}
+    {% include "partials/case/audit.html" %}
+  </div>
+  <div class="evidence">
+    {% include "partials/case/session.html" %}
+    {% include "partials/case/outbox.html" %}
+  </div>
+</div>

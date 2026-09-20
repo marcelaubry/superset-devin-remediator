@@ -1,1 +1,24 @@
-<section><h2>Throughput</h2><ul><li>Cases opened (1h): {{throughput.received_1h}}</li><li>Cases opened (24h): {{throughput.received_24h}}</li><li>Webhooks accepted (1h): {{throughput.accepted_1h}}</li><li>Webhooks accepted (24h): {{throughput.accepted_24h}}</li>{% for name, bucket in throughput.buckets.items() %}<li>{{name|capitalize}}: {{bucket.count}} (mean time to terminal: {{bucket.mean_time}})</li>{% endfor %}</ul></section>
+<section class="panel" aria-labelledby="throughput-title">
+  <header class="panel-head"><h2 id="throughput-title">Throughput</h2></header>
+  <div class="table-wrap" tabindex="0" role="region" aria-labelledby="throughput-title">
+    <table>
+      <caption>Intake over the last hour and day</caption>
+      <thead><tr><th scope="col">Metric</th><th scope="col" class="num">1h</th><th scope="col" class="num">24h</th></tr></thead>
+      <tbody>
+        <tr><th scope="row">Cases opened</th><td class="num">{{ throughput.received_1h }}</td><td class="num">{{ throughput.received_24h }}</td></tr>
+        <tr><th scope="row">Webhooks accepted</th><td class="num">{{ throughput.accepted_1h }}</td><td class="num">{{ throughput.accepted_24h }}</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="table-wrap subsection" tabindex="0" role="region" aria-label="Terminal buckets">
+    <table>
+      <caption>Terminal buckets (mean time to terminal from case creation)</caption>
+      <thead><tr><th scope="col">Bucket</th><th scope="col" class="num">Cases</th><th scope="col" class="num">Mean time</th></tr></thead>
+      <tbody>
+        {% for name, bucket in throughput.buckets.items() %}
+        <tr><th scope="row">{{ name|capitalize }}</th><td class="num">{{ bucket.count }}</td><td class="num">{{ bucket.mean_time }}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>

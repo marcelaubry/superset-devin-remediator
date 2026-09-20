@@ -1,1 +1,27 @@
-<section><h2>Completed jobs</h2><ul>{% for case in completed %}<li><a href="/cases/{{case.id}}">#{{case.issue_number}} {{case.issue_title}}</a> {{case.state}} {{case.ci_status or ""}}</li>{% else %}<li>None</li>{% endfor %}</ul></section>
+{% import "macros/badges.html" as b %}
+{% import "macros/ui.html" as ui %}
+<section class="panel" aria-labelledby="completed-title">
+  <header class="panel-head"><h2 id="completed-title">Completed jobs</h2><span class="count">{{ completed|length }} terminal (latest 100 cases)</span></header>
+  {% if completed %}
+  <div class="table-wrap" tabindex="0" role="region" aria-labelledby="completed-title">
+    <table>
+      <caption class="sr-only">Cases in a terminal state, most recent first</caption>
+      <thead><tr><th scope="col">Issue</th><th scope="col">Outcome</th><th scope="col">PR</th><th scope="col">CI</th><th scope="col">Finished</th></tr></thead>
+      <tbody>
+        {% for case in completed[:25] %}
+        <tr>
+          <th scope="row">{{ ui.case_link(case) }}</th>
+          <td>{{ b.state(case.state) }}</td>
+          <td>{% if case.pr_url %}{{ ui.ext(case.pr_url, "PR") }}{% else %}<span class="muted">-</span>{% endif %}</td>
+          <td>{% if case.ci_status %}{{ b.enum("ci", case.ci_status) }}{% else %}<span class="muted">-</span>{% endif %}</td>
+          <td>{{ ui.ago(case.completed_at or case.state_entered_at) }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% if completed|length > 25 %}<p class="muted small">Showing 25 of {{ completed|length }}; use the ledger below for the rest.</p>{% endif %}
+  {% else %}
+  {{ ui.empty("No completed jobs yet.") }}
+  {% endif %}
+</section>

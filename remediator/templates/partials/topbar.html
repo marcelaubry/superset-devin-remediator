@@ -1,0 +1,11 @@
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="/">Superset Devin Remediator <span class="brand-sub">operator console</span></a>
+    <div id="topbar-status" class="topbar-status"{% if poll_topbar %} hx-get="/partials/topbar_status" hx-trigger="every 3s" hx-swap="innerHTML"{% endif %}>
+      {% include "partials/topbar_status.html" %}
+    </div>
+    {% if show_logout %}
+    <form method="post" action="/logout"><button type="submit" class="btn-quiet">Logout</button></form>
+    {% endif %}
+  </div>
+</header>

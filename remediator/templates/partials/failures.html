@@ -1,1 +1,37 @@
-<section><h2>Failures requiring action</h2><ul>{% for item in failures %}<li>{% if item.state %}<a href="/cases/{{item.id}}">{{item.issue_number}}</a>{% elif item.case_id %}<a href="/cases/{{item.case_id}}">{{item.issue_number or item.delivery_id}}</a>{% else %}{{item.issue_number or item.delivery_id}}{% endif %} {{item.state or item.status}}{% if item.failure_reason %} — {{item.failure_reason}}{% elif item.last_error %} — {{item.last_error}}{% endif %}</li>{% else %}<li>None</li>{% endfor %}</ul></section>
+{% import "macros/badges.html" as b %}
+{% import "macros/ui.html" as ui %}
+<section class="panel" aria-labelledby="attention-title" id="attention">
+  <header class="panel-head"><h2 id="attention-title">Requires attention</h2><span class="count">{{ failures|length }} item{{ '' if failures|length == 1 else 's' }} · blocked first, then failed, then webhook errors</span></header>
+  {% if failures %}
+  <div class="table-wrap" tabindex="0" role="region" aria-labelledby="attention-title">
+    <table>
+      <caption class="sr-only">Cases and webhook deliveries that need an operator</caption>
+      <thead><tr><th scope="col">Issue</th><th scope="col">Status</th><th scope="col">Reason</th><th scope="col">Since</th><th scope="col">Detail</th></tr></thead>
+      <tbody>
+        {% for item in failures %}
+        {% if item.state is defined %}
+        {% set p = present_state(item.state) %}
+        <tr class="{{ 'row-blocked' if p.glyph == '⛔' else 'row-failed' }}">
+          <th scope="row">{{ ui.case_link(item) }}<span class="muted small">{{ item.repository }}</span></th>
+          <td>{{ b.badge(p) }}</td>
+          <td class="reason">{{ item.failure_reason or "-" }}</td>
+          <td>{{ ui.ago(item.state_entered_at) }}</td>
+          <td><a class="button" href="/cases/{{ item.id }}">Open case</a></td>
+        </tr>
+        {% else %}
+        <tr class="row-event">
+          <th scope="row">{% if item.case_id and item.case_id in case_by_id %}{{ ui.case_link(case_by_id[item.case_id]) }}{% elif item.case_id %}<a href="/cases/{{ item.case_id }}">case {{ short(item.case_id|string, 8) }}</a>{% else %}<span class="mono">delivery {{ short(item.delivery_id, 12) }}</span>{% endif %}</th>
+          <td>{{ b.enum("event", item.status) }} <span class="muted small">webhook</span></td>
+          <td class="reason">{{ item.last_error or "-" }}</td>
+          <td>{{ ui.ago(item.received_at) }}</td>
+          <td class="muted small">{{ item.event_type }}/{{ item.action }} · {{ item.attempts_count }} attempt{{ '' if item.attempts_count == 1 else 's' }} · {{ item.repository }}</td>
+        </tr>
+        {% endif %}
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  {{ ui.empty("Nothing needs attention.") }}
+  {% endif %}
+</section>

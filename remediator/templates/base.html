@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}Remediator{% endblock %} · Superset Devin Remediator</title>
+<link rel="stylesheet" href="/static/style.css">
+{% block head %}{% endblock %}
+</head>
+<body{% block body_attrs %}{% endblock %}>
+<a class="skip-link" href="#main">Skip to main content</a>
+{% block topbar %}{% include "partials/topbar.html" %}{% endblock %}
+<main id="main" tabindex="-1">
+{% block banner %}
+<div id="stale-banner" class="banner" role="status" aria-live="polite" hidden>Live refresh is stale — data may be out of date. <span id="stale-detail"></span></div>
+{% endblock %}
+{% block content %}{% endblock %}
+</main>
+{% block scripts %}
+<script src="/static/htmx.min.js"></script>
+<script>
+(function () {
+  var banner = document.getElementById("stale-banner");
+  var detail = document.getElementById("stale-detail");
+  if (!banner) { return; }
+  var lastOk = Date.now();
+  var lastError = null;
+  var STALE_MS = 10000;
+  function show(text, isError) {
+    detail.textContent = text || "";
+    banner.classList.toggle("banner-err", !!isError);
+    banner.classList.add("is-visible");
+    banner.hidden = false;
+  }
+  function hide() {
+    banner.classList.remove("is-visible", "banner-err");
+    banner.hidden = true;
+  }
+  document.body.addEventListener("htmx:afterRequest", function (evt) {
+    var xhr = evt.detail && evt.detail.xhr;
+    if (!xhr) { return; }
+    if (xhr.status === 401) {
+      window.location.assign(xhr.getResponseHeader("HX-Redirect") || "/login");
+      return;
+    }
+    if (evt.detail.successful) {
+      lastOk = Date.now();
+      lastError = null;
+      hide();
+    } else {
+      lastError = "Last response: HTTP " + xhr.status + ".";
+    }
+  });
+  document.body.addEventListener("htmx:sendError", function () {
+    lastError = "The server could not be reached.";
+  });
+  window.setInterval(function () {
+    var age = Date.now() - lastOk;
+    if (age > STALE_MS) {
+      show("Last successful refresh " + Math.round(age / 1000) + "s ago. " + (lastError || ""), !!lastError);
+    }
+  }, 1000);
+})();
+</script>
+{% endblock %}
+</body>
+</html>

@@ -1,0 +1,36 @@
+{% set attention_total = attention_blocked + attention_failed %}
+<section aria-labelledby="kpis-title">
+  <h2 id="kpis-title" class="sr-only">Key indicators</h2>
+  <ul class="kpis">
+    <li class="kpi {{ 'kpi-err' if attention_total else '' }}" data-kpi="attention" data-value="{{ attention_total }}">
+      <span class="kpi-label">Requires attention</span>
+      <span class="kpi-value">{{ attention_total }}</span>
+      <span class="kpi-sub">{{ attention_blocked }} blocked · {{ attention_failed }} failed{% if failed_event_count %} · {{ failed_event_count }} webhook{{ '' if failed_event_count == 1 else 's' }}{% endif %}</span>
+    </li>
+    <li class="kpi" data-kpi="sessions" data-value="{{ active_session_count }}">
+      <span class="kpi-label">Active sessions</span>
+      <span class="kpi-value">{{ active_session_count }}</span>
+      <span class="kpi-sub">Devin sessions owned by running attempts</span>
+    </li>
+    <li class="kpi" data-kpi="in-flight" data-value="{{ active|length }}">
+      <span class="kpi-label">In flight</span>
+      <span class="kpi-value">{{ active|length }}</span>
+      <span class="kpi-sub">{{ active_triage }} triage · {{ active_remediation }} remediation</span>
+    </li>
+    <li class="kpi {{ 'kpi-warn' if state_counts['AWAITING_REMEDIATION_APPROVAL'] else '' }}" data-kpi="awaiting-approval" data-value="{{ state_counts['AWAITING_REMEDIATION_APPROVAL'] }}">
+      <span class="kpi-label">Awaiting approval</span>
+      <span class="kpi-value">{{ state_counts['AWAITING_REMEDIATION_APPROVAL'] }}</span>
+      <span class="kpi-sub">decided in Slack</span>
+    </li>
+    <li class="kpi {{ 'kpi-ok' if ready_for_review else '' }}" data-kpi="ready" data-value="{{ ready_for_review }}">
+      <span class="kpi-label">Ready for review</span>
+      <span class="kpi-value">{{ ready_for_review }}</span>
+      <span class="kpi-sub">CI passed on verified PR</span>
+    </li>
+    <li class="kpi" data-kpi="processing" data-value="{{ processing_count }}">
+      <span class="kpi-label">Webhooks processing</span>
+      <span class="kpi-value">{{ processing_count }}</span>
+      <span class="kpi-sub">{{ throughput.accepted_1h }} accepted in 1h</span>
+    </li>
+  </ul>
+</section>

@@ -1,0 +1,44 @@
+{# Shared UI helpers. #}
+{% macro ago(value, prefix="") -%}
+{% if value %}<time datetime="{{ iso(value) }}" title="{{ iso(value) }}">{{ prefix }}{{ humanize(value) }}</time>{% else %}-{% endif %}
+{%- endmacro %}
+
+{% macro at(value) -%}
+{% if value %}<time datetime="{{ iso(value) }}" title="{{ iso(value) }}">{{ clock(value) }}</time>{% else %}-{% endif %}
+{%- endmacro %}
+
+{% macro deadline(value) -%}
+{% if value %}<time datetime="{{ iso(value) }}" title="{{ iso(value) }}">{{ until(value) }}</time>{% else %}-{% endif %}
+{%- endmacro %}
+
+{% macro case_link(case) -%}
+<a href="/cases/{{ case.id }}" class="case-link">#{{ case.issue_number }}</a> <span class="issue-title" title="{{ case.issue_title }}">{{ case.issue_title }}</span>
+{%- endmacro %}
+
+{% macro ext(url, text=None) -%}
+{% if url %}<a href="{{ url }}" rel="noopener" class="ext">{{ text or url }}</a>{% else %}<span class="muted">-</span>{% endif %}
+{%- endmacro %}
+
+{% macro session_link(session_id, session_url, length=18) -%}
+{% if session_id %}{% if session_url %}<a href="{{ session_url }}" rel="noopener" class="mono ext" title="{{ session_id }}">{{ short(session_id, length) }}</a>{% else %}<span class="mono" title="{{ session_id }}">{{ short(session_id, length) }}</span>{% endif %}{% else %}<span class="muted">-</span>{% endif %}
+{%- endmacro %}
+
+{% macro sha(value, length=12) -%}
+{% if value %}<code title="{{ value }}">{{ value[:length] }}</code>{% else %}<span class="muted">-</span>{% endif %}
+{%- endmacro %}
+
+{% macro kv(label, value) -%}
+<dt>{{ label }}</dt><dd>{{ value }}</dd>
+{%- endmacro %}
+
+{% macro acu(attempt) -%}
+{% if attempt.devin_acus_consumed is not none or attempt.max_acu_limit %}<span class="nowrap" title="ACUs consumed / limit">{{ attempt.devin_acus_consumed if attempt.devin_acus_consumed is not none else "?" }} / {{ attempt.max_acu_limit or "?" }} ACU</span>{% else %}<span class="muted">-</span>{% endif %}
+{%- endmacro %}
+
+{% macro empty(text="None") -%}
+<p class="empty">{{ text }}</p>
+{%- endmacro %}
+
+{% macro panel_head(title, count=None, id=None) -%}
+<header class="panel-head"><h2{% if id %} id="{{ id }}"{% endif %}>{{ title }}</h2>{% if count is not none %}<span class="count">{{ count }}</span>{% endif %}</header>
+{%- endmacro %}
