@@ -40,11 +40,49 @@ services:
     env_file: .env
     environment:
       DATABASE_URL: postgresql+asyncpg://remediator:remediator@db:5432/remediator
+      PROBE_VERIFIER_URL: http://verifier:8080
     command: python -m remediator.worker
     stop_grace_period: 40s
     depends_on:
       migrate:
         condition: service_completed_successfully
+      verifier:
+        condition: service_healthy
+    networks: [default, verifier]
+    restart: unless-stopped
+  # Credential-free probe verifier: the only process that executes repository code.
+  # No env_file, no secrets, dedicated UID, read-only root, bounded tmpfs workspace,
+  # no capabilities, PID and memory limits. Reachable only from the worker over the
+  # `verifier` network; its own egress (git clone over https) should be restricted to the
+  # allowlisted forge by the host firewall / egress proxy in production.
+  verifier:
+    build:
+      context: .
+      dockerfile: docker/verifier/Dockerfile
+    environment:
+      VERIFIER_CLONE_URL_FORMAT: https://github.com/{repository}.git
+      VERIFIER_MAX_TIMEOUT_SECONDS: "3600"
+      VERIFIER_MAX_PROCESSES: "256"
+      VERIFIER_MAX_FILE_SIZE_BYTES: "536870912"
+    user: "65534:65534"
+    read_only: true
+    tmpfs:
+      - /tmp:size=4g,mode=1777,uid=65534,gid=65534
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 512
+    mem_limit: 4g
+    memswap_limit: 4g
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3).status == 200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    networks: [verifier]
     restart: unless-stopped
 volumes:
   postgres-data:
+
+networks:
+  default: {}
+  verifier: {}

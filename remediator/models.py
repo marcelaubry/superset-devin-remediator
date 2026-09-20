@@ -245,11 +245,24 @@ class Attempt(Base):
             postgresql_where=text("finished_at IS NULL"),
         ),
         Index("ix_attempts_devin_session_id", "devin_session_id"),
+        Index(
+            "uq_attempts_case_kind_ordinal",
+            "case_id",
+            "kind",
+            "ordinal",
+            unique=True,
+            postgresql_where=text("ordinal IS NOT NULL"),
+        ),
     )
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     case_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("cases.id", ondelete="CASCADE"))
     kind: Mapped[AttemptKind] = mapped_column(Enum(AttemptKind, name="attempt_kind"))
+    # 1-based per (case, kind); allocated under a case row lock (DevinRunner._create) and
+    # backed by the partial unique index above. Legacy rows may be NULL.
+    ordinal: Mapped[int | None] = mapped_column(Integer)
     idempotency_key: Mapped[str] = mapped_column(String(255), unique=True)
+    # Full operation identity (case, phase, complete triage-result hash, complete base SHA,
+    # ordinal); also the exact Devin session tag. Never truncated.
     operation_key: Mapped[str] = mapped_column(String(255), unique=True)
     create_state: Mapped[CreateState] = mapped_column(
         Enum(CreateState, name="create_state"), default=CreateState.PENDING

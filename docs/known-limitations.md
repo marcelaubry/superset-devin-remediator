@@ -1,52 +1,56 @@
 # Known limitations (after Phase 4)
 
-## Independent probe execution inside the worker container is not safe
+## Probe execution boundary: the verifier container
 
-The Phase 4 verifier (`LocalProbeRunner`) is complete: isolated checkout of the
-exact SHA, snapshotted script only, fixed argv, minimal environment, timeout,
-output caps, process-group kill, cleanup, and "missing dependency = failure".
-It is nevertheless **not enabled for production** because the only container
-that could host it today is the worker, and the worker holds the Devin API
-key, GitHub token, Slack token/signing secret, operator token and database
-URL.
+The worker holds the Devin API key, GitHub token, Slack token/signing secret,
+operator token and database URL, so it **never executes repository code**:
+there is no worker-side `local` probe mode, only `fake` (simulation) and
+`remote`. Repository code runs in the dedicated `verifier` service
+(`docker/verifier/Dockerfile`, `remediator.verifier`): no `env_file`, no
+import of `remediator.config` (so no `.env` is ever read), dedicated non-root
+UID, read-only root filesystem, bounded `/tmp` tmpfs, `cap_drop: ALL`,
+`no-new-privileges`, PID/memory limits, isolated network. The worker checks
+`GET /health` before every probe and refuses a verifier that can see any
+credential, runs as root or has a writable root.
 
-Scrubbing the child's environment does not make that safe:
+What is still a limitation:
 
-- the probe runs the checked-out commit's own tooling (pytest plugins,
-  `conftest.py`, `setup.py`, npm scripts) as the same UID as the worker, so it
-  can read `/proc/<worker-pid>/environ`, the worker's `.env` mount, or any
-  file the worker can;
-- it shares the worker's network namespace, so it can reach PostgreSQL (state
-  tampering), the Devin API, and the operator API with credentials it finds;
-- Docker secrets (`/run/secrets`) or a mounted Docker socket would be visible
-  to it directly.
-
-Because of this the runner refuses to start when any credential-shaped
-variable or secret path is visible to the hosting process, and `Settings`
-refuses `DEVIN_CLIENT_MODE=live` unless
-`PROBE_VERIFIER_ISOLATION=credential_free_container` is set. That flag is an
-operator attestation, not a runtime guarantee; setting it while running probes
-inside the worker re-creates the exposure described above.
-
-**Phase 5 production path:** a dedicated `verifier` service in the compose
-stack with no secrets in its environment, a read-only image containing only
-`git`, `bash` and the runtimes probes may declare, egress restricted to
-anonymous `https://github.com` clones, no access to the application database
-credentials, that consumes probe run requests (snapshot id, target, SHA) via a
-narrow queue table or API and returns exit code, duration and bounded output
-into `probe_executions`. The worker then never executes repository code at all.
-Until that exists, live-mode remediation cannot start, by design.
+- **Egress is documented, not enforced, by compose.** The verifier network has
+  no route to PostgreSQL or the worker, but Docker's default bridge still allows
+  outbound internet (needed for the anonymous `https://github.com` clone).
+  Production should pin egress to GitHub with a network policy / egress proxy;
+  a malicious probe can otherwise exfiltrate the repository contents it already
+  has (it has no credentials to exfiltrate).
+- **Containment is per container, not per probe.** Descendants that both
+  clear their environment (dropping the run marker) and `setsid` out of the
+  process group survive until the container's `pids_limit`/restart. One probe
+  run at a time per verifier is the intended deployment; a compromised probe
+  can interfere with a concurrent one in the same container.
+- `RLIMIT_NPROC` is per UID, so it is only meaningful because the verifier UID
+  runs nothing else. `RLIMIT_AS` is off by default (`VERIFIER_MAX_MEMORY_BYTES`)
+  because Node/JVM toolchains reserve large address spaces; the container
+  `mem_limit` is the effective memory bound.
+- The verifier is reached over plain HTTP on an internal network. Nothing
+  secret crosses it (the probe script is public repository content and the
+  result is evidence, not authority), but an attacker on that network could
+  feed the worker false verdicts. Production should authenticate the link
+  (mTLS or a shared-nothing sidecar).
 
 ## Probe runtime availability
 
-- The local runner clones anonymously over HTTPS; private forks or GitHub
+- The verifier clones anonymously over HTTPS; private forks or GitHub
   outages surface as `PROBE_INFRASTRUCTURE_BLOCKED` / infrastructure failure,
   never as a pass.
-- The remediator image (`python:3.11-slim`) does not contain the Superset
-  toolchain. Probes whose `runtime.tools` are absent are infrastructure
-  failures. Real Superset probes need the verifier image above.
-- Probe timeouts are capped by `PROBE_TIMEOUT_SECONDS`; a test suite slower
-  than that cannot be used as a probe.
+- The verifier image ships `git`, `bash`, `python3`, `node`, `npm` and `yarn`,
+  so Node-based probes (`runtime.tools: [node, npm]`) are supported there. The
+  worker image contains none of this and cannot run probes at all. Probes
+  whose `runtime.tools` are absent from the verifier are infrastructure
+  failures, never a pass. The full Superset toolchain (Python deps, a browser)
+  is still not preinstalled; a probe must install what it needs inside its own
+  timeout or the verifier image must be extended.
+- Probe timeouts are capped by `PROBE_TIMEOUT_SECONDS` and, independently, by
+  the verifier's `VERIFIER_MAX_TIMEOUT_SECONDS`; a test suite slower than that
+  cannot be used as a probe.
 
 ## Remediation flow
 

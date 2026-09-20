@@ -51,17 +51,15 @@ class Settings(BaseSettings):
     devin_remediation_max_acu: int = 15
     devin_remediation_timeout_seconds: float = 5400.0
     devin_remediation_branch_prefix: str = "devin/"
-    probe_runner_mode: Literal["fake", "local"] = "fake"
-    # "none": the local runner executes inside this (credential-bearing) process and will
-    # refuse every probe as an infrastructure failure; live mode rejects it outright.
-    # "credential_free_container": the operator attests the worker that runs probes holds no
-    # Devin/GitHub/Slack/operator/database secrets (Phase 5 verifier container). The runner
-    # still verifies that claim against its own environment before spawning anything.
-    probe_verifier_isolation: Literal["none", "credential_free_container"] = "none"
+    # The worker never runs repository code itself: "fake" is deterministic simulation data,
+    # "remote" delegates to the credential-free verifier container (remediator.verifier) and
+    # refuses to trust a verifier that can see any credential. There is no "local" mode here
+    # because this process always holds at least the database credential.
+    probe_runner_mode: Literal["fake", "remote"] = "fake"
+    probe_verifier_url: str | None = None
     probe_root: str = "probes"
     probe_timeout_seconds: int = 900
     probe_max_output_bytes: int = 65536
-    probe_clone_url_format: str = "https://github.com/{repository}.git"
     ci_poll_interval_seconds: float = 60.0
     ci_timeout_seconds: float = 4 * 3600.0
     github_pr_author_logins: str = DEFAULT_PR_AUTHOR_LOGINS
@@ -188,10 +186,10 @@ class Settings(BaseSettings):
             raise ValueError("PROBE_ROOT must not be empty")
         if not self.pr_author_logins:
             raise ValueError("GITHUB_PR_AUTHOR_LOGINS must name the expected integration identity")
-        if "{repository}" not in self.probe_clone_url_format or not (
-            self.probe_clone_url_format.startswith("https://")
+        if self.probe_runner_mode == "remote" and not (self.probe_verifier_url or "").startswith(
+            ("http://", "https://")
         ):
-            raise ValueError("PROBE_CLONE_URL_FORMAT must be an https template with {repository}")
+            raise ValueError("PROBE_RUNNER_MODE=remote requires PROBE_VERIFIER_URL (http(s) URL)")
         if not self.allowed_repositories:
             raise ValueError("GITHUB_REPOSITORY must name at least one allowlisted repository")
         if self.slack_live:
@@ -264,17 +262,12 @@ class Settings(BaseSettings):
                 "DEVIN_REMEDIATION_TIMEOUT_SECONDS must be at least "
                 f"{MIN_LIVE_REMEDIATION_TIMEOUT_SECONDS:.0f} in live mode"
             )
-        if self.probe_runner_mode != "local":
+        if self.probe_runner_mode != "remote":
             raise ValueError(
-                "DEVIN_CLIENT_MODE=live requires PROBE_RUNNER_MODE=local; the fake probe runner "
-                "is not independent evidence"
-            )
-        if self.probe_verifier_isolation != "credential_free_container":
-            raise ValueError(
-                "DEVIN_CLIENT_MODE=live requires "
-                "PROBE_VERIFIER_ISOLATION=credential_free_container; probes run repository "
-                "code and must never execute inside a process that holds Devin, GitHub, Slack, "
-                "operator or database credentials (see docs/threat-model.md)"
+                "DEVIN_CLIENT_MODE=live requires PROBE_RUNNER_MODE=remote; the fake probe runner "
+                "is not independent evidence and probes must never execute inside a process "
+                "that holds Devin, GitHub, Slack, operator or database credentials "
+                "(see docs/threat-model.md)"
             )
         if not self.probe_root_path.is_dir():
             raise ValueError(

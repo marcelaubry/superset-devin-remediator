@@ -100,11 +100,27 @@ uses the snapshot, and the PR validator rejects PRs that touch `probes/`.
 | `PROBE_RUNNER_MODE` | Behaviour |
 | --- | --- |
 | `fake` (default) | No execution. Exit codes are chosen from the fixture issue number (`remediator/fixtures.py`); used by tests and simulations. |
-| `local` | `git init` + `fetch --depth 1 origin <sha>` + detached checkout in a temp directory, then `bash <snapshotted script>` with a minimal environment, `min(manifest.timeout, PROBE_TIMEOUT_SECONDS)`, per-stream output caps, process-group kill on timeout, and workspace cleanup. Missing `git`/`bash`/declared tools are reported as an infrastructure failure, never as a pass. |
+| `remote` | The worker forwards the snapshotted `ProbeRunSpec` to the credential-free **verifier container** (`POST /probe` on `PROBE_VERIFIER_URL`) after checking `GET /health`. A verifier that can see any credential-shaped variable or secret path, runs as UID 0, has a writable root or speaks another protocol version is refused as an infrastructure failure. The result's `command_identity` must match what was requested. |
 
-The local runner refuses to start when the hosting process can see any
+There is deliberately **no worker-side `local` mode**: the worker holds every
+application credential and a scrubbed child environment is not a security
+boundary (see [threat-model.md](threat-model.md)). Inside the verifier the
+`LocalProbeRunner` does `git init` + `fetch --depth 1 origin <sha>` + detached
+checkout in a temp directory, then `bash <snapshotted script>` with a minimal
+environment, `min(manifest.timeout, PROBE_TIMEOUT_SECONDS,
+VERIFIER_MAX_TIMEOUT_SECONDS)` covering process exit (not just output), rlimits
+(`VERIFIER_MAX_PROCESSES`, `VERIFIER_MAX_FILE_SIZE_BYTES`, optional
+`VERIFIER_MAX_MEMORY_BYTES`), per-stream output caps, process-group kill plus a
+marker sweep that also kills `setsid`-detached descendants, and workspace
+cleanup. Missing `git`/`bash`/declared tools are an infrastructure failure,
+never a pass. The verifier image ships `git`, `bash`, `python3`, `node`, `npm`
+and `yarn`; declare what the script needs in `runtime.tools`.
+
+The verifier's runner also refuses to start when *its own* process can see any
 credential-shaped environment variable (`DEVIN_API_KEY`, `GITHUB_TOKEN`,
 `SLACK_*`, `OPERATOR_TOKEN`, `DATABASE_URL`, anything ending in `_TOKEN`,
-`_SECRET`, `_API_KEY`, `_PASSWORD`, `_PRIVATE_KEY`) or `/run/secrets` /
-`/var/run/docker.sock`. That is deliberate: see
-[known-limitations.md](known-limitations.md) for the verifier-container plan.
+`_SECRET`, `_API_KEY`, `_PASSWORD`, `_PRIVATE_KEY`), a `.env` file,
+`/run/secrets` or `/var/run/docker.sock`; that state is also reported on
+`/health` so the worker never trusts such a verifier. Run it locally with
+`docker compose up verifier` or `python -m remediator.verifier` from a shell
+with no secrets exported.

@@ -122,14 +122,22 @@ spend zero ACUs.
   pending/passed/failed/cancelled/skipped/timed-out are distinguished, absent
   checks never pass, `GITHUB_REQUIRED_CHECKS` names the required ones.
   `CI_PASSED` still requires human PR review; nothing merges or closes.
-- Probe subprocesses are the only place repository code executes. The
-  `LocalProbeRunner` clones the exact commit into a temp dir, runs the
-  snapshotted script with `create_subprocess_exec` (no shell interpolation),
-  a minimal environment, timeout and output caps, and refuses to start when the
-  hosting process can see any credential. Live Devin mode therefore requires
-  `PROBE_RUNNER_MODE=local` **and** `PROBE_VERIFIER_ISOLATION=credential_free_container`;
-  see [docs/probes.md](docs/probes.md) and
-  [docs/known-limitations.md](docs/known-limitations.md).
+- Repository code executes in exactly one place: the **verifier container**
+  (`docker/verifier/Dockerfile`, `remediator.verifier`). It holds no
+  application credential (no `env_file`, never imports `remediator.config`),
+  runs as a dedicated non-root UID on a read-only root filesystem with a bounded
+  `/tmp`, `cap_drop: ALL`, `no-new-privileges`, PID/memory limits and its own
+  network, and ships git/bash/python3/node/npm/yarn for probe runtimes. The
+  worker only ever uses `PROBE_RUNNER_MODE=fake` (simulation) or `remote`, and
+  before each probe checks the verifier's `/health`: any visible credential,
+  UID 0 or a writable root makes the run an *infrastructure* failure, never a
+  verdict. There is no worker-side `local` mode. Inside the verifier the runner
+  clones the exact commit, runs the snapshotted script with
+  `create_subprocess_exec` (no shell), a minimal environment, rlimits, a deadline
+  that covers process exit (not just output), and kills every descendant carrying
+  the run marker (including `setsid` escapees) before removing the workspace.
+  See [docs/probes.md](docs/probes.md), [docs/threat-model.md](docs/threat-model.md)
+  and [docs/known-limitations.md](docs/known-limitations.md).
 - Slack updates for every milestone (queued/running, session link, PR found,
   probe base/head, CI state, failure/blocked reason, "Ready for human review")
   go through the same outbox and never change remediation state.
@@ -234,7 +242,7 @@ failed termination, concurrent retries, and worker restart in every state.
 | `GITHUB_ALLOWED_ACTIONS` | `opened,labeled` | Comma-separated action allowlist |
 | `GITHUB_REQUIRED_LABEL` | *(empty)* | Optional opt-in intake label; empty (default) evaluates every opened issue |
 | `WORKER_POLL_INTERVAL_SECONDS` | `1.0` | Worker idle poll interval |
-| `WORKER_CONCURRENCY` | `2` | Concurrent worker loops |
+| `WORKER_CONCURRENCY` | `2` | Concurrent worker loops. Safe at 2+: case processor and outbox dispatcher share one lock order (case → approval request → outbox row, all `FOR NO KEY UPDATE`), and a deadlock/serialization failure releases the lease for retry instead of failing the case |
 | `WORKER_LEASE_SECONDS` | `300` | Case and webhook ownership lease |
 | `WORKER_SHUTDOWN_TIMEOUT_SECONDS` | `30` | Maximum in-flight drain time |
 | `EVENT_MAX_ATTEMPTS` | `3` | Event reclaim limit |
@@ -254,12 +262,12 @@ failed termination, concurrent retries, and worker restart in every state.
 | `DEVIN_REMEDIATION_MAX_ACU` | `15` | `max_acu_limit` sent on every remediation session |
 | `DEVIN_REMEDIATION_TIMEOUT_SECONDS` | `5400` | Absolute remediation deadline; final GET then `DELETE`; live mode enforces `>= 600` |
 | `DEVIN_REMEDIATION_BRANCH_PREFIX` | `devin/` | Required prefix of the PR head branch |
-| `PROBE_RUNNER_MODE` | `fake` | `fake` (deterministic by issue number) or `local` (isolated clone + subprocess) |
-| `PROBE_VERIFIER_ISOLATION` | `none` | `credential_free_container` attests the worker holds no secrets; required with live Devin; the local runner re-checks its environment regardless |
+| `PROBE_RUNNER_MODE` | `fake` | `fake` (deterministic by issue number) or `remote` (credential-free verifier container); the worker has no `local` mode |
+| `PROBE_VERIFIER_URL` | *(unset)* | Verifier base URL, required with `remote`; the worker refuses a verifier whose `/health` shows credentials, UID 0 or a writable root |
 | `PROBE_ROOT` | `probes` | Immutable probe registry root; must exist in live mode |
 | `PROBE_TIMEOUT_SECONDS` | `900` | Upper bound for one probe run (manifest may be shorter) |
 | `PROBE_MAX_OUTPUT_BYTES` | `65536` | Per-stream stdout/stderr capture cap |
-| `PROBE_CLONE_URL_FORMAT` | `https://github.com/{repository}.git` | Anonymous HTTPS clone template used by the local runner (no token) |
+| `VERIFIER_*` | see `docker-compose.yml` | Verifier-container-only knobs (`VERIFIER_CLONE_URL_FORMAT`, `VERIFIER_MAX_TIMEOUT_SECONDS`, `VERIFIER_MAX_PROCESSES`, `VERIFIER_MAX_FILE_SIZE_BYTES`, `VERIFIER_MAX_MEMORY_BYTES`); read from plain environment, never from `.env` |
 | `CI_POLL_INTERVAL_SECONDS` | `60` | Check-run poll interval; live mode enforces `>= 30` |
 | `CI_TIMEOUT_SECONDS` | `14400` | After this `CI_PENDING` becomes `CI_FAILED` (`timed_out`) |
 | `GITHUB_PR_AUTHOR_LOGINS` | `devin-ai-integration[bot]` | Accepted PR author identities |
@@ -295,11 +303,12 @@ shorter than 16 characters. `SLACK_CLIENT_MODE=live` additionally requires a
 non-placeholder `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, `SLACK_CHANNEL_ID`,
 at least one approver, and an HTTPS API URL; `GITHUB_CLIENT_MODE=live`
 requires `GITHUB_TOKEN` and an HTTPS API URL. `DEVIN_CLIENT_MODE=live`
-additionally requires `GITHUB_CLIENT_MODE=live`, `PROBE_RUNNER_MODE=local`,
-`PROBE_VERIFIER_ISOLATION=credential_free_container`, an existing
-`PROBE_ROOT`, a remediation timeout `>= 600`, and a CI poll interval `>= 30`,
-so a real session can never be verified by fake evidence or by a probe running
-next to the credentials.
+additionally requires `GITHUB_CLIENT_MODE=live`, `PROBE_RUNNER_MODE=remote`
+with a `PROBE_VERIFIER_URL`, an existing `PROBE_ROOT`, a remediation timeout
+`>= 600`, and a CI poll interval `>= 30`, so a real session can never be
+verified by fake evidence or by a probe running next to the credentials. The
+setting alone is not trusted: the worker re-checks the verifier's `/health`
+before every single probe.
 
 A live session is never left without a local owner: worker errors, operator
 cancel (including mid-poll), and retries all go through `TERMINATION_PENDING`
@@ -359,8 +368,20 @@ The worker's Docker `stop_grace_period` must exceed
 ### GitHub setup (live)
 
 For this take-home a **fine-grained personal access token** scoped to the
-Superset fork only, with *Issues: read/write* and *Metadata: read*, is
-sufficient (`GITHUB_TOKEN`). For production prefer a **GitHub App** with
+Superset fork only (`GITHUB_TOKEN`) with these repository permissions is
+sufficient:
+
+| Permission | Access | Used for |
+|---|---|---|
+| Issues | read/write | audit comment, `devin:remediate` label, issue read-back |
+| Metadata | read | required by GitHub for any fine-grained token |
+| Pull requests | read | PR validation (`GET /pulls/{n}`, `/files`), timeline cross-references |
+| Contents | read | `GET /commits/{ref}` (base SHA pinning) and `compare/{base}...{head}` |
+| Checks | read | check runs for the exact head SHA (`CI_PENDING`/`CI_PASSED`/`CI_FAILED`) |
+
+No `Contents: write`, `Workflows`, `Administration` or merge permission is
+needed: the remediator never pushes, merges or closes anything (Devin's own
+GitHub integration opens the PR). For production prefer a **GitHub App** with
 short-lived installation tokens: the App identity shows up in the audit
 comment, tokens expire hourly, and permissions are granted per installation
 rather than per user. The client refuses any repository outside
@@ -457,5 +478,5 @@ never trusts Devin-reported probe results. See
 lifecycle semantics, and status mapping;
 [docs/threat-model.md](docs/threat-model.md) for the spend, secret, and probe
 isolation boundaries; and [docs/known-limitations.md](docs/known-limitations.md)
-for what remains for Phase 5 (notably the credential-free verifier container
-that production probe execution requires).
+for what remains for Phase 5 (notably enforced egress control and
+authentication for the verifier link).

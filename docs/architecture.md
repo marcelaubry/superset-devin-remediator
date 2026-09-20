@@ -37,9 +37,15 @@
   issue, 40-hex base SHA, exit codes, timeout, runtime tools, script SHA-256
   recomputed and compared), records the registry commit, and exposes a
   `ProbeRunner` protocol. `FakeProbeRunner` is deterministic by issue number;
-  `LocalProbeRunner` clones the exact commit into a temp workspace and runs the
-  snapshotted script under timeout/output caps with no shell interpolation and
-  no credentials, refusing to start inside a credential-bearing process.
+  `RemoteProbeRunner` forwards the spec to the verifier container after
+  checking its `/health` (no credentials visible, non-root, read-only root).
+- **Verifier service (`remediator/verifier`, `docker/verifier/Dockerfile`):**
+  the only process that executes repository code. Separate container with no
+  secrets, no import of `remediator.config`, dedicated UID, read-only root,
+  bounded tmpfs, dropped capabilities, PID/memory limits and its own network.
+  `LocalProbeRunner` lives here: exact-commit clone into a temp workspace,
+  snapshotted script with fixed argv and minimal environment, deadline covering
+  process exit, rlimits, marker-based descendant kill, workspace cleanup.
 - **Slack adapter (`remediator/slack`):** request signature verification
   (`v0:{ts}:{raw body}` HMAC-SHA256, replay window, constant-time compare),
   a Block Kit builder that escapes untrusted text and enforces Slack limits,
@@ -602,18 +608,24 @@ the Devin client closes and the database engine is disposed.
 - Probe scripts are the only repository code the service ever executes. They
   come exclusively from the immutable registry snapshot taken at dispatch —
   never from issue text, Slack, Devin output, or the remediation branch. The
-  local runner uses `create_subprocess_exec` with a fixed argv, a minimal
-  environment (`PATH`, `HOME`, `LANG`, `CI=1`, non-interactive git), an
-  anonymous HTTPS clone of the exact commit, `start_new_session` so the whole
-  process group is killed on timeout, bounded captures, and `tempfile`
-  cleanup. It refuses to run at all if the hosting process can see any
-  credential-shaped variable or mounted secret file; live Devin mode requires
-  the operator to attest a credential-free verifier boundary
-  (`PROBE_VERIFIER_ISOLATION=credential_free_container`). See
-  [known-limitations.md](known-limitations.md) for why a scrubbed child
-  environment alone is insufficient.
-- Live Devin mode also requires live GitHub and the local probe runner, so a
-  real session can never be verified by fake adapters.
+  worker never executes it: `PROBE_RUNNER_MODE` is `fake` or `remote`, and the
+  remote runner refuses any verifier whose `/health` shows a credential, UID 0
+  or a writable root. Inside the verifier, `create_subprocess_exec` with a
+  fixed argv, a minimal environment (`PATH`, `HOME`, `LANG`, `CI=1`,
+  non-interactive git, a per-run marker), an anonymous HTTPS clone of the exact
+  commit, `start_new_session`, rlimits, a deadline that includes `proc.wait()`,
+  `killpg` plus a `/proc` marker sweep for detached descendants, bounded
+  captures, and `tempfile` cleanup. See [threat-model.md](threat-model.md) and
+  [known-limitations.md](known-limitations.md).
+- Live Devin mode also requires live GitHub and the remote probe runner, so a
+  real session can never be verified by fake adapters or by a probe next to
+  the credentials.
+- Worker loops (`WORKER_CONCURRENCY`, default 2) share one lock order: case →
+  approval request → outbox row, all `FOR NO KEY UPDATE`. Deadlock,
+  serialization and connection errors are transient: rollback, release the
+  lease, retry; never a case verdict. Attempt ordinals are allocated under the
+  case row lock and enforced by a partial unique index; the operation key /
+  Devin tag embeds the full triage hash and base SHA.
 
 ## API assumptions verified against current documentation
 
@@ -651,12 +663,10 @@ the Devin client closes and the database engine is disposed.
 
 ## Deferred to Phase 5
 
-- **Credential-free verifier container:** the production path for local probe
-  execution. The worker container holds Devin/GitHub/Slack/operator/database
-  credentials, so `LocalProbeRunner` refuses to run there; Phase 5 adds a
-  separate `verifier` service (no secrets, network limited to anonymous GitHub
-  clone) that consumes probe run requests from PostgreSQL and writes
-  `probe_executions`.
+- **Verifier hardening:** the credential-free `verifier` container exists;
+  still to do are enforced egress (only anonymous GitHub clones), an
+  authenticated worker↔verifier link (mTLS), and one-probe-per-container
+  scheduling so probes cannot interfere with each other.
 - **GitHub App identity:** replace the PAT with an installation token and pin
   `GITHUB_PR_AUTHOR_LOGINS` to the app's bot login.
 - **CI webhook ingestion:** advance `CI_PENDING` from `check_suite` /

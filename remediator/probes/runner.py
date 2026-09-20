@@ -5,35 +5,52 @@ exit code plus bounded output. It never derives anything from the remediation br
 issue text or Devin's output; the only inputs are the snapshot taken at dispatch and the
 commit SHA under test.
 
-Two implementations exist:
+Three implementations exist:
 
 * `FakeProbeRunner` - deterministic, keyed by the shared fixture table. Used by tests and
   fake-mode simulations. It is *not* evidence and live mode refuses to use it.
 * `LocalProbeRunner` - fetches the exact commit into a throw-away workspace, writes the
   snapshot script there and runs it with `bash` via `create_subprocess_exec` (argv only, no
-  shell interpolation) under a minimal environment, with wall-clock and output limits.
-  Missing tools, fetch failures or workspace errors surface as *infrastructure* failures,
-  which the pipeline never mistakes for a passing probe.
+  shell interpolation) under a minimal environment, with wall-clock, output and resource
+  limits. Missing tools, fetch failures or workspace errors surface as *infrastructure*
+  failures, which the pipeline never mistakes for a passing probe. It is what the dedicated
+  verifier container runs (`remediator.verifier`); the worker never instantiates it.
+* `RemoteProbeRunner` (`remediator.probes.remote`) - what the worker uses: it forwards the
+  spec to the verifier container and refuses to trust a verifier that reports a credential
+  in its own environment.
 
 Credential boundary
 -------------------
 A scrubbed child environment is *not* a security boundary: a probe script runs the
 repository's own code, which can read `/proc/<worker-pid>/environ`, the worker's mounted
-secret files, the Docker socket or the local network of whatever process spawned it. If that
-process is the credential-bearing worker (Devin key, GitHub token, Slack tokens, operator
-token, database URL) the probe can exfiltrate them regardless of `env=`. The local runner
-therefore refuses to spawn anything while the *hosting process* can see a credential, and
-`Settings` refuses live mode unless the operator declares a credential-free verifier boundary
-(`PROBE_VERIFIER_ISOLATION=credential_free_container`). The Phase 5 production path is a
-dedicated verifier container that holds no application secrets; see docs/threat-model.md.
+secret files, the Docker socket, `.env` on disk or the local network of whatever process
+spawned it. If that process is the credential-bearing worker (Devin key, GitHub token,
+Slack tokens, operator token, database URL) the probe can exfiltrate them regardless of
+`env=`. `Settings` therefore does not offer a local mode at all: the worker either uses the
+fake runner (simulations) or delegates to the verifier container, which holds no
+application secret, runs as a dedicated UID on a read-only root filesystem and is bounded
+by PID/memory limits (docker-compose.yml, docs/threat-model.md). `credential_exposure` is
+the verifier's own last line of defence and is also reported through its health endpoint.
+
+Process containment
+-------------------
+Every probe child carries a unique `REMEDIATOR_PROBE_RUN` marker in its environment. On
+timeout (and after every run) the runner kills the child's process group *and* every process
+visible in `/proc` that still carries the marker, so descendants that `setsid` away from the
+group cannot outlive the run or race the workspace cleanup. Inside the verifier container
+`/proc` is the container's PID namespace, so that sweep is complete; `pids_limit`,
+memory limits and the tmpfs workspace size bound what a probe can consume in between.
 """
 
 import asyncio
 import os
+import resource
 import shutil
 import signal
 import tempfile
 import time
+import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -43,6 +60,8 @@ from ..models import ProbeTarget
 
 _MINIMAL_PATH = "/usr/local/bin:/usr/bin:/bin"
 _FETCH_TIMEOUT_SECONDS = 600
+_KILL_GRACE_SECONDS = 5
+PROBE_RUN_MARKER = "REMEDIATOR_PROBE_RUN"
 
 # Environment variables whose presence in the *hosting* process proves it is a
 # credential-bearing service. Matched exactly or by suffix so `*_TOKEN`-style secrets
@@ -60,7 +79,7 @@ CREDENTIAL_ENV_NAMES = frozenset(
 )
 CREDENTIAL_ENV_SUFFIXES = ("_TOKEN", "_SECRET", "_API_KEY", "_PASSWORD", "_PRIVATE_KEY")
 # Files whose presence means the process runs inside a credential-bearing deployment.
-CREDENTIAL_PATHS = ("/run/secrets", "/var/run/docker.sock")
+CREDENTIAL_PATHS = ("/run/secrets", "/var/run/docker.sock", ".env")
 
 
 def credential_exposure(
@@ -76,6 +95,34 @@ def credential_exposure(
     )
     found.extend(path for path in paths if Path(path).exists())
     return found
+
+
+@dataclass(frozen=True)
+class ProbeResourceLimits:
+    """Per-process rlimits applied to the probe child (and inherited by its descendants).
+
+    `max_processes` is `RLIMIT_NPROC`, which Linux counts per *UID*; it is only meaningful
+    where the probe UID runs nothing else (the verifier container). `None` leaves a limit
+    untouched.
+    """
+
+    max_processes: int | None = None
+    max_file_size_bytes: int | None = None
+    max_memory_bytes: int | None = None
+
+    def apply(self) -> None:
+        for limit, value in (
+            (resource.RLIMIT_NPROC, self.max_processes),
+            (resource.RLIMIT_FSIZE, self.max_file_size_bytes),
+            (resource.RLIMIT_AS, self.max_memory_bytes),
+        ):
+            if value is not None:
+                resource.setrlimit(limit, (value, value))
+
+    def preexec(self) -> Callable[[], None] | None:
+        if self == ProbeResourceLimits():
+            return None
+        return self.apply
 
 
 @dataclass(frozen=True)
@@ -210,12 +257,16 @@ class LocalProbeRunner:
         *,
         workspace_root: Path | None = None,
         fetch_timeout_seconds: int = _FETCH_TIMEOUT_SECONDS,
+        limits: ProbeResourceLimits | None = None,
+        proc_root: Path = Path("/proc"),
     ) -> None:
         if "{repository}" not in clone_url_format:
             raise ValueError("clone_url_format must contain {repository}")
         self.clone_url_format = clone_url_format
         self.workspace_root = workspace_root
         self.fetch_timeout_seconds = fetch_timeout_seconds
+        self.limits = limits or ProbeResourceLimits()
+        self.proc_root = proc_root
         self.credential_check = credential_exposure
 
     def clone_url(self, repository: str) -> str:
@@ -256,15 +307,22 @@ class LocalProbeRunner:
             script_path = workspace / "probe.sh"
             script_path.write_text(spec.script_content, encoding="utf-8")
             script_path.chmod(0o500)
+            marker = uuid.uuid4().hex
             env.update(
                 {
                     "PROBE_TARGET": spec.target.value,
                     "PROBE_COMMIT": spec.commit_sha,
                     "PROBE_REPOSITORY": spec.repository,
                     "PROBE_IDENTIFIER": spec.probe_identifier,
+                    PROBE_RUN_MARKER: marker,
                 }
             )
-            return await self._execute(identity, started, script_path, repo_dir, spec, env)
+            try:
+                return await self._execute(identity, started, script_path, repo_dir, spec, env)
+            finally:
+                # Nothing spawned by this run may survive it or keep writing into the
+                # workspace we are about to remove.
+                kill_marked_processes(marker, self.proc_root)
         finally:
             shutil.rmtree(workspace, ignore_errors=True)
 
@@ -310,6 +368,7 @@ class LocalProbeRunner:
         spec: ProbeRunSpec,
         env: dict[str, str],
     ) -> ProbeRunResult:
+        marker = env[PROBE_RUN_MARKER]
         try:
             proc = await asyncio.create_subprocess_exec(
                 "bash",
@@ -320,24 +379,28 @@ class LocalProbeRunner:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
+                preexec_fn=self.limits.preexec(),
             )
         except OSError as exc:
             return self._infra(identity, started, f"cannot start probe: {exc}")
         out = _BoundedCapture(spec.max_output_bytes)
         err = _BoundedCapture(spec.max_output_bytes)
-        drain = asyncio.gather(out.drain(proc.stdout), err.drain(proc.stderr))
+        # The deadline covers the child's *exit*, not just its output: a probe that closes
+        # stdout/stderr and keeps running is still killed at `timeout_seconds`.
+        work = asyncio.gather(out.drain(proc.stdout), err.drain(proc.stderr), proc.wait())
         timed_out = False
         try:
-            await asyncio.wait_for(asyncio.shield(drain), timeout=spec.timeout_seconds)
-            await proc.wait()
+            await asyncio.wait_for(asyncio.shield(work), timeout=spec.timeout_seconds)
         except TimeoutError:
             timed_out = True
             _kill_group(proc)
+            kill_marked_processes(marker, self.proc_root)
             await proc.wait()
             try:
-                await asyncio.wait_for(drain, timeout=5)
+                # Pipes may stay open while a killed grandchild is reaped; bound that too.
+                await asyncio.wait_for(work, timeout=_KILL_GRACE_SECONDS)
             except (TimeoutError, asyncio.CancelledError):
-                pass
+                work.cancel()
         duration_ms = int((time.monotonic() - started) * 1000)
         return ProbeRunResult(
             runner_mode=self.mode,
@@ -393,7 +456,41 @@ def _kill_group(proc: asyncio.subprocess.Process) -> None:
             pass
 
 
-def build_probe_runner(mode: str, clone_url_format: str) -> ProbeRunner:
-    if mode == "local":
-        return LocalProbeRunner(clone_url_format)
-    return FakeProbeRunner()
+def marked_pids(marker: str, proc_root: Path = Path("/proc")) -> list[int]:
+    """PIDs whose environment carries `REMEDIATOR_PROBE_RUN=<marker>`, regardless of session
+    or process group. Processes owned by other UIDs are invisible (their environ is
+    unreadable), which is why the verifier runs probes under a dedicated UID."""
+    needle = f"{PROBE_RUN_MARKER}={marker}".encode()
+    found: list[int] = []
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return found
+    for entry in entries:
+        if not entry.name.isdigit() or int(entry.name) == os.getpid():
+            continue
+        try:
+            environ = (entry / "environ").read_bytes()
+        except OSError:
+            continue
+        if needle in environ.split(b"\0"):
+            found.append(int(entry.name))
+    return found
+
+
+def kill_marked_processes(marker: str, proc_root: Path = Path("/proc")) -> int:
+    """SIGKILL every process still carrying the run marker; returns how many were signalled.
+    Repeats until a sweep finds nothing so a forking child cannot outrun it."""
+    killed = 0
+    for _ in range(10):
+        pids = marked_pids(marker, proc_root)
+        if not pids:
+            break
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+                killed += 1
+            except (ProcessLookupError, PermissionError):
+                continue
+        time.sleep(0.05)
+    return killed

@@ -33,7 +33,8 @@ from ..models import (
     Recommendation,
     WebhookEvent,
 )
-from ..probes.runner import ProbeRunner, build_probe_runner
+from ..probes import build_probe_runner
+from ..probes.runner import ProbeRunner
 from ..rubric import IssueSnapshot, evaluate
 from .devin_runner import (
     DevinRunner,
@@ -247,8 +248,7 @@ async def process_case(
             case,
             devin,
             github or build_github_client(settings),
-            probes
-            or build_probe_runner(settings.probe_runner_mode, settings.probe_clone_url_format),
+            probes or build_probe_runner(settings.probe_runner_mode, settings.probe_verifier_url),
             settings,
             resolver,
             claimed_by=claimed_by,

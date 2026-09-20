@@ -189,6 +189,24 @@ async def fail_case(
     session.add(_outbox(case, _outbox_kind(phase, "failed"), reason=reason))
 
 
+async def allocate_attempt_ordinal(session: AsyncSession, case_id: Any, kind: AttemptKind) -> int:
+    """Next 1-based ordinal for (case, kind), allocated under a case row lock so two workers
+    retrying concurrently cannot both compute the same number. FOR NO KEY UPDATE keeps
+    foreign-key inserts referencing the case (outbox rows, probe executions) unblocked; the
+    partial unique index on (case_id, kind, ordinal) and the unique operation_key are the
+    database backstop should the lock ever be bypassed."""
+    await session.execute(select(Case.id).where(Case.id == case_id).with_for_update(key_share=True))
+    highest = await session.scalar(
+        select(func.max(Attempt.ordinal)).where(Attempt.case_id == case_id, Attempt.kind == kind)
+    )
+    count = await session.scalar(
+        select(func.count())
+        .select_from(Attempt)
+        .where(Attempt.case_id == case_id, Attempt.kind == kind)
+    )
+    return max(int(highest or 0), int(count or 0)) + 1
+
+
 class DevinRunner:
     def __init__(
         self,
@@ -274,12 +292,7 @@ class DevinRunner:
 
     async def _create(self, kind: AttemptKind) -> Attempt | RunOutcome:
         case = self.case
-        count = await self.session.scalar(
-            select(func.count())
-            .select_from(Attempt)
-            .where(Attempt.case_id == case.id, Attempt.kind == kind)
-        )
-        ordinal = int(count or 0) + 1
+        ordinal = await allocate_attempt_ordinal(self.session, case.id, kind)
         if ordinal > self.settings.max_attempts_per_kind:
             reason = "attempt cap reached"
             await fail_case(self.session, case, reason, "worker", self.claimed_by)
@@ -313,6 +326,7 @@ class DevinRunner:
         attempt = Attempt(
             case_id=case.id,
             kind=kind,
+            ordinal=ordinal,
             idempotency_key=f"{case.id}:{kind.value}:{ordinal}",
             operation_key=key,
             create_state=CreateState.PENDING,

@@ -375,7 +375,13 @@ class RemediationPipeline:
         except TransientVerificationError as exc:
             logger.warning("case %s: %s; will retry", case.id, exc)
             await self.session.rollback()
-        finally:
+        except BaseException:
+            # The session is unusable after a failed flush/commit (PendingRollbackError on
+            # the next statement); roll it back and let the worker classify the error
+            # instead of masking it with a follow-up notification failure.
+            await self.session.rollback()
+            raise
+        else:
             if CaseState(case.state) != entered or CaseState(case.state) == CaseState.CI_PENDING:
                 await self._notify()
                 await self.session.commit()
