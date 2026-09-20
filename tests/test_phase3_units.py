@@ -515,3 +515,24 @@ async def test_live_slack_retry_after_and_metadata_reconciliation() -> None:
             await client.post_response("https://evil.example/x", "hello")
     finally:
         await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_live_slack_history_missing_scope_is_not_retryable() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("conversations.history")
+        return httpx.Response(
+            200, json={"ok": False, "error": "missing_scope", "needed": "channels:history"}
+        )
+
+    client = LiveSlackClient(
+        "xoxb-" + "k" * 40,
+        base_url="https://slack.test/api",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        with pytest.raises(SlackApiError) as error:
+            await client.find_message("C1", "req-1", oldest=datetime.now(UTC))
+        assert error.value.error == "missing_scope" and error.value.retryable is False
+    finally:
+        await client.aclose()

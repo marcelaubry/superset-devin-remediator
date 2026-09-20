@@ -173,6 +173,16 @@ class Simulator:
             print(f"  opened {repository}#{number}: {response.status_code} {response.json()}")
         else:
             print(f"  {repository}#{number} already exists in state {existing['state']}")
+            approval = existing.get("approval") or {}
+            if existing["state"] != "AWAITING_REMEDIATION_APPROVAL" or approval.get(
+                "decision"
+            ) not in {None, "PENDING"}:
+                raise SimulationError(
+                    f"{repository}#{number} was already decided in an earlier run "
+                    f"(state {existing['state']}, decision {approval.get('decision')}); "
+                    "Phase 3 scenarios exercise the real one-decision-per-case lifecycle, so "
+                    "start from a clean database (`docker compose down -v && docker compose up -d`)"
+                )
         case = self.wait_state(
             repository,
             number,

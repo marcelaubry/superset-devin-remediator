@@ -123,8 +123,11 @@ Design points:
 - **Exactly-once external writes.** Every non-idempotent outbound call is
   bracketed by a committed intent marker: `notification_status=SENDING` +
   token hash before `chat.postMessage` (messages carry
-  `metadata.event_type=remediator_approval_request` and are looked up before a
-  repost), `label_requested_at` before `POST .../labels` (the issue's labels
+  `metadata.event_type=remediator_approval_request` and are looked up through
+  `conversations.history` before a repost — the live bot needs
+  `channels:history`/`groups:history`; if that lookup fails non-retryably, e.g.
+  `missing_scope`, the row fails with the reason and nothing is reposted),
+  `label_requested_at` before `POST .../labels` (the issue's labels
   are re-read before a retry), and `comment_requested_at` before
   `POST .../comments` (comments end with `<!-- remediator:approval:<id> -->`
   / `<!-- remediator:rejection:<id> -->` and are searched before a retry). A
@@ -143,8 +146,15 @@ Design points:
   the delivery is still pending/failed) is audited as
   `label_webhook_unexpected`, leaves the case unchanged, and does not cancel
   the outbox job, which still reconciles the label and posts the audit
-  comment. A `labeled` webhook for a case without a recorded `APPROVED`
-  decision is treated as an ordinary ingest and does not advance the case.
+  comment. GitHub emits the webhook as soon as our label POST lands, which can
+  be before the worker commits `label_applied_at`; GitHub never resends it, so
+  right after that commit the worker replays any already-processed `labeled`
+  delivery for the issue that was processed after `label_requested_at`
+  (`label_webhook_replayed` + `label_confirmed`), and the case reaches
+  `REMEDIATION_APPROVED` without waiting for a webhook that will not come.
+  Deliveries processed before our intent existed are not replayed. A `labeled`
+  webhook for a case without a recorded `APPROVED` decision is treated as an
+  ordinary ingest and does not advance the case.
 - **Failure isolation.** Slack post failures leave the triage result and
   case untouched; after `OUTBOX_MAX_ATTEMPTS` the row is `FAILED` with
   `last_error`. GitHub label failures keep the approval decision and move the

@@ -33,11 +33,13 @@ from .models import (
     AttemptKind,
     Case,
     DeliveryStatus,
+    EventStatus,
     NotificationOutbox,
     NotificationStatus,
     OutboxChannel,
     OutboxStatus,
     SlackAction,
+    WebhookEvent,
 )
 from .slack.blocks import ACTION_APPROVE, ACTION_REJECT
 
@@ -554,6 +556,74 @@ async def confirm_label_webhook(
         return False
     _enqueue_status_update(session, request)
     return True
+
+
+def issue_label_names(issue: Any) -> tuple[str, ...] | None:
+    """Label names from a webhook's issue snapshot; None when the payload has none."""
+    if not isinstance(issue, dict) or not isinstance(issue.get("labels"), list):
+        return None
+    return tuple(
+        str(label.get("name", ""))
+        for label in issue["labels"]
+        if isinstance(label, dict) and label.get("name")
+    )
+
+
+def is_remediation_label_event(event: WebhookEvent, label: str) -> bool:
+    if event.event_type != "issues" or event.action != "labeled":
+        return False
+    payload_label = event.payload.get("label", {})
+    name = str(payload_label.get("name", "")) if isinstance(payload_label, dict) else ""
+    return name.lower() == label.lower()
+
+
+async def replay_label_webhooks_after_delivery(
+    session: AsyncSession, case: Case, request: ApprovalRequest, label: str
+) -> bool:
+    """Confirm `labeled` deliveries that GitHub sent while our label write was in flight.
+
+    GitHub fires the webhook as soon as the label POST lands, which can be before the worker
+    commits `label_applied_at`; such a delivery is processed as `label_webhook_unexpected`
+    and GitHub never resends it. Called right after `label_applied_at` is committed, this
+    re-runs the confirmation for deliveries of this case that were processed after the label
+    was requested, so the case cannot wedge in AWAITING_REMEDIATION_APPROVAL. Deliveries
+    processed before our intent existed (someone else labelled the issue) are not replayed.
+    """
+    if request.label_requested_at is None or request.label_applied_at is None:
+        return False
+    events = await session.scalars(
+        select(WebhookEvent)
+        .where(
+            WebhookEvent.repository == case.repository,
+            WebhookEvent.event_type == "issues",
+            WebhookEvent.action == "labeled",
+            WebhookEvent.status == EventStatus.PROCESSED,
+            WebhookEvent.processed_at >= request.label_requested_at,
+            WebhookEvent.payload["issue"]["number"].as_integer() == case.issue_number,
+        )
+        .order_by(WebhookEvent.received_at)
+    )
+    for event in events:
+        if not is_remediation_label_event(event, label):
+            continue
+        if await confirm_label_webhook(
+            session,
+            case,
+            label,
+            event.delivery_id,
+            issue_labels=issue_label_names(event.payload.get("issue")),
+        ):
+            event.case_id = case.id
+            event.last_error = None
+            record_event(
+                session,
+                request,
+                "label_webhook_replayed",
+                "worker",
+                f"delivery {event.delivery_id} had arrived before our label commit; confirmed",
+            )
+            return True
+    return False
 
 
 async def expire_request(session: AsyncSession, request: ApprovalRequest, actor: str) -> bool:

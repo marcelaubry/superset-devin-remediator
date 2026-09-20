@@ -941,6 +941,65 @@ async def test_early_signed_label_webhook_does_not_advance_before_our_delivery(
 
 
 @pytest.mark.asyncio
+async def test_label_webhook_inside_post_to_commit_window_still_confirms(
+    harness: Harness,
+) -> None:
+    """GitHub fires `labeled` as soon as our POST lands, possibly before the worker commits
+    `label_applied_at`. That delivery is never resent, so it must still confirm the case."""
+    case, request, _ = await harness.notify_and_approve()
+    original_label = harness.github.add_label
+
+    async def label_then_webhook(*args: Any, **kwargs: Any) -> Any:
+        result = await original_label(*args, **kwargs)
+        response = await harness.label_webhook(4213, delivery="in-window")
+        assert response.status_code in {200, 202}
+        async with harness.factory() as session:
+            event = await session.scalar(
+                select(WebhookEvent).where(WebhookEvent.delivery_id == "in-window")
+            )
+            assert event is not None
+            await process_event(session, event, harness.devin, harness.settings)
+        # Processed while our delivery was in flight: recorded, not confirmed.
+        assert (await harness.case(case.id)).state == CaseState.AWAITING_REMEDIATION_APPROVAL
+        assert "label_webhook_unexpected" in await harness.events(request.id)
+        return result
+
+    harness.github.add_label = label_then_webhook  # type: ignore[method-assign]
+    await harness.drain()
+    harness.github.add_label = original_label  # type: ignore[method-assign]
+
+    assert (await harness.case(case.id)).state == CaseState.REMEDIATION_APPROVED
+    request = await harness.approval(case.id)
+    assert request.delivery_status == DeliveryStatus.CONFIRMED
+    assert request.label_confirmed_at is not None
+    assert request.github_comment_id is not None
+    events = await harness.events(request.id)
+    assert "label_webhook_replayed" in events and events.count("label_confirmed") == 1
+    assert harness.github.label_calls == [("apache/superset", 4213, "devin:remediate")]
+    async with harness.factory() as session:
+        event = await session.scalar(
+            select(WebhookEvent).where(WebhookEvent.delivery_id == "in-window")
+        )
+        assert event is not None
+        assert event.status == EventStatus.PROCESSED and event.last_error is None
+        assert event.case_id == case.id
+
+    # GitHub redelivery after confirmation is a no-op.
+    replay = await harness.label_webhook(4213, delivery="in-window")
+    assert replay.json().get("deduplicated") is True
+    await harness.label_webhook(4213, delivery="after-confirm")
+    async with harness.factory() as session:
+        event = await session.scalar(
+            select(WebhookEvent).where(WebhookEvent.delivery_id == "after-confirm")
+        )
+        assert event is not None
+        await process_event(session, event, harness.devin, harness.settings)
+    assert (await harness.case(case.id)).state == CaseState.REMEDIATION_APPROVED
+    assert "label_webhook_duplicate" in await harness.events(request.id)
+    assert harness.devin.create_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_slack_post_accepted_but_commit_lost_does_not_duplicate_message(
     harness: Harness,
 ) -> None:
@@ -982,6 +1041,64 @@ async def test_slack_post_accepted_but_commit_lost_does_not_duplicate_message(
     assert hash_action_token(token) == request.action_token_hash
     approved = await harness.click(token)
     assert approved.status_code == 200 and approved.json()["outcome"] == "approved"
+
+
+@pytest.mark.asyncio
+async def test_slack_reconciliation_without_history_scope_fails_loudly_without_repost(
+    harness: Harness,
+) -> None:
+    case = await harness.triage(4213)
+    rows = await harness.outbox(case.id, OUTBOX_KIND_SLACK_APPROVAL_REQUEST)
+    original_post = harness.slack.post_message
+    original_find = harness.slack.find_message
+
+    async def post_then_crash(*args: Any, **kwargs: Any) -> Any:
+        await original_post(*args, **kwargs)
+        raise SlackApiError("chat.postMessage", "ReadTimeout", retryable=True)
+
+    async def find_without_scope(*args: Any, **kwargs: Any) -> Any:
+        raise SlackApiError("conversations.history", "missing_scope", retryable=False)
+
+    harness.slack.post_message = post_then_crash  # type: ignore[method-assign]
+    claimed = await harness.dispatcher.claim()
+    assert claimed is not None
+    await harness.dispatcher.dispatch(claimed.id)
+    assert (await harness.approval(case.id)).notification_status == NotificationStatus.SENDING
+    async with harness.factory() as session:
+        row = await session.get(NotificationOutbox, rows[0].id)
+        assert row is not None
+        row.next_attempt_at = datetime.now(UTC)
+        await session.commit()
+
+    harness.slack.post_message = original_post  # type: ignore[method-assign]
+    harness.slack.find_message = find_without_scope  # type: ignore[method-assign]
+    posts_before = len(await harness.fake_messages())
+    await harness.drain()
+    harness.slack.find_message = original_find  # type: ignore[method-assign]
+
+    assert len(await harness.fake_messages()) == posts_before  # never reposted blindly
+    request = await harness.approval(case.id)
+    assert request.notification_status == NotificationStatus.FAILED
+    assert request.slack_message_ts is None
+    assert "slack_notification_failed" in await harness.events(request.id)
+    async with harness.factory() as session:
+        row = await session.get(NotificationOutbox, rows[0].id)
+        assert row is not None and row.status == OutboxStatus.FAILED
+        assert row.last_error is not None
+        assert "missing_scope" in row.last_error and "channels:history" in row.last_error
+    # Triage itself is untouched and the case still awaits approval.
+    assert (await harness.case(case.id)).state == CaseState.AWAITING_REMEDIATION_APPROVAL
+
+    # Once the scope is granted, an operator retry reconciles the original message.
+    retry = await harness.client.post(
+        f"/operator/outbox/{rows[0].id}/retry", headers=harness.operator
+    )
+    assert retry.status_code == 200
+    await harness.drain()
+    request = await harness.approval(case.id)
+    assert request.notification_status == NotificationStatus.SENT
+    messages = await harness.fake_messages()
+    assert len(messages) == posts_before and request.slack_message_ts == messages[0].ts
 
 
 @pytest.mark.asyncio

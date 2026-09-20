@@ -23,6 +23,7 @@ from ..approvals import (
     hash_action_token,
     is_current_request,
     record_event,
+    replay_label_webhooks_after_delivery,
     triage_result_hash,
 )
 from ..config import Settings
@@ -360,12 +361,24 @@ class OutboxDispatcher:
         if CaseState(case.state) != CaseState.AWAITING_REMEDIATION_APPROVAL:
             raise OutboxSkip(f"case is {case.state}, not awaiting approval")
         channel = self.settings.slack_channel_id
-        if request.notification_status == NotificationStatus.SENDING:
-            # A previous attempt may have posted before its commit was lost; find that
-            # message by its metadata instead of posting a second one.
-            ref = await self.slack.find_message(
-                channel, str(request.id), oldest=request.created_at - timedelta(minutes=5)
-            )
+        if request.action_token_hash is not None:
+            # A token was committed, so a previous attempt (possibly one that later failed and
+            # is now being retried by an operator) may have posted before its commit was
+            # lost; find that message by its metadata instead of posting a second one.
+            try:
+                ref = await self.slack.find_message(
+                    channel, str(request.id), oldest=request.created_at - timedelta(minutes=5)
+                )
+            except SlackApiError as exc:
+                if exc.retryable:
+                    raise
+                # Reposting could duplicate a message Slack already accepted; leave the
+                # request in SENDING for an operator rather than guess.
+                raise OutboxPermanentFailure(
+                    f"cannot reconcile earlier Slack post ({exc.error}); not reposting. "
+                    "conversations.history needs the channels:history (public) or "
+                    "groups:history (private) bot scope"
+                ) from exc
             if ref is not None:
                 self._mark_notified(session, request, ref, reconciled=True)
                 return
@@ -498,6 +511,8 @@ class OutboxDispatcher:
             # Persist the label bookkeeping before the comment so a comment failure can
             # never cause a second label write on retry.
             await session.commit()
+            if await replay_label_webhooks_after_delivery(session, case, request, label):
+                await session.commit()
         if request.github_comment_id is None:
             marker = comment_marker("approval", str(request.id))
             request.github_comment_id = await self._ensure_comment(

@@ -124,6 +124,10 @@ uv run python scripts/simulate.py --scenario approve --wait
 uv run python scripts/simulate.py --scenario good --bad-signature
 ```
 
+Phase 3 scenarios each decide their fixture issue exactly once, like production;
+re-running them against a database that already holds those decisions fails
+fast with a message to reset (`docker compose down -v && docker compose up -d`).
+
 ## Environment
 
 | Variable | Default | Purpose |
@@ -214,8 +218,15 @@ The worker's Docker `stop_grace_period` must exceed
 ### Slack setup (live)
 
 1. Create a Slack app; add bot scopes `chat:write` (and `chat:write.public`
-   if the bot is not invited to the channel). Install it and copy the
-   **Bot User OAuth Token** into `SLACK_BOT_TOKEN`.
+   if the bot is not invited to the channel) plus `channels:history` for a
+   public approval channel or `groups:history` for a private one. The history
+   scope is what lets the worker recover from a crash between `chat.postMessage`
+   and its database commit: it looks the message up by metadata through
+   `conversations.history` instead of posting a duplicate. Without it that
+   recovery fails closed (`missing_scope`): the outbox row is marked `FAILED`
+   with the reason, the request shows notification `FAILED`, nothing is
+   reposted, and an operator retry reconciles once the scope is granted.
+   Install the app and copy the **Bot User OAuth Token** into `SLACK_BOT_TOKEN`.
 2. Copy **Basic Information → Signing Secret** into `SLACK_SIGNING_SECRET`.
 3. Enable **Interactivity & Shortcuts** and set the request URL to
    `https://<host>/webhooks/slack/actions`. Slack signs each request with

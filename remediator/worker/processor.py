@@ -6,7 +6,12 @@ from sqlalchemy import desc, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..approvals import confirm_label_webhook, create_approval_request
+from ..approvals import (
+    confirm_label_webhook,
+    create_approval_request,
+    is_remediation_label_event,
+    issue_label_names,
+)
 from ..config import Settings
 from ..devin.client import DevinClient, DevinError, DevinSessionNotFound
 from ..devin.triage import TriageValidationError, validate_triage_output
@@ -360,25 +365,6 @@ async def _active_kind(session: AsyncSession, case: Case) -> AttemptKind | None:
     return kind
 
 
-def _issue_label_names(issue: Any) -> tuple[str, ...] | None:
-    """Label names from the webhook's issue snapshot; None when the payload has none."""
-    if not isinstance(issue, dict) or not isinstance(issue.get("labels"), list):
-        return None
-    return tuple(
-        str(label.get("name", ""))
-        for label in issue["labels"]
-        if isinstance(label, dict) and label.get("name")
-    )
-
-
-def _is_remediation_label_event(event: WebhookEvent, settings: Settings) -> bool:
-    if event.event_type != "issues" or event.action != "labeled":
-        return False
-    label = event.payload.get("label", {})
-    name = str(label.get("name", "")) if isinstance(label, dict) else ""
-    return name.lower() == settings.github_remediation_label.lower()
-
-
 async def process_event(
     session: AsyncSession,
     event: WebhookEvent,
@@ -393,7 +379,7 @@ async def process_event(
             Case.repository == event.repository, Case.issue_number == issue.get("number")
         )
     )
-    if _is_remediation_label_event(event, settings):
+    if is_remediation_label_event(event, settings.github_remediation_label):
         confirmed = False
         if case is not None:
             confirmed = await confirm_label_webhook(
@@ -401,7 +387,7 @@ async def process_event(
                 case,
                 settings.github_remediation_label,
                 event.delivery_id,
-                issue_labels=_issue_label_names(issue),
+                issue_labels=issue_label_names(issue),
             )
             event.case_id = case.id
         logger.info(
