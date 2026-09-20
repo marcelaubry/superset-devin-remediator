@@ -30,6 +30,8 @@ SCENARIOS = {
     "needs-scoping": "issue_needs_scoping.json",
     "deterministic": "issue_deterministic.json",
     "human-led": "issue_human_led.json",
+    # focused single-area bug that mentions other areas only as context/non-goals (4171)
+    "digit-only-temporal": "issue_digit_only_temporal.json",
     "failure": "issue_fake_failure.json",
     "blocked": "issue_human_blocked.json",
     "triage-infeasible": "issue_triage_infeasible.json",

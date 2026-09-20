@@ -239,6 +239,7 @@ docker buildx build --platform linux/amd64 -f docker/verifier/Dockerfile .
 | `needs-scoping` | `issue_needs_scoping.json` | 4321 | `POLICY_REJECTED` without Devin session | Missing reproducibility and acceptance details |
 | `deterministic` | `issue_deterministic.json` | 4422 | `POLICY_REJECTED` without Devin session | Dependency/version-bump work is deterministic automation |
 | `human-led` | `issue_human_led.json` | 4501 | `POLICY_REJECTED` without Devin session | Architecture and breaking-change reasoning requires human ownership |
+| `digit-only-temporal` | `issue_digit_only_temporal.json` | 4171 | `AWAITING_REMEDIATION_APPROVAL` | Focused single-area bug; other areas appear only in code paths, context and non-goals, so the filter admits it to bounded Devin triage |
 | `triage-infeasible` | `issue_triage_infeasible.json` | 4533 | `POLICY_REJECTED` after triage | Fake triage reports that remediation requires a product decision |
 | `failure` | `issue_fake_failure.json` | 4515 | `FAILED` | Fake session ends `status=error` for issue numbers divisible by five |
 | `blocked` | `issue_human_blocked.json` | 4529 | `HUMAN_BLOCKED` | Fake session reports `waiting_for_user`; session URL retained, no replacement |
