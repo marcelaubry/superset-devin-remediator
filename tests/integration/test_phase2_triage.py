@@ -10,7 +10,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from remediator.config import Settings
-from remediator.devin.client import CreateSessionRequest, DevinTransportError, SessionSnapshot
+from remediator.devin.client import (
+    ConsumptionReport,
+    CreateSessionRequest,
+    DevinTransportError,
+    SessionSnapshot,
+)
 from remediator.devin.fake import FakeDevinClient, FakeScenario, sample_triage_output
 from remediator.devin.tags import OPERATION_TAG_PREFIX
 from remediator.lifecycle import CaseState, transition
@@ -878,3 +883,43 @@ async def test_deadline_is_anchored_after_session_creation(db: AsyncSession) -> 
     (attempt,) = await _attempts(db, case)
     assert attempt.started_at and attempt.timeout_at
     assert attempt.timeout_at - attempt.started_at >= timedelta(seconds=5.2)
+
+
+class _ConsumptionBrokenDevin(FakeDevinClient):
+    async def session_consumption(self, session_id: str) -> ConsumptionReport:
+        raise RuntimeError("consumption endpoint exploded")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_acu_reporting_never_fails_remediation_and_never_estimates(
+    db: AsyncSession, enabled: bool
+) -> None:
+    event = _event(4297 + 4 * int(enabled), f"p5-acu-{enabled}")
+    db.add(event)
+    await db.commit()
+    client = _ConsumptionBrokenDevin() if enabled else FakeDevinClient()
+    await process_event(db, event, client, _settings(devin_acu_reporting_enabled=enabled))
+
+    case = await db.scalar(select(Case).where(Case.issue_number == 4297 + 4 * int(enabled)))
+    assert case and case.state == CaseState.AWAITING_REMEDIATION_APPROVAL
+    (attempt,) = await _attempts(db, case)
+    assert attempt.status == AttemptStatus.SUCCEEDED
+    assert attempt.acu_reported is None
+    assert attempt.acu_report_status == ("unavailable" if enabled else "not_attempted")
+    if enabled:
+        assert attempt.acu_report_detail == "client error: RuntimeError"
+
+
+@pytest.mark.asyncio
+async def test_fake_acu_consumption_is_labelled_simulated(db: AsyncSession) -> None:
+    event = _event(4301, "p5-acu-sim")
+    db.add(event)
+    await db.commit()
+    client = FakeDevinClient()
+    await process_event(db, event, client, _settings(devin_acu_reporting_enabled=True))
+    case = await db.scalar(select(Case).where(Case.issue_number == 4301))
+    assert case
+    (attempt,) = await _attempts(db, case)
+    assert attempt.acu_report_status == "simulated"
+    assert attempt.acu_reported is not None

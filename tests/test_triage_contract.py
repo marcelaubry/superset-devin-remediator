@@ -133,6 +133,7 @@ LIVE_OK: dict[str, Any] = {
     "github_token": "ghp_" + "t" * 40,
     "probe_runner_mode": "remote",
     "probe_verifier_url": "http://verifier:8080",
+    "probe_verifier_shared_secret": "verifier-shared-secret-with-32-chars!!",
     "probe_root": str(Path(__file__).resolve().parents[1] / "probes"),
     "_env_file": None,
 }

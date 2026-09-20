@@ -219,3 +219,7 @@ __marimo__/
 
 # Visual verification artifacts (docker-compose.visual.yml)
 artifacts/
+
+# Verifier HMAC key delivered as a Compose secret file (see docker-compose.yml)
+docker/secrets/*
+!docker/secrets/README.md

@@ -1,49 +1,99 @@
-# Known limitations (after Phase 4)
+# Known limitations (after Phase 5)
 
-## Probe execution boundary: the verifier container
+## Probe execution boundary: front, runner and egress proxy
 
 The worker holds the Devin API key, GitHub token, Slack token/signing secret,
 operator token and database URL, so it **never executes repository code**:
 there is no worker-side `local` probe mode, only `fake` (simulation) and
-`remote`. Repository code runs in the dedicated `verifier` service
-(`docker/verifier/Dockerfile`, `remediator.verifier`): no `env_file`, no
-import of `remediator.config` (so no `.env` is ever read), dedicated non-root
-UID, read-only root filesystem, bounded `/tmp` tmpfs, `cap_drop: ALL`,
-`no-new-privileges`, PID/memory limits, isolated network. The worker checks
-`GET /health` before every probe and refuses a verifier that can see any
-credential, runs as root or has a writable root.
+`remote`. Repository code runs in the `verifier-runner` service, which is
+reached only through the `verifier` front:
+
+| service | UID | holds | reaches |
+|---|---|---|---|
+| `verifier` (front, `remediator.verifier`) | 65533 | the HMAC key (Docker secret), the read-only registry | worker network, `verifier-internal` |
+| `verifier-runner` (`remediator.verifier.executor`) | 65534 | the read-only registry, a disk-backed `/workspace` | `verifier-internal` only |
+| `egress-proxy` (`remediator.verifier.egress_proxy`) | 65532 | nothing | `verifier-internal`, `egress` (internet) |
+
+No service mounts `.env` or imports `remediator.config`; every one runs with a
+read-only root filesystem, `cap_drop: ALL`, `no-new-privileges`, PID/memory/CPU
+limits and `init: true`. The runner is on an `internal: true` network, so the
+only way out is `CONNECT host:443` through the proxy, which accepts exact
+lower-case hostnames from `EGRESS_ALLOWED_HOSTS` (GitHub, the npm/yarn
+registries and `cdn.sheetjs.com` — Superset's lockfile resolves `xlsx` from
+the SheetJS CDN — by default) and rejects wildcards, IP literals, other ports and
+plain HTTP. The runner reports `direct_egress` (a bounded TCP attempt to a
+non-allowlisted public host) and `execution=runner`; the worker's signed
+`GET /capabilities` check refuses, in live mode, a verifier that executes
+in-process, that can see any credential (including the HMAC key on the runner
+side), runs as root, has a writable root, lacks a declared tool, cannot show
+the compose hardening, or has unrestricted direct egress.
+`python -m remediator.readiness --verifier-smoke` runs the real
+`apache/superset#0` Jest smoke probe (pinned SHA, `npm ci --ignore-scripts`)
+through that whole path.
 
 What is still a limitation:
 
-- **Egress is documented, not enforced, by compose.** The verifier network has
-  no route to PostgreSQL or the worker, but Docker's default bridge still allows
-  outbound internet (needed for the anonymous `https://github.com` clone).
-  Production should pin egress to GitHub with a network policy / egress proxy;
-  a malicious probe can otherwise exfiltrate the repository contents it already
-  has (it has no credentials to exfiltrate).
-- **One probe at a time per verifier.** `/probe` is serialized (a second
-  request gets `409`, which the worker treats as transient and retries on its
-  next claim), and after every run the verifier SIGKILLs every remaining
-  process of the probe UID, so a descendant that dropped the run marker and
-  `setsid`-escaped cannot outlive its probe or touch the next one's workspace.
-  `init: true` (tini) reaps whatever exits as an orphan. The cost is
-  throughput: probe verification is sequential per verifier instance; scale by
-  running more verifier containers behind distinct `PROBE_VERIFIER_URL`s, not
-  by lifting the lock.
+- **Isolation is verified from inside the container, not from the host.** The
+  runner reads `/proc/self/status` (`NoNewPrivs`, `Cap*` masks) and its
+  cgroup `pids.max` / `memory.max`. Docker Desktop (macOS/Windows) runs a
+  Linux VM whose cgroup v2 layout usually exposes these; where it does not,
+  the worker fails closed with `PROBE_INFRASTRUCTURE_BLOCKED` and the readiness
+  command reports `verifier.isolation FAIL`. Set
+  `PROBE_VERIFIER_REQUIRE_ISOLATION=false` only for local fake-mode
+  experiments; live mode ignores that flag. Seccomp and AppArmor profiles are
+  Docker's defaults and are not introspected.
+- **Egress enforcement is the compose network topology plus the proxy.** The
+  `direct_egress` self-check proves the runner cannot open a TCP connection to
+  a public host at check time; it cannot prove the absence of every side
+  channel (DNS is resolved by the proxy, not the runner, but Docker's embedded
+  DNS still answers for service names). The proxy allowlist is by hostname:
+  anything the allowlisted hosts serve (any GitHub repository, any npm
+  package) is reachable, so **package `postinstall` scripts are the residual
+  supply-chain risk**; approved manifests use `--ignore-scripts` and a probe
+  that needs native builds must be reviewed for it.
+- **The front and runner trust each other over plain HTTP on the internal
+  network.** The front authenticates the worker (HMAC) and forwards a
+  registry-bound request; the runner trusts the front because nothing else can
+  reach `verifier-internal`. There is no second authentication on that hop and
+  responses are not signed; production should add TLS (or mTLS) on both hops.
+- **Verifier image CVE posture.** `make audit` (Trivy, HIGH/CRITICAL,
+  `--ignore-unfixed`) is clean for Python and Node packages after pinning
+  npm 11.19.1 and removing `setuptools`/`wheel`, but the Debian 13 base still
+  carries OS-level findings with no fixed package available (notably
+  `linux-libc-dev`, a header-only package). They are tracked, not
+  suppressed: rebuild the image on every base refresh and re-run `make audit`
+  before a release.
+- **Idempotency is process-local.** The front remembers request ids in
+  memory only; after a restart the same id runs again (deterministically, from
+  the registry). The cost is a repeated probe run, never a stale verdict.
+- **Exactly one probe at a time per runner.** `VERIFIER_MAX_CONCURRENT` must
+  be `1` and the runner refuses to start otherwise: after every run it
+  SIGKILLs every remaining process of the probe UID (so a descendant that
+  dropped the run marker and `setsid`-escaped cannot outlive its probe or
+  touch the next one's workspace), and that sweep is UID-wide, so a second
+  concurrent run could be killed by the first one's cleanup. A second request
+  gets `409`, which the worker treats as transient and retries on its next
+  claim. Scale by running more runner/front pairs behind distinct
+  `PROBE_VERIFIER_URL`s, not by lifting the lock.
+- **The runner workspace is a Docker volume, not tmpfs.** A real
+  `npm ci` for Superset's frontend needs several GB, more than a sane tmpfs;
+  `/workspace` is a named volume (and the dependency cache lives under it).
+  Every run's checkout is removed afterwards and cache entries are keyed by
+  repository, lockfile hash and Node version, but the volume persists across
+  restarts: prune it (`docker volume rm`) when rotating the image.
 - **The verifier runs on the stdlib asyncio loop, not uvloop.** With uvloop
   (uvicorn's default when installed) a probe that leaves any detached
   descendant keeps the child's stdio socketpair open, `Process.wait()` never
   resolves and the probe is misreported as a timeout. `remediator.verifier`
   pins `loop="asyncio"`; keep it that way.
-- `RLIMIT_NPROC` is per UID, so it is only meaningful because the verifier UID
+- `RLIMIT_NPROC` is per UID, so it is only meaningful because the runner UID
   runs nothing else. `RLIMIT_AS` is off by default (`VERIFIER_MAX_MEMORY_BYTES`)
   because Node/JVM toolchains reserve large address spaces; the container
   `mem_limit` is the effective memory bound.
-- The verifier is reached over plain HTTP on an internal network. Nothing
-  secret crosses it (the probe script is public repository content and the
-  result is evidence, not authority), but an attacker on that network could
-  feed the worker false verdicts. Production should authenticate the link
-  (mTLS or a shared-nothing sidecar).
+- **`GET /health` on the front is unauthenticated** (Compose health check). It
+  returns only `{"status","protocol_version"}`; uid, toolchain, credential and
+  boundary state are served exclusively by the signed `/capabilities`. The
+  runner's `/health` is detailed but only reachable from `verifier-internal`.
 
 ## Probe runtime availability
 
@@ -103,7 +153,56 @@ never dismisses reviews. Branch protection requiring human review on the
 default branch is assumed and should be enforced independently of this
 service.
 
+## Concurrency and capacity
+
+- Capacity leases are per worker id and heartbeaten every loop; a worker that
+  is alive but wedged keeps its lease until `CAPACITY_LEASE_GRACE_SECONDS`
+  elapses without a heartbeat. A too-small grace can let two workers hold the
+  same slot after a long GC pause; the default is 600 s.
+- Cancelling a running remediation keeps its lease until Devin confirms
+  termination (`TERMINATION_PENDING`). Under a Devin outage, cancelled jobs
+  therefore continue to occupy capacity; this is deliberate (a live session
+  is still spending) and visible in `active_jobs`.
+- Resource keys are opaque strings declared by probe manifests; the
+  remediator does not derive them from changed files, so two remediations
+  that conflict on an undeclared file are not serialized.
+- Waiting cases are admitted FIFO by `waiting_since`: a freed slot is refused
+  to any case while an older live waiter for the same global limit exists
+  (`CapacityDenied.queued_behind`, label `... behind N`), and the worker
+  claims waiting cases oldest first. Ordering is per global limit only; cases
+  parked on a per-repository limit do not hold up other repositories, and a
+  waiter that reaches a terminal state drops out of the queue. Admission still
+  happens on the waiter's next retry (`CAPACITY_WAIT_BACKOFF_SECONDS`), so a
+  freed slot can sit idle for up to one backoff interval.
+
+## Metrics and ACU reporting
+
+- `/metrics` is a per-process Prometheus registry. With `WORKER_CONCURRENCY`
+  loops in one process counters are shared; with several API/worker
+  processes each must be scraped separately (gauges are refreshed from the
+  database on scrape and therefore agree).
+- `mode="live"` requires Devin, GitHub **and** Slack to be live; the mixed
+  real-Slack/fake-GitHub/fake-Devin configuration is `simulated`.
+- ACU figures come only from the official consumption endpoint and are read
+  once after a session ends. Plans or service users without access show
+  `Unavailable`; nothing is estimated, and a reporting failure never changes
+  the case outcome.
+
 ## Operational
+
+- `make readiness` is read-only by default and never creates a session or
+  mutates a repository or channel. `--allow-mutations` adds one Slack test
+  message and additionally requires `--confirm-channel <id>` matching
+  `SLACK_CHANNEL_ID` (otherwise `mutations.confirmation FAIL` and nothing is
+  posted); there is no GitHub write check because none is reversible without
+  a trace. `--verifier-smoke` is opt-in because it takes minutes and needs
+  the egress proxy; it still mutates nothing outside the runner.
+- `alembic check` is clean (models and migrations agree) and enforced by
+  `tests/integration/test_migrations.py`; the ORM declares the indexes and
+  the `webhook_events_delivery_id_key` constraint exactly as the migrations
+  created them, so no schema change was needed.
+- Operator rate limits and CSRF origin checks are per process and in memory;
+  behind several API replicas the effective limit multiplies.
 
 - Live GitHub uses a personal access token identity; PR author verification
   therefore depends on `GITHUB_PR_AUTHOR_LOGINS` matching Devin's GitHub App

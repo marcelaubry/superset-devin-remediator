@@ -161,8 +161,9 @@ FAILURE_CLASS_SESSION = "session"
 
 class WebhookEvent(Base):
     __tablename__ = "webhook_events"
+    __table_args__ = (UniqueConstraint("delivery_id", name="webhook_events_delivery_id_key"),)
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    delivery_id: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    delivery_id: Mapped[str] = mapped_column(String(255), index=True)
     event_type: Mapped[str] = mapped_column(String(100))
     action: Mapped[str] = mapped_column(String(100))
     repository: Mapped[str] = mapped_column(String(255))
@@ -218,6 +219,10 @@ class Case(Base):
     version: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
     claimed_by: Mapped[str | None] = mapped_column(String(255))
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Set while the case is parked because a configured concurrency limit is saturated;
+    # cleared when capacity is acquired. Waiting spends nothing and changes no state.
+    waiting_for: Mapped[str | None] = mapped_column(String(255))
+    waiting_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     events: Mapped[list[WebhookEvent]] = relationship(back_populates="case")
     attempts: Mapped[list["Attempt"]] = relationship(back_populates="case")
     transitions: Mapped[list["StateTransition"]] = relationship(
@@ -310,6 +315,12 @@ class Attempt(Base):
     ci_deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     failure_stage: Mapped[str | None] = mapped_column(String(64))
     failure_class: Mapped[str | None] = mapped_column(String(32))
+    # Official consumption API result (Phase 5). `devin_acus_consumed` above is the value the
+    # session object itself reports; this is the billing figure, when the plan exposes it.
+    acu_report_status: Mapped[str | None] = mapped_column(String(32))
+    acu_reported: Mapped[float | None] = mapped_column(Float)
+    acu_report_detail: Mapped[str | None] = mapped_column(Text)
+    acu_reported_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     case: Mapped[Case] = relationship(back_populates="attempts")
     probe_snapshot: Mapped["ProbeSnapshot | None"] = relationship(foreign_keys=[probe_snapshot_id])
     probe_executions: Mapped[list["ProbeExecution"]] = relationship(
@@ -331,6 +342,7 @@ class ProbeSnapshot(Base):
     """
 
     __tablename__ = "probe_snapshots"
+    __table_args__ = (Index("ix_probe_snapshots_case_id", "case_id"),)
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     case_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("cases.id", ondelete="CASCADE"))
     repository: Mapped[str] = mapped_column(String(255))
@@ -358,6 +370,7 @@ class ProbeSnapshot(Base):
 
 class ProbeExecution(Base):
     __tablename__ = "probe_executions"
+    __table_args__ = (Index("ix_probe_executions_attempt_id", "attempt_id"),)
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     case_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("cases.id", ondelete="CASCADE"))
     # NULL until a Devin attempt is authorised: the BASE run happens before any attempt
@@ -382,6 +395,11 @@ class ProbeExecution(Base):
     stderr: Mapped[str] = mapped_column(Text, default="")
     output_truncated: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     error: Mapped[str | None] = mapped_column(Text)
+    # Phase 5 evidence: verifier request id (idempotency key), stage of an infrastructure
+    # failure and the tool versions the verifier reported.
+    request_id: Mapped[str | None] = mapped_column(String(32))
+    failure_stage: Mapped[str | None] = mapped_column(String(32))
+    tool_versions: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     started_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), default=lambda: datetime.now(UTC)
     )
@@ -390,10 +408,64 @@ class ProbeExecution(Base):
     snapshot: Mapped["ProbeSnapshot"] = relationship(back_populates="executions")
 
 
+class CapacityLeaseKind(str, enum.Enum):
+    TRIAGE = "TRIAGE"
+    REMEDIATION = "REMEDIATION"
+    PROBE = "PROBE"
+    RESOURCE = "RESOURCE"
+
+
+ACU_REPORT_AVAILABLE = "available"
+ACU_REPORT_UNAVAILABLE = "unavailable"
+ACU_REPORT_SIMULATED = "simulated"
+ACU_REPORT_NOT_ATTEMPTED = "not_attempted"
+
+
+class CapacityLease(Base):
+    """One unit of a database-backed semaphore (Phase 5).
+
+    A lease counts against `kind`'s limit (and against `scope`'s per-repository / resource
+    limit) while `released_at IS NULL AND expires_at > now()`. Acquisition happens under
+    `pg_advisory_xact_lock` so two workers can never both observe free capacity; expiry
+    lets a lease held by a crashed worker recover without operator action.
+    """
+
+    __tablename__ = "capacity_leases"
+    __table_args__ = (
+        Index(
+            "uq_capacity_leases_one_active_per_case_kind",
+            "case_id",
+            "kind",
+            "scope",
+            unique=True,
+            postgresql_where=text("released_at IS NULL"),
+        ),
+        Index("ix_capacity_leases_kind_active", "kind", "expires_at", "released_at"),
+    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    kind: Mapped[CapacityLeaseKind] = mapped_column(
+        Enum(CapacityLeaseKind, name="capacity_lease_kind")
+    )
+    # Repository for TRIAGE/REMEDIATION, "" for PROBE, the resource key for RESOURCE.
+    scope: Mapped[str] = mapped_column(String(255), default="")
+    case_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("cases.id", ondelete="CASCADE"))
+    attempt_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("attempts.id", ondelete="SET NULL")
+    )
+    owner: Mapped[str] = mapped_column(String(255))
+    acquired_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), default=lambda: datetime.now(UTC)
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    release_reason: Mapped[str | None] = mapped_column(Text)
+
+
 class PullRequestEvidence(Base):
     """What GitHub said about the discovered PR when it was validated."""
 
     __tablename__ = "pull_request_evidence"
+    __table_args__ = (Index("ix_pull_request_evidence_attempt_id", "attempt_id"),)
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     case_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("cases.id", ondelete="CASCADE"))
     attempt_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("attempts.id", ondelete="CASCADE"))
@@ -427,6 +499,7 @@ class PullRequestEvidence(Base):
 
 class CiSnapshot(Base):
     __tablename__ = "ci_snapshots"
+    __table_args__ = (Index("ix_ci_snapshots_attempt_id", "attempt_id"),)
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     case_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("cases.id", ondelete="CASCADE"))
     attempt_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("attempts.id", ondelete="CASCADE"))
@@ -463,6 +536,7 @@ class StateTransition(Base):
 
 class NotificationOutbox(Base):
     __tablename__ = "notification_outbox"
+    __table_args__ = (Index("ix_notification_outbox_pending", "status", "next_attempt_at"),)
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     case_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("cases.id", ondelete="CASCADE"))
     channel: Mapped[OutboxChannel] = mapped_column(
@@ -571,6 +645,7 @@ class ApprovalEvent(Base):
     """Append-only approval timeline (never updated or deleted by application code)."""
 
     __tablename__ = "approval_events"
+    __table_args__ = (Index("ix_approval_events_case_id", "case_id"),)
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     seq: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=False)
     approval_request_id: Mapped[uuid.UUID] = mapped_column(

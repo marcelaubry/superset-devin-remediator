@@ -26,9 +26,9 @@ from ..approvals import (
 )
 from ..config import Settings, get_settings
 from ..db import get_session
+from ..metrics import slack_action_requests_total
 from ..slack.blocks import ACTION_REASON, BLOCK_ID_REASON
 from ..slack.signature import verify_slack_request
-from .metrics import slack_action_requests_total
 
 logger = logging.getLogger(__name__)
 router = APIRouter()

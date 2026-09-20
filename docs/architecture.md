@@ -37,15 +37,56 @@
   issue, 40-hex base SHA, exit codes, timeout, runtime tools, script SHA-256
   recomputed and compared), records the registry commit, and exposes a
   `ProbeRunner` protocol. `FakeProbeRunner` is deterministic by issue number;
-  `RemoteProbeRunner` forwards the spec to the verifier container after
-  checking its `/health` (no credentials visible, non-root, read-only root).
-- **Verifier service (`remediator/verifier`, `docker/verifier/Dockerfile`):**
-  the only process that executes repository code. Separate container with no
-  secrets, no import of `remediator.config`, dedicated UID, read-only root,
-  bounded tmpfs, dropped capabilities, PID/memory limits and its own network.
-  `LocalProbeRunner` lives here: exact-commit clone into a temp workspace,
-  snapshotted script with fixed argv and minimal environment, deadline covering
-  process exit, rlimits, marker-based descendant kill, workspace cleanup.
+  `RemoteProbeRunner` sends a signed `verifier.v2` request (identifier and
+  hashes, never the script) after validating `/capabilities` (no credentials
+  visible, non-root, read-only root, required tools present).
+- **Verifier front (`verifier` service, `remediator/verifier`):** the
+  worker-facing half of the verifier. Holds exactly one secret, the HMAC key
+  (Docker secret file), and executes no repository code. Speaks
+  `verifier.v2`: every request carries an HMAC-SHA256 signature over
+  `timestamp.body`, a request id for replay/idempotency, exact repository +
+  40-hex SHA, and the probe *identifier and hashes only*; the front rebinds
+  the request to its own read-only registry mount, enforces allowlist and
+  timeouts, then forwards to the runner over `verifier-internal`
+  (`VERIFIER_EXECUTION=runner`). Its signed `GET /capabilities` merges the
+  runner's isolation facts with `execution` and `key_isolated_from_probes`;
+  unauthenticated `/health` is liveness only.
+- **Verifier runner (`verifier-runner`, `remediator/verifier/executor`):**
+  the only process that executes repository code, in a separate container
+  and UID with **no secret at all** (not even the HMAC key), no `.env`, no
+  Docker socket, read-only root, disk-backed `/workspace` volume wiped per
+  run, dropped capabilities, `no-new-privileges`, PID/memory/CPU limits, and
+  a single `internal: true` network. `LocalProbeRunner` lives here:
+  exact-commit fetch of the allowlisted repository, manifest `setup` argv
+  steps (pinned Node 24 / npm / Yarn, Git, Python 3) with a keyed download
+  cache, snapshotted script with fixed argv and minimal environment,
+  deadline covering process exit, rlimits, every subprocess (fetch steps
+  included) in its own session with a run marker and process-group kill,
+  a UID-wide post-run sweep (hence `VERIFIER_MAX_CONCURRENT` must be 1),
+  workspace cleanup, and bounded structured evidence including tool versions
+  and an infrastructure-vs-product failure class. It self-reports
+  `direct_egress` by attempting a bounded connection to a public host.
+- **Egress proxy (`egress-proxy`, `remediator/verifier/egress_proxy`):** the
+  runner's only route out. Accepts `CONNECT host:443` for exact lower-case
+  hostnames in `EGRESS_ALLOWED_HOSTS` (GitHub, the npm/yarn registries and `cdn.sheetjs.com`, which Superset's lockfile resolves `xlsx` from, by
+  default); rejects wildcards, IP literals, other ports and plain HTTP.
+  Holds nothing. See [probes.md](probes.md) and
+  [threat-model.md](threat-model.md).
+- **Capacity manager (`remediator/capacity.py`):** PostgreSQL lease table
+  under an advisory lock enforcing `MAX_CONCURRENT_TRIAGE` /
+  `MAX_CONCURRENT_REMEDIATION` / `MAX_CONCURRENT_PROBES`, a per-repository
+  remediation limit, one active remediation per case and manifest
+  `resource_keys`. Denied cases park at zero ACUs and are admitted FIFO by
+  `waiting_since` per global limit. See [concurrency.md](concurrency.md).
+- **Readiness (`python -m remediator.readiness`):** read-only pre-flight of
+  configuration, database, Devin/GitHub/Slack identity and permissions,
+  verifier key separation, isolation, egress and Node capability, webhook
+  URL, allowlists and limits; `--verifier-smoke` runs the real pinned
+  Superset Jest probe through the runner; mutating checks need
+  `--allow-mutations --confirm-channel <SLACK_CHANNEL_ID>`. See
+  [readiness.md](readiness.md).
+- **Metrics (`/metrics`):** authenticated, low-cardinality Prometheus text with
+  a `mode=live|simulated` label; see [metrics.md](metrics.md).
 - **Slack adapter (`remediator/slack`):** request signature verification
   (`v0:{ts}:{raw body}` HMAC-SHA256, replay window, constant-time compare),
   a Block Kit builder that escapes untrusted text and enforces Slack limits,
@@ -73,7 +114,8 @@ flowchart LR
   W -->|DEVIN_CLIENT_MODE=live| L[Devin v3 API]
   W -->|DEVIN_CLIENT_MODE=fake| D[Fake Devin]
   W -->|base SHA, pulls, files, compare, timeline, check-runs| GHAPI[GitHub REST API]
-  W -->|ProbeRunner| P[Probe runner\nfake / local isolated checkout]
+  W -->|HMAC verifier.v2, probe id + hashes only| P[Verifier container\nno credentials, read-only registry]
+  P -->|anonymous clone of exact SHA| GHAPI
   W -->|remediation session| L
   DB --> UI[Operator browser dashboard]
   DB --> O[Transactional outbox]
@@ -504,6 +546,8 @@ authorised precisely.
 | `probe_executions` | snapshot, attempt (nullable for the pre-session BASE run), target `BASE`/`HEAD`, `commit_sha`, `runner_mode`, `command_identity`, `script_hash`, exit code, expected code, `verdict` (`MATCHED`/`MISMATCHED`/`INFRASTRUCTURE`), duration, bounded stdout/stderr, `timed_out`, `output_truncated` | Independent reproduction evidence |
 | `pull_request_evidence` | case, attempt, repository, PR number/url, base/head ref and SHA, author, state, merged, changed files, `checks` (JSON of every validation), `valid` | GitHub-side corroboration of the Devin-reported PR |
 | `ci_snapshots` | attempt, `head_sha`, `overall`, `checks` (name/status/conclusion/url), required/missing names, polled_at | One row per CI poll; `cases.ci_status` mirrors the latest |
+| `capacity_leases` | `kind` (`TRIAGE`/`REMEDIATION`/`PROBE`/`RESOURCE`), `scope`, case, attempt, `owner`, `acquired_at`, `expires_at`, `released_at`, `release_reason` | Durable concurrency slots; partial unique index = one live lease per (case, kind, scope) |
+| `cases` (Phase 5 columns) | `waiting_for`, `waiting_since` | Case parked on a full limit, zero ACUs |
 | `attempts` (Phase 4 columns) | `triage_result_hash`, `probe_snapshot_id`, `devin_pull_requests`, `pr_url`, `pr_number`, `branch`, `head_sha`, `ci_deadline_at`, `failure_stage`, `failure_class` | Ties the remediation attempt to the approved triage result, probe, PR and CI |
 
 ## Webhook request path
@@ -609,8 +653,12 @@ the Devin client closes and the database engine is disposed.
   come exclusively from the immutable registry snapshot taken at dispatch —
   never from issue text, Slack, Devin output, or the remediation branch. The
   worker never executes it: `PROBE_RUNNER_MODE` is `fake` or `remote`, and the
-  remote runner refuses any verifier whose `/health` shows a credential, UID 0
-  or a writable root. Inside the verifier, `create_subprocess_exec` with a
+  remote runner refuses any verifier whose `/capabilities` shows a credential,
+  UID 0, a writable root, a missing required tool or (in live mode, always)
+  an unproven isolation property. Worker↔verifier requests are HMAC-signed
+  with a shared secret that is neither a provider nor a database credential;
+  the verifier clones only allowlisted repositories at exact SHAs and rejects
+  any script whose hash differs from the approved registry snapshot. Inside the verifier, `create_subprocess_exec` with a
   fixed argv, a minimal environment (`PATH`, `HOME`, `LANG`, `CI=1`,
   non-interactive git, a per-run marker), an anonymous HTTPS clone of the exact
   commit, `start_new_session`, rlimits, a deadline that includes `proc.wait()`,
@@ -622,6 +670,12 @@ the Devin client closes and the database engine is disposed.
 - Live Devin mode also requires live GitHub and the remote probe runner, so a
   real session can never be verified by fake adapters or by a probe next to
   the credentials.
+- The API enforces a request-body limit, security headers, Origin/CSRF checks
+  on cookie-authenticated operator mutations, and a per-process rate limit on
+  operator actions. Provider base URLs and the verifier URL are validated
+  against SSRF; every outbound error message is passed through the secret
+  redaction filter. Dashboard and Slack links are rendered only from
+  allowlisted hosts (`remediator/safe_urls.py`).
 - Worker loops (`WORKER_CONCURRENCY`, default 2) share one lock order: case →
   approval request → outbox row, all `FOR NO KEY UPDATE`. Deadlock,
   serialization and connection errors are transient: rollback, release the
@@ -663,13 +717,16 @@ the Devin client closes and the database engine is disposed.
   `action_required`). Closing keywords (`Closes owner/repo#N`) are parsed only
   as a fallback and only as an exact `owner/repo#N` token.
 
-## Deferred to Phase 5
+## Deferred beyond Phase 5
 
-- **Verifier hardening:** the credential-free `verifier` container exists;
-  still to do are enforced egress (only anonymous GitHub clones), an
-  authenticated worker↔verifier link (mTLS), and per-probe sub-UIDs or
-  namespaces / container recycling so a verifier is never reused after a
-  suspicious run.
+- **Verifier hardening:** the key-holding front, credential-free runner and
+  exact-host egress proxy exist (Phase 5); still to do are TLS/mTLS on the
+  two internal hops instead of plain HTTP on the compose networks, a shared
+  idempotency store across front restarts, and per-probe sub-UIDs or
+  namespaces / container recycling so a runner is never reused after a
+  suspicious run (which would also lift the one-probe-per-runner limit).
+- **Post-merge verification:** `MERGED` and `MERGE_VERIFIED` remain
+  documented future states; no automatic regression-issue creation.
 - **GitHub App identity:** replace the PAT with an installation token and pin
   `GITHUB_PR_AUTHOR_LOGINS` to the app's bot login.
 - **CI webhook ingestion:** advance `CI_PENDING` from `check_suite` /

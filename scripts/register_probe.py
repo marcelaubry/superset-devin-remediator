@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import shlex
 import sys
 from pathlib import Path
 
@@ -43,6 +44,28 @@ def main() -> int:
     parser.add_argument("--timeout", type=int, default=600)
     parser.add_argument("--tool", action="append", default=[])
     parser.add_argument("--description", default="")
+    parser.add_argument(
+        "--setup",
+        action="append",
+        default=[],
+        metavar="ARGV",
+        help="dependency install step as one shell-quoted argv, e.g. 'npm ci --ignore-scripts'; "
+        "argv[0] must be a --tool. Repeatable, run in order, no shell.",
+    )
+    parser.add_argument("--setup-timeout", type=int, default=None)
+    parser.add_argument(
+        "--cache-input",
+        action="append",
+        default=[],
+        help="repository-relative lockfile hashed into the download-cache key (repeatable)",
+    )
+    parser.add_argument(
+        "--resource-key",
+        action="append",
+        default=[],
+        help="shared resource this remediation conflicts on, e.g. lockfile:superset-frontend "
+        "(repeatable); conflicting cases queue instead of running concurrently",
+    )
     args = parser.parse_args()
 
     root = Path(args.root)
@@ -65,11 +88,21 @@ def main() -> int:
             "runtime": {"tools": args.tool or ["bash"]},
             "description": args.description,
         }
+        if args.setup:
+            manifest["setup"] = [shlex.split(step) for step in args.setup]
+        if args.setup_timeout is not None:
+            manifest["setup_timeout_seconds"] = args.setup_timeout
+        if args.cache_input:
+            manifest["cache_inputs"] = list(args.cache_input)
+        if args.resource_key:
+            manifest["resource_keys"] = list(args.resource_key)
         (directory / MANIFEST_FILENAME).write_text(
             yaml.safe_dump(manifest, sort_keys=False), encoding="utf-8"
         )
     try:
-        probe = asyncio.run(load_approved_probe(root, args.repository, args.issue_number))
+        probe = asyncio.run(
+            load_approved_probe(root, args.repository, args.issue_number, allow_smoke=True)
+        )
     except ProbeRegistryError as exc:
         print(f"INVALID: {exc}", file=sys.stderr)
         return 1

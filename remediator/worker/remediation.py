@@ -12,15 +12,24 @@ from __future__ import annotations
 
 import logging
 import re
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .. import metrics
 from ..approvals import enqueue, is_current_request, open_request_for_case, triage_result_hash
+from ..capacity import (
+    CapacityDenied,
+    CapacityManager,
+    clear_waiting,
+    mark_waiting,
+    validate_resource_key,
+)
 from ..config import Settings
 from ..devin.client import DevinClient
 from ..devin.remediation import (
@@ -54,6 +63,7 @@ from ..models import (
     Attempt,
     AttemptKind,
     AttemptStatus,
+    CapacityLeaseKind,
     Case,
     CiSnapshot,
     DeliveryStatus,
@@ -65,7 +75,13 @@ from ..models import (
     ProbeVerdict,
     PullRequestEvidence,
 )
-from ..probes.registry import ProbeRegistryError, load_approved_probe
+from ..probes.registry import (
+    ProbeRegistryError,
+    load_approved_probe,
+    manifest_cache_inputs,
+    manifest_setup_steps,
+    manifest_setup_timeout,
+)
 from ..probes.remote import VerifierBusyError
 from ..probes.runner import ProbeRunner, ProbeRunResult, ProbeRunSpec
 from ..slack.blocks import RemediationProgress, remediation_headline
@@ -134,6 +150,24 @@ _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 class TransientVerificationError(Exception):
     """GitHub (or another dependency) is unavailable; leave the state untouched and retry."""
+
+
+class CapacityWait(Exception):
+    """A configured concurrency limit is saturated. The case keeps its state, `waiting_for`
+    is already committed, nothing was spent; the worker re-claims after the backoff."""
+
+    def __init__(self, denied: CapacityDenied) -> None:
+        super().__init__(f"waiting for capacity: {denied.label}")
+        self.denied = denied
+
+
+def manifest_resource_keys(manifest: dict[str, Any]) -> tuple[str, ...]:
+    """Optional `resource_keys` declared by the approved probe manifest (lockfiles,
+    migrations, shared config). Conflicting remediations queue instead of racing."""
+    raw = manifest.get("resource_keys")
+    if not isinstance(raw, list):
+        return ()
+    return tuple(dict.fromkeys(validate_resource_key(str(key)) for key in raw))
 
 
 def _now() -> datetime:
@@ -327,6 +361,7 @@ class RemediationPipeline:
         claimed_by: str | None = None,
         clock: Clock = _now,
         sleep: Sleep | None = None,
+        capacity: CapacityManager | None = None,
     ) -> None:
         self.session = session
         self.case = case
@@ -338,6 +373,7 @@ class RemediationPipeline:
         self.claimed_by = claimed_by
         self.clock = clock
         self.sleep = sleep
+        self.capacity = capacity
         self._request: ApprovalRequest | None = None
 
     # -- driver --------------------------------------------------------------------
@@ -376,6 +412,9 @@ class RemediationPipeline:
         except TransientVerificationError as exc:
             logger.warning("case %s: %s; will retry", case.id, exc)
             await self.session.rollback()
+        except CapacityWait as exc:
+            logger.info("case %s: %s", case.id, exc)
+            await self.session.commit()
         except BaseException:
             # The session is unusable after a failed flush/commit (PendingRollbackError on
             # the next statement); roll it back and let the worker classify the error
@@ -654,6 +693,7 @@ class RemediationPipeline:
             claimed_by=self.claimed_by,
             clock=self.clock,
             remediation=runner_context,
+            capacity=self.capacity,
             **({"sleep": self.sleep} if self.sleep is not None else {}),
         )
         if CaseState(case.state) == CaseState.REMEDIATION_TERMINATION_PENDING:
@@ -672,10 +712,18 @@ class RemediationPipeline:
                     )
                     await self.session.commit()
                     return
+                if self.capacity is not None:
+                    await self.capacity.release_all_for_case(
+                        self.session, case.id, "remote termination confirmed"
+                    )
                 await self._transition(CaseState.REMEDIATION_CANCELLED, CANCEL_TERMINATION_REASON)
                 await self.session.commit()
                 return
+        if runner_context is not None:
+            await self._acquire_resource_keys(runner_context.probe)
         outcome = await runner.run(AttemptKind.REMEDIATION)
+        if outcome.result not in {RunResult.TERMINATION_PENDING, RunResult.WAITING_FOR_CAPACITY}:
+            await self._release_resource_keys(f"remediation {outcome.result.value}")
         if outcome.result != RunResult.FINISHED:
             return
         attempt = outcome.attempt
@@ -1026,6 +1074,56 @@ class RemediationPipeline:
             f"PR #{number} corroborated by GitHub at {pull.head_sha[:12]}",
         )
 
+    # -- capacity ----------------------------------------------------------------------
+
+    async def _acquire_resource_keys(self, probe: ProbeSnapshot) -> None:
+        """Resource keys are mutual-exclusion leases (limit 1) taken *before* the session
+        slot so a conflicting job queues without a create intent."""
+        if self.capacity is None:
+            return
+        for key in manifest_resource_keys(probe.manifest):
+            outcome = await self.capacity.acquire(
+                self.session,
+                kind=CapacityLeaseKind.RESOURCE,
+                case_id=self.case.id,
+                scope=key,
+                per_scope_limit=1,
+            )
+            if isinstance(outcome, CapacityDenied):
+                metrics.capacity_denied_total.labels(metrics.mode(), "resource").inc()
+                await mark_waiting(self.session, self.case, outcome)
+                raise CapacityWait(outcome)
+        await clear_waiting(self.session, self.case)
+        await self.session.commit()
+
+    async def _release_resource_keys(self, reason: str) -> None:
+        if self.capacity is None:
+            return
+        await self.capacity.release(
+            self.session, kind=CapacityLeaseKind.RESOURCE, case_id=self.case.id, reason=reason
+        )
+        await self.session.commit()
+
+    async def _acquire_probe_slot(self) -> None:
+        if self.capacity is None:
+            return
+        outcome = await self.capacity.acquire(
+            self.session, kind=CapacityLeaseKind.PROBE, case_id=self.case.id
+        )
+        if isinstance(outcome, CapacityDenied):
+            metrics.capacity_denied_total.labels(metrics.mode(), "probe").inc()
+            await mark_waiting(self.session, self.case, outcome)
+            raise CapacityWait(outcome)
+        await clear_waiting(self.session, self.case)
+        await self.session.commit()
+
+    async def _release_probe_slot(self) -> None:
+        if self.capacity is None:
+            return
+        await self.capacity.release(
+            self.session, kind=CapacityLeaseKind.PROBE, case_id=self.case.id, reason="probe done"
+        )
+
     # -- independent probe execution -------------------------------------------------
 
     async def _execute_probe(
@@ -1040,6 +1138,23 @@ class RemediationPipeline:
             if target == ProbeTarget.BASE
             else snapshot.expected_head_exit_code
         )
+        prior = await self.session.scalar(
+            select(func.count())
+            .select_from(ProbeExecution)
+            .where(
+                ProbeExecution.case_id == self.case.id,
+                ProbeExecution.probe_snapshot_id == snapshot.id,
+                ProbeExecution.target == target,
+                ProbeExecution.commit_sha == commit_sha,
+            )
+        )
+        # Deterministic per (case, snapshot, target, commit, ordinal): a worker that crashes
+        # after the verifier ran but before this row was written re-asks with the same id
+        # and gets the stored verdict instead of a second execution.
+        request_id = uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"probe:{self.case.id}:{snapshot.id}:{target.value}:{commit_sha}:{prior or 0}",
+        ).hex
         spec = ProbeRunSpec(
             repository=snapshot.repository,
             issue_number=snapshot.issue_number,
@@ -1051,18 +1166,31 @@ class RemediationPipeline:
             timeout_seconds=min(snapshot.timeout_seconds, self.settings.probe_timeout_seconds),
             max_output_bytes=self.settings.probe_max_output_bytes,
             required_tools=tuple(str(t) for t in (snapshot.runtime.get("tools") or [])),
+            setup_steps=manifest_setup_steps(snapshot.manifest),
+            setup_timeout_seconds=manifest_setup_timeout(snapshot.manifest),
+            cache_inputs=manifest_cache_inputs(snapshot.manifest),
+            manifest_hash=snapshot.manifest_hash,
+            request_id=request_id,
         )
+        await self._acquire_probe_slot()
         started = self.clock()
         try:
             result: ProbeRunResult = await self.probes.run(spec)
         except VerifierBusyError as exc:
+            metrics.probe_outcomes_total.labels(metrics.mode(), target.value, "busy").inc()
             raise TransientVerificationError(str(exc)) from exc
+        finally:
+            await self._release_probe_slot()
+            await self.session.commit()
         if result.infrastructure_failed:
             verdict = ProbeVerdict.INFRASTRUCTURE
         elif result.exit_code == expected and not result.timed_out:
             verdict = ProbeVerdict.MATCHED
         else:
             verdict = ProbeVerdict.MISMATCHED
+        metrics.probe_outcomes_total.labels(
+            metrics.mode(), target.value, verdict.value.lower()
+        ).inc()
         execution = ProbeExecution(
             case_id=self.case.id,
             attempt_id=attempt.id if attempt is not None else None,
@@ -1081,6 +1209,9 @@ class RemediationPipeline:
             stderr=result.stderr,
             output_truncated=result.output_truncated,
             error=result.infrastructure_error,
+            request_id=request_id,
+            failure_stage=result.failure_stage,
+            tool_versions=dict(result.tool_versions) or None,
             started_at=started,
             finished_at=self.clock(),
         )
@@ -1240,6 +1371,8 @@ class RemediationPipeline:
             )
         )
         case.ci_status = overall
+        if overall in {CI_PASSED, CI_FAILED, CI_TIMED_OUT}:
+            metrics.ci_outcomes_total.labels(metrics.mode(), overall.lower()).inc()
         if overall == CI_PASSED:
             await self._transition(
                 CaseState.CI_PASSED,

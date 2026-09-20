@@ -170,7 +170,9 @@ async def test_dashboard_auth_health_metrics_detail_and_throughput(
         valid = login.cookies.get("operator_session")
         assert valid is not None
         assert (await client.get("/", cookies={"operator_session": valid})).status_code == 200
-        logged_out = await client.post("/logout", cookies={"operator_session": valid})
+        logged_out = await client.post(
+            "/logout", cookies={"operator_session": valid}, headers={"Origin": "http://test"}
+        )
         assert logged_out.status_code == 303
 
 
