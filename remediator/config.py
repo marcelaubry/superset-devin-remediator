@@ -16,8 +16,9 @@ MIN_LIVE_CI_POLL_INTERVAL_SECONDS = 30.0
 DEFAULT_PR_AUTHOR_LOGINS = "devin-ai-integration[bot]"
 MIN_LIVE_SECRET_LENGTH = 16
 PLACEHOLDER_SECRET = "change-me"
-# `repos[]` entries on POST /sessions are repository paths (`owner/repo`), the identifier
-# every other v3 repository surface uses (`repo_names` filter, repository listing).
+# `repos[]` entries on POST /sessions are sent as repository paths (`owner/repo`): the create
+# schema leaves the format unstated, so this is inferred from the other v3 repository surfaces
+# (`repo_names` filter, repository listing) and confirmed by readiness `devin.repository_access`.
 DEFAULT_DEVIN_REPOS_FORMAT = "{repository}"
 REPOS_FORMAT_PLACEHOLDER = "{repository}"
 CANARY_CONCURRENCY_LIMIT = 1

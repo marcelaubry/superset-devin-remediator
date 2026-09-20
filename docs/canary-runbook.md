@@ -74,6 +74,10 @@ Work through the steps in order; do not skip ahead when a step is yellow.
    `github.label[devin:remediate]`, `verifier.key_separation`,
    `verifier.isolation`, `verifier.egress`, `verifier.node`, `verifier.smoke`,
    `dashboard.cookie_secure`, `allowlist.required_label`, `canary.envelope`.
+   `PROBE_SMOKE_PROBE=marcelaubry/superset#0` clones the fork, runs `npm ci`
+   in `superset-frontend` and one Jest test: the heaviest probe in the
+   repository (up to 1800 s), so the verifier needs its full CPU/memory/disk
+   envelope and network reach to npm through the egress proxy.
 6. **Live Devin last.** `DEVIN_CLIENT_MODE=live`, `DEVIN_API_KEY`,
    `DEVIN_ORG_ID`, `DEVIN_TRIAGE_TIMEOUT_SECONDS=1800`,
    `DEVIN_REMEDIATION_TIMEOUT_SECONDS=5400`, `DEVIN_POLL_INTERVAL_SECONDS=15`.

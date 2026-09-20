@@ -220,7 +220,11 @@ and fails the build for any other architecture rather than producing an image
 whose `node` cannot exec. Never set `DOCKER_DEFAULT_PLATFORM=linux/amd64` or a
 `platform:` on the stack: the emulated verifier would run Superset's Jest suite
 under Rosetta/QEMU. `tests/test_phase6_canary.py` guards the Dockerfiles against
-reintroducing a single-architecture download. Cross-building for review:
+reintroducing a single-architecture download. The `linux/arm64` image has so far
+been built and exercised under QEMU emulation on an x86_64 host; run
+`docker compose up --build -d` and `make readiness-smoke` once on a native arm64
+host (Apple Silicon Docker Desktop, Graviton) before relying on it there.
+Cross-building for review:
 
 ```bash
 docker buildx build --platform linux/arm64 -f docker/verifier/Dockerfile .
@@ -334,7 +338,7 @@ failed termination, concurrent retries, and worker restart in every state.
 | `DEVIN_POLL_INTERVAL_SECONDS` | `15` | Poll interval; live mode enforces `>= 10` (10–30 recommended) |
 | `DEVIN_HTTP_TIMEOUT_SECONDS` | `30` | Per-request HTTP timeout |
 | `DEVIN_HTTP_MAX_RETRIES` | `3` | Bounded retries with backoff and jitter for GET/list only |
-| `DEVIN_REPOS_FORMAT` | `{repository}` | Template for the single `repos[]` entry on `POST /v3/organizations/{org}/sessions`: the `owner/repo` repository path, the identifier every other v3 repository surface uses (repository listing `repo_path`, the `repo_names` session filter). Must contain `{repository}` exactly once; the URL form stays configurable. Readiness reports the value and, with live Devin, checks the organization's repository listing for the allowlisted path |
+| `DEVIN_REPOS_FORMAT` | `{repository}` | Template for the single `repos[]` entry on `POST /v3/organizations/{org}/sessions`: the `owner/repo` repository path. The create schema types `repos` as `array[string]` without stating the format; `owner/repo` is inferred from the other v3 repository surfaces (repository listing `repo_path`, the `repo_names` session filter) and confirmed per deployment by the readiness check `devin.repository_access`. Must contain `{repository}` exactly once; the URL form stays configurable. Readiness reports the value and, with live Devin, checks the organization's repository listing for the allowlisted path |
 | `GITHUB_BASE_REF` | `master` | Ref resolved to the exact base SHA pinned in each session |
 | `RECONCILE_MAX_ATTEMPTS` | `3` | Bounded list-by-tag lookups after an uncertain create |
 | `MAX_ATTEMPTS_PER_KIND` | `3` | Per-case triage/remediation spend cap |
