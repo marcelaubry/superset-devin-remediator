@@ -330,7 +330,7 @@ tbody th { font-weight: 500; color: var(--text); }
 tbody tr:hover { background: var(--bg); }
 td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 /* Inside tables the wrapper scrolls, so hashes stay on one line instead of breaking mid-word. */
-td code, td .ext, td time { white-space: nowrap; overflow-wrap: normal; }
+td code, td .ext, td time, tbody th code, tbody th .ext { white-space: nowrap; overflow-wrap: normal; }
 .dash-ops .issue-title { max-width: 28ch; }
 .job-cell { min-width: 13rem; }
 .job-cell .issue-title { max-width: 28ch; }
