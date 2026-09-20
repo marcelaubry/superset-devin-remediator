@@ -7,6 +7,7 @@ import pytest
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from remediator.config import Settings
 from remediator.models import EventStatus, WebhookEvent
 
 
@@ -75,25 +76,57 @@ async def test_filtered_events_are_not_persisted(
     async with integration_session_factory() as session:
         assert await session.scalar(select(func.count()).select_from(WebhookEvent)) == 0
 
+
+@pytest.mark.asyncio
+async def test_unlabeled_opened_issue_is_accepted_by_default(
+    test_app, test_settings, integration_session_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    """No intake label is required by default: every `issues/opened` delivery is persisted
+    so the zero-ACU eligibility filter evaluates it."""
+    assert Settings(_env_file=None).github_required_label == ""
+    test_settings.github_required_label = Settings(_env_file=None).github_required_label
+    transport = httpx.ASGITransport(app=test_app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         body = json.dumps(payload(labels=["bug"])).encode()
-        response = await send(client, body, delivery="missing-label")
+        response = await send(client, body, delivery="unlabeled-opened")
     assert response.status_code == 202
-    assert response.json()["accepted"] is False
+    assert response.json()["accepted"] is True
     async with integration_session_factory() as session:
-        assert await session.scalar(select(func.count()).select_from(WebhookEvent)) == 0
+        assert await session.scalar(select(func.count()).select_from(WebhookEvent)) == 1
 
 
 @pytest.mark.asyncio
-async def test_labeled_action_accepts_added_required_label(test_app) -> None:
-    body = json.dumps(
-        payload(labels=["bug"], action="labeled", added_label="devin-candidate")
-    ).encode()
-    transport = httpx.ASGITransport(app=test_app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await send(client, body, delivery="labeled-delivery")
-    assert response.status_code == 202
-    assert response.json()["accepted"] is True
+async def test_optional_intake_label_filters_unlabeled_issues(
+    test_app, test_settings, integration_session_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    """Deployments may opt in to label gating; then unlabeled issues are filtered and an
+    `labeled` event adding the intake or remediation label is accepted."""
+    test_settings.github_required_label = "devin-candidate"
+    try:
+        transport = httpx.ASGITransport(app=test_app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            body = json.dumps(payload(labels=["bug"])).encode()
+            response = await send(client, body, delivery="missing-label")
+            assert response.status_code == 202
+            assert response.json()["accepted"] is False
+            async with integration_session_factory() as session:
+                assert await session.scalar(select(func.count()).select_from(WebhookEvent)) == 0
+
+            body = json.dumps(
+                payload(labels=["bug"], action="labeled", added_label="devin-candidate")
+            ).encode()
+            response = await send(client, body, delivery="labeled-delivery")
+            assert response.status_code == 202
+            assert response.json()["accepted"] is True
+
+            body = json.dumps(
+                payload(labels=["bug"], action="labeled", added_label="devin:remediate")
+            ).encode()
+            response = await send(client, body, delivery="remediate-labeled-delivery")
+            assert response.status_code == 202
+            assert response.json()["accepted"] is True
+    finally:
+        test_settings.github_required_label = ""
 
 
 @pytest.mark.asyncio

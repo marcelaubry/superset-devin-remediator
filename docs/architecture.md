@@ -25,6 +25,21 @@
 - **DevinRunner (`remediator/worker/devin_runner.py`):** The bounded session
   state machine: durable create intent → single create → reconcile-by-tag →
   poll until deadline → final GET → remote termination → schema validation.
+  Phase-aware: triage attempts use the generic states, remediation attempts
+  use the `REMEDIATION_*` variants, so one audit trail never mixes phases.
+- **RemediationPipeline (`remediator/worker/remediation.py`):** Consumes
+  `REMEDIATION_APPROVED`: zero-ACU preconditions → probe snapshot → probe at
+  base → DevinRunner → structured-output validation → PR discovery from
+  `pull_requests[]` → GitHub PR validation → probe at head → bounded CI
+  polling. Each stage is a separate resumable case state.
+- **Probe registry and runners (`remediator/probes`):** Loads and validates
+  `probes/<owner>/<repo>/<issue>/probe.yaml` + `probe.sh` (schema, repository,
+  issue, 40-hex base SHA, exit codes, timeout, runtime tools, script SHA-256
+  recomputed and compared), records the registry commit, and exposes a
+  `ProbeRunner` protocol. `FakeProbeRunner` is deterministic by issue number;
+  `LocalProbeRunner` clones the exact commit into a temp workspace and runs the
+  snapshotted script under timeout/output caps with no shell interpolation and
+  no credentials, refusing to start inside a credential-bearing process.
 - **Slack adapter (`remediator/slack`):** request signature verification
   (`v0:{ts}:{raw body}` HMAC-SHA256, replay window, constant-time compare),
   a Block Kit builder that escapes untrusted text and enforces Slack limits,
@@ -32,8 +47,10 @@
   `slack_fake_messages`; `LiveSlackClient` calls `chat.postMessage` /
   `chat.update`.
 - **GitHub client (`remediator/github/client.py`):** `FakeGitHubClient` and
-  `LiveGitHubClient` (issues GET, labels POST, comments POST). Every call
-  checks the repository allowlist before any network I/O.
+  `LiveGitHubClient` (issues GET, labels POST, comments POST, plus typed pulls,
+  PR files, compare, issue timeline cross-references and commit check runs).
+  Every call checks the repository allowlist before any network I/O; the fake
+  derives PR/CI shape from the fixture issue number.
 - **Approval service (`remediator/approvals.py`):** creates approval requests
   after a valid `remediation_candidate` triage, processes verified Slack
   actions (token → expiry → approver → state → dedupe) in one transaction,
@@ -49,7 +66,9 @@ flowchart LR
   W[Worker / DevinRunner] --> DB
   W -->|DEVIN_CLIENT_MODE=live| L[Devin v3 API]
   W -->|DEVIN_CLIENT_MODE=fake| D[Fake Devin]
-  W -->|base SHA| GHAPI[GitHub commits API]
+  W -->|base SHA, pulls, files, compare, timeline, check-runs| GHAPI[GitHub REST API]
+  W -->|ProbeRunner| P[Probe runner\nfake / local isolated checkout]
+  W -->|remediation session| L
   DB --> UI[Operator browser dashboard]
   DB --> O[Transactional outbox]
   W -->|dispatch| O
@@ -255,6 +274,63 @@ expired and resumes from the persisted attempt: a `PENDING` create is
 reconciled by tag rather than re-sent, a `CREATED` session is polled, a
 pending termination is retried.
 
+## Phase 4 remediation flow
+
+```text
+REMEDIATION_APPROVED
+  │ zero-ACU preconditions: allowlist, approval.decision=APPROVED and
+  │ approval.triage_result_hash == sha256(current validated triage), triage
+  │ attempt is the latest (not superseded), default branch configured,
+  │ `devin:remediate` present on the exact open issue (GitHub GET), no active
+  │ REMEDIATION attempt, no PullRequestEvidence.valid=true, approved probe
+  │ loads and validates → ProbeSnapshot row (manifest, script content, hashes,
+  │ registry commit, expected exit codes, timeout, runtime)
+  ▼
+PROBE_VALIDATING_BASE          probe @ manifest.base_sha, persisted ProbeExecution
+  ├─ exit == expected_base  → REMEDIATION_CREATE_INTENT (spend permitted)
+  ├─ exit == expected_head  → REMEDIATION_HUMAN_BLOCKED  no_change_needed, 0 ACU
+  ├─ infrastructure         → PROBE_INFRASTRUCTURE_BLOCKED             0 ACU
+  └─ other / timeout        → REMEDIATION_FAILED                       0 ACU
+REMEDIATION_CREATE_INTENT      attempt + operation key op:<case>:REMEDIATION:<hash12>:<sha12>:<n>
+  │                            (UNIQUE, exact session tag); BASE execution re-linked to attempt
+  ├─ POST ok                → REMEDIATING
+  ├─ POST uncertain         → REMEDIATION_RECONCILING_CREATE (list by tag; never re-POST)
+  │                              ├─ one match → REMEDIATING
+  │                              └─ inconclusive → REMEDIATION_HUMAN_BLOCKED
+  └─ definitive API error   → REMEDIATION_FAILED
+REMEDIATING                    poll; deadline → final GET → DELETE → REMEDIATION_TERMINATION_PENDING
+  ├─ finished               → OUTPUT_VALIDATING
+  ├─ waiting_for_user etc.  → REMEDIATION_HUMAN_BLOCKED (session retained)
+  └─ termination confirmed  → REMEDIATION_TIMED_OUT
+OUTPUT_VALIDATING              remediation.v1 schema; outcome routing:
+  ├─ pr_created             → PR_DISCOVERED (candidate from pull_requests[] only)
+  ├─ no_change_needed       → REMEDIATION_HUMAN_BLOCKED (base evidence disagreed)
+  ├─ needs_human            → REMEDIATION_HUMAN_BLOCKED (blocking_questions shown)
+  └─ failed / invalid       → REMEDIATION_FAILED
+PR_DISCOVERED → PR_VALIDATING  GitHub GET pull, files, compare, timeline
+  │ exists in allowlisted repo, open/draft & not merged, base == default branch,
+  │ head ref starts with prefix, head SHA == structured output, ahead of pinned
+  │ base (compare status ahead/diverged handled), closing ref resolves to this
+  │ issue (timeline cross-reference, then exact owner/repo#N), author in
+  │ GITHUB_PR_AUTHOR_LOGINS, no forbidden paths (probes/, .github/, repo
+  │ settings), changed_files declared, count <= REMEDIATION_MAX_CHANGED_FILES
+  ├─ all pass               → PROBE_VALIDATING_HEAD
+  ├─ scope expansion        → REMEDIATION_HUMAN_BLOCKED
+  └─ any contradiction      → REMEDIATION_FAILED (PullRequestEvidence.valid=false)
+PROBE_VALIDATING_HEAD          identical snapshot/hash @ head_sha
+  ├─ exit == expected_head  → PR_VALIDATED → CI_PENDING
+  ├─ infrastructure         → REMEDIATION_FAILED (class=infrastructure; retry-probe allowed)
+  └─ mismatch               → REMEDIATION_FAILED (no automatic fix chain)
+CI_PENDING                     check runs for head_sha, bounded by CI_TIMEOUT_SECONDS
+  ├─ required all success  → CI_PASSED   (ready for human review; no merge)
+  ├─ failure/cancelled/timed_out/absent at deadline → CI_FAILED (retry-ci allowed)
+  └─ pending               → stay, ci_snapshots row per poll
+```
+
+Every milestone enqueues a `remediation_status_update` outbox row that edits
+the original Slack approval message; Slack failures are retried by the outbox
+and never touch remediation state.
+
 ## Lifecycle
 
 The eligibility filter runs without ACU cost. Eligible cases go directly to
@@ -262,8 +338,8 @@ triage; there is no approval or notification before triage. A
 `remediation_candidate` verdict creates one approval request and one Slack
 outbox row; an authorized human approves or rejects from Slack, and the case
 reaches `REMEDIATION_APPROVED` only through GitHub's signed `labeled` webhook.
-`REMEDIATION_APPROVED → REMEDIATION_CREATE_INTENT` exists in the transition
-table for Phase 4 but nothing in this release performs it.
+From there the remediation pipeline above takes over; remediation-phase
+terminations always use the `REMEDIATION_*` variants.
 
 ```mermaid
 stateDiagram-v2
@@ -294,31 +370,77 @@ stateDiagram-v2
   APPROVAL_DELIVERY_FAILED --> CANCELLED
   APPROVAL_DELIVERY_FAILED --> FAILED
   APPROVAL_DELIVERY_FAILED --> TERMINATION_PENDING
-  REMEDIATION_APPROVED --> REMEDIATION_CREATE_INTENT: Phase 4
-  REMEDIATION_APPROVED --> CANCELLED
-  REMEDIATION_APPROVED --> FAILED
   REMEDIATION_REJECTED --> [*]
+  REMEDIATION_APPROVED --> PROBE_VALIDATING_BASE: preconditions + snapshot
+  REMEDIATION_APPROVED --> REMEDIATION_HUMAN_BLOCKED
+  REMEDIATION_APPROVED --> REMEDIATION_FAILED
+  REMEDIATION_APPROVED --> REMEDIATION_CANCELLED
+  PROBE_VALIDATING_BASE --> REMEDIATION_CREATE_INTENT: base fails as declared
+  PROBE_VALIDATING_BASE --> REMEDIATION_HUMAN_BLOCKED: no_change_needed
+  PROBE_VALIDATING_BASE --> PROBE_INFRASTRUCTURE_BLOCKED
+  PROBE_VALIDATING_BASE --> REMEDIATION_FAILED
+  PROBE_VALIDATING_BASE --> REMEDIATION_CANCELLED
+  PROBE_INFRASTRUCTURE_BLOCKED --> PROBE_VALIDATING_BASE: operator retry-probe
+  PROBE_INFRASTRUCTURE_BLOCKED --> REMEDIATION_CANCELLED
   REMEDIATION_CREATE_INTENT --> REMEDIATING
-  REMEDIATION_CREATE_INTENT --> RECONCILING_CREATE
-  REMEDIATION_CREATE_INTENT --> FAILED
-  REMEDIATION_CREATE_INTENT --> CANCELLED
-  REMEDIATION_CREATE_INTENT --> TERMINATION_PENDING
+  REMEDIATION_CREATE_INTENT --> REMEDIATION_RECONCILING_CREATE
+  REMEDIATION_CREATE_INTENT --> REMEDIATION_TERMINATION_PENDING
+  REMEDIATION_CREATE_INTENT --> REMEDIATION_FAILED
+  REMEDIATION_CREATE_INTENT --> REMEDIATION_CANCELLED
+  REMEDIATION_RECONCILING_CREATE --> REMEDIATING: single tag match
+  REMEDIATION_RECONCILING_CREATE --> REMEDIATION_HUMAN_BLOCKED: inconclusive
+  REMEDIATION_RECONCILING_CREATE --> REMEDIATION_TERMINATION_PENDING
+  REMEDIATION_RECONCILING_CREATE --> REMEDIATION_FAILED
+  REMEDIATION_RECONCILING_CREATE --> REMEDIATION_CANCELLED
   REMEDIATING --> OUTPUT_VALIDATING
-  REMEDIATING --> FAILED
-  REMEDIATING --> HUMAN_BLOCKED
-  REMEDIATING --> TIMED_OUT
-  OUTPUT_VALIDATING --> PR_VALIDATED
-  OUTPUT_VALIDATING --> FAILED
-  OUTPUT_VALIDATING --> CANCELLED
-  OUTPUT_VALIDATING --> TERMINATION_PENDING
+  REMEDIATING --> REMEDIATION_HUMAN_BLOCKED
+  REMEDIATING --> REMEDIATION_TIMED_OUT
+  REMEDIATING --> REMEDIATION_TERMINATION_PENDING
+  REMEDIATING --> REMEDIATION_FAILED
+  REMEDIATING --> REMEDIATION_CANCELLED
+  OUTPUT_VALIDATING --> PR_DISCOVERED
+  OUTPUT_VALIDATING --> REMEDIATION_HUMAN_BLOCKED
+  OUTPUT_VALIDATING --> REMEDIATION_FAILED
+  OUTPUT_VALIDATING --> REMEDIATION_CANCELLED
+  PR_DISCOVERED --> PR_VALIDATING
+  PR_DISCOVERED --> REMEDIATION_HUMAN_BLOCKED
+  PR_DISCOVERED --> REMEDIATION_FAILED
+  PR_DISCOVERED --> REMEDIATION_CANCELLED
+  PR_VALIDATING --> PROBE_VALIDATING_HEAD
+  PR_VALIDATING --> REMEDIATION_HUMAN_BLOCKED: scope expansion
+  PR_VALIDATING --> REMEDIATION_FAILED: contradiction
+  PR_VALIDATING --> REMEDIATION_CANCELLED
+  PROBE_VALIDATING_HEAD --> PR_VALIDATED
+  PROBE_VALIDATING_HEAD --> REMEDIATION_HUMAN_BLOCKED
+  PROBE_VALIDATING_HEAD --> REMEDIATION_FAILED
+  PROBE_VALIDATING_HEAD --> REMEDIATION_CANCELLED
   PR_VALIDATED --> CI_PENDING
-  PR_VALIDATED --> FAILED
-  PR_VALIDATED --> CANCELLED
-  PR_VALIDATED --> TERMINATION_PENDING
+  PR_VALIDATED --> REMEDIATION_FAILED
+  PR_VALIDATED --> REMEDIATION_CANCELLED
   CI_PENDING --> CI_PASSED
-  CI_PENDING --> FAILED
-  CI_PENDING --> CANCELLED
-  CI_PENDING --> TERMINATION_PENDING
+  CI_PENDING --> CI_FAILED
+  CI_PENDING --> REMEDIATION_HUMAN_BLOCKED
+  CI_PENDING --> REMEDIATION_FAILED
+  CI_PENDING --> REMEDIATION_CANCELLED
+  CI_PASSED --> [*]
+  CI_FAILED --> CI_PENDING: operator retry-ci
+  CI_FAILED --> REMEDIATION_CANCELLED
+  REMEDIATION_HUMAN_BLOCKED --> REMEDIATION_APPROVED: operator retry (new attempt)
+  REMEDIATION_HUMAN_BLOCKED --> REMEDIATION_TERMINATION_PENDING
+  REMEDIATION_HUMAN_BLOCKED --> REMEDIATION_FAILED
+  REMEDIATION_HUMAN_BLOCKED --> REMEDIATION_CANCELLED
+  REMEDIATION_TERMINATION_PENDING --> REMEDIATION_TIMED_OUT: DELETE confirmed
+  REMEDIATION_TERMINATION_PENDING --> OUTPUT_VALIDATING: final GET saw completion
+  REMEDIATION_TERMINATION_PENDING --> REMEDIATION_HUMAN_BLOCKED
+  REMEDIATION_TERMINATION_PENDING --> REMEDIATION_FAILED
+  REMEDIATION_TERMINATION_PENDING --> REMEDIATION_CANCELLED
+  REMEDIATION_FAILED --> REMEDIATION_APPROVED: operator retry (new attempt)
+  REMEDIATION_FAILED --> PROBE_VALIDATING_HEAD: retry-probe (infrastructure only)
+  REMEDIATION_FAILED --> CI_PENDING: retry-ci
+  REMEDIATION_FAILED --> REMEDIATION_CANCELLED
+  REMEDIATION_TIMED_OUT --> REMEDIATION_APPROVED: operator retry (new attempt)
+  REMEDIATION_TIMED_OUT --> REMEDIATION_CANCELLED
+  REMEDIATION_CANCELLED --> [*]
   HUMAN_BLOCKED --> RECEIVED
   HUMAN_BLOCKED --> CANCELLED
   HUMAN_BLOCKED --> FAILED
@@ -336,7 +458,6 @@ stateDiagram-v2
   REMEDIATING --> TERMINATION_PENDING
   AWAITING_REMEDIATION_APPROVAL --> TERMINATION_PENDING
   RECONCILING_CREATE --> TRIAGING
-  RECONCILING_CREATE --> REMEDIATING
   RECONCILING_CREATE --> HUMAN_BLOCKED
   RECONCILING_CREATE --> FAILED
   RECONCILING_CREATE --> CANCELLED
@@ -349,9 +470,16 @@ stateDiagram-v2
 `TRIAGE_CREATE_INTENT` and `REMEDIATION_CREATE_INTENT` make external session
 creation resumable. Triage infeasibility transitions to `POLICY_REJECTED`,
 records a GitHub notification intent, and creates no remediation attempt.
-Retries from `FAILED` or `TIMED_OUT` normally return to eligibility, while a
-case whose latest attempt is a failed remediation after successful triage
-returns directly to `REMEDIATION_CREATE_INTENT`.
+Retries from `FAILED` or `TIMED_OUT` return to eligibility. Remediation
+retries (`REMEDIATION_FAILED`, `REMEDIATION_TIMED_OUT`,
+`REMEDIATION_HUMAN_BLOCKED`) return to `REMEDIATION_APPROVED` so the
+preconditions and the base probe run again and a new attempt/operation key is
+minted; `PROBE_VALIDATING_HEAD` and `CI_PENDING` are re-enterable only for
+infrastructure failures on the already-verified attempt. Every remediation
+attempt records `failure_stage` (`dispatch`, `probe_base`, `create`, `session`,
+`output`, `pr`, `probe_head`, `ci`) and `failure_class` (`policy`,
+`session`, `verification`, `infrastructure`) so operator retries can be
+authorised precisely.
 
 ## Data model
 
@@ -366,6 +494,11 @@ returns directly to `REMEDIATION_CREATE_INTENT`.
 | `slack_actions` | approval request, `action_ts`, Slack user, action id, outcome | Unique dedupe key and append-only audit of every verified click |
 | `approval_events` | approval request, kind, actor, detail | Append-only approval timeline shown in the dashboard |
 | `slack_fake_messages` | channel, ts, text, blocks | Fake adapter store, readable only via the authenticated operator API |
+| `probe_snapshots` | case, repository, issue, `probe_identifier`, `base_sha`, manifest (JSON) + `manifest_hash`, `script_content` + `script_hash`, `registry_commit`, expected exit codes, timeout, runtime | Immutable copy of the approved probe taken at dispatch; every execution references it, never the working tree |
+| `probe_executions` | snapshot, attempt (nullable for the pre-session BASE run), target `BASE`/`HEAD`, `commit_sha`, `runner_mode`, `command_identity`, `script_hash`, exit code, expected code, `verdict` (`MATCHED`/`MISMATCHED`/`INFRASTRUCTURE`), duration, bounded stdout/stderr, `timed_out`, `output_truncated` | Independent reproduction evidence |
+| `pull_request_evidence` | case, attempt, repository, PR number/url, base/head ref and SHA, author, state, merged, changed files, `checks` (JSON of every validation), `valid` | GitHub-side corroboration of the Devin-reported PR |
+| `ci_snapshots` | attempt, `head_sha`, `overall`, `checks` (name/status/conclusion/url), required/missing names, polled_at | One row per CI poll; `cases.ci_status` mirrors the latest |
+| `attempts` (Phase 4 columns) | `triage_result_hash`, `probe_snapshot_id`, `devin_pull_requests`, `pr_url`, `pr_number`, `branch`, `head_sha`, `ci_deadline_at`, `failure_stage`, `failure_class` | Ties the remediation attempt to the approved triage result, probe, PR and CI |
 
 ## Webhook request path
 
@@ -466,6 +599,21 @@ the Devin client closes and the database engine is disposed.
   authenticated `/api/slack/fake/messages` route.
 - Accepted webhook payloads are stored verbatim; deployments should consider
   retention and possible personal information in issue bodies.
+- Probe scripts are the only repository code the service ever executes. They
+  come exclusively from the immutable registry snapshot taken at dispatch —
+  never from issue text, Slack, Devin output, or the remediation branch. The
+  local runner uses `create_subprocess_exec` with a fixed argv, a minimal
+  environment (`PATH`, `HOME`, `LANG`, `CI=1`, non-interactive git), an
+  anonymous HTTPS clone of the exact commit, `start_new_session` so the whole
+  process group is killed on timeout, bounded captures, and `tempfile`
+  cleanup. It refuses to run at all if the hosting process can see any
+  credential-shaped variable or mounted secret file; live Devin mode requires
+  the operator to attest a credential-free verifier boundary
+  (`PROBE_VERIFIER_ISOLATION=credential_free_container`). See
+  [known-limitations.md](known-limitations.md) for why a scrubbed child
+  environment alone is insufficient.
+- Live Devin mode also requires live GitHub and the local probe runner, so a
+  real session can never be verified by fake adapters.
 
 ## API assumptions verified against current documentation
 
@@ -484,13 +632,34 @@ the Devin client closes and the database engine is disposed.
   the issue's current labels first so `applied` is reported truthfully.
 - GitHub sends `issues` `labeled` events with `payload.label.name`; the
   webhook signature is `X-Hub-Signature-256`.
+- Devin v3 `GET /sessions/{id}` returns `pull_requests[]` (each with a `url`)
+  alongside `structured_output`; the pipeline reads candidates only from that
+  array. `POST /sessions` accepts `tags`, `max_acu_limit`,
+  `structured_output_schema` and `structured_output_required`; `GET /sessions`
+  filters by `tags`.
+- GitHub `GET /repos/{o}/{r}/pulls/{n}` exposes `state`, `draft`, `merged`,
+  `base.ref`, `head.ref`, `head.sha`, `user.login`; `GET .../pulls/{n}/files`
+  lists changed paths (paginated); `GET /repos/{o}/{r}/compare/{base}...{head}`
+  returns `status` (`ahead`/`behind`/`diverged`/`identical`) and `ahead_by`;
+  `GET /repos/{o}/{r}/issues/{n}/timeline` yields `cross-referenced` events
+  whose `source.issue.pull_request` identifies linking PRs;
+  `GET /repos/{o}/{r}/commits/{sha}/check-runs` returns `check_runs[]` with
+  `status` (`queued`/`in_progress`/`completed`) and `conclusion`
+  (`success`/`failure`/`neutral`/`cancelled`/`skipped`/`timed_out`/
+  `action_required`). Closing keywords (`Closes owner/repo#N`) are parsed only
+  as a fallback and only as an exact `owner/repo#N` token.
 
-## Deferred to Phase 4
+## Deferred to Phase 5
 
-- **Remediation sessions:** consume `REMEDIATION_APPROVED` cases; live mode
-  still refuses `REMEDIATION` attempts.
-- **GitHub App writes:** branches, pull requests, and statuses (comments and
-  labels are implemented here).
-- **Stage deadline reconciliation:** apply longer-lived stage deadlines and operational escalation to `TIMED_OUT`.
-- **CI webhook ingestion:** advance `CI_PENDING` from GitHub CI events.
-- **Retention and cleanup:** expire old payloads, attempts, and notification records.
+- **Credential-free verifier container:** the production path for local probe
+  execution. The worker container holds Devin/GitHub/Slack/operator/database
+  credentials, so `LocalProbeRunner` refuses to run there; Phase 5 adds a
+  separate `verifier` service (no secrets, network limited to anonymous GitHub
+  clone) that consumes probe run requests from PostgreSQL and writes
+  `probe_executions`.
+- **GitHub App identity:** replace the PAT with an installation token and pin
+  `GITHUB_PR_AUTHOR_LOGINS` to the app's bot login.
+- **CI webhook ingestion:** advance `CI_PENDING` from `check_suite` /
+  `workflow_run` events instead of polling.
+- **Retention and cleanup:** expire old payloads, attempts, probe output, and
+  notification records.

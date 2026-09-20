@@ -355,7 +355,7 @@ async def test_slack_notification_failure_never_fails_triage(
     assert SLACK_SECRET not in caplog.text
 
     # An authenticated operator retry re-queues the row and the notification then lands.
-    harness.slack._fail_posts = False
+    harness.slack.fail_posts = False
     retry = await harness.client.post(
         f"/operator/outbox/{rows[0].id}/retry", headers=harness.operator
     )

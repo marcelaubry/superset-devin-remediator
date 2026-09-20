@@ -46,6 +46,32 @@ class CreateSessionRequest:
 
 
 @dataclass(frozen=True)
+class SessionPullRequest:
+    """One entry of the v3 `pull_requests[]` array (`pr_url`, `pr_state`)."""
+
+    pr_url: str
+    pr_state: str | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"pr_url": self.pr_url, "pr_state": self.pr_state}
+
+
+def parse_pull_requests(raw: object) -> tuple[SessionPullRequest, ...]:
+    if not isinstance(raw, list):
+        return ()
+    parsed: list[SessionPullRequest] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        url = item.get("pr_url")
+        if not isinstance(url, str) or not url:
+            continue
+        state = item.get("pr_state")
+        parsed.append(SessionPullRequest(pr_url=url, pr_state=str(state) if state else None))
+    return tuple(parsed)
+
+
+@dataclass(frozen=True)
 class SessionSnapshot:
     """A point-in-time view of a Devin session as returned by the v3 API."""
 
@@ -57,6 +83,7 @@ class SessionSnapshot:
     structured_output: dict[str, Any] | None = None
     acus_consumed: float | None = None
     updated_at: datetime | None = None
+    pull_requests: tuple[SessionPullRequest, ...] = ()
     extra: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
 
 

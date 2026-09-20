@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -126,6 +127,12 @@ LIVE_OK: dict[str, Any] = {
     "devin_triage_timeout_seconds": 1800,
     "github_webhook_secret": "webhook-secret-with-enough-entropy",
     "operator_token": "operator-token-with-enough-entropy",
+    # Phase 4: a live Devin session needs a live evidence chain.
+    "github_client_mode": "live",
+    "github_token": "ghp_" + "t" * 40,
+    "probe_runner_mode": "local",
+    "probe_root": str(Path(__file__).resolve().parents[1] / "probes"),
+    "probe_verifier_isolation": "credential_free_container",
     "_env_file": None,
 }
 
@@ -150,6 +157,16 @@ def test_live_mode_fails_closed_without_credentials(monkeypatch: pytest.MonkeyPa
     assert "apk_unit_test_secret_key" not in repr(ok)
     assert "apk_unit_test_secret_key" not in str(ok.devin_api_key)
     assert "apk_unit_test_secret_key" not in ok.model_dump_json()
+
+
+def test_live_mode_requires_credential_free_probe_verifier() -> None:
+    """Probes run repository code; live mode refuses to run them inside the credential-bearing
+    worker (see docs/threat-model.md) unless a dedicated verifier boundary is declared."""
+    with pytest.raises(ValueError, match="PROBE_VERIFIER_ISOLATION=credential_free_container"):
+        _live(probe_verifier_isolation="none")
+    with pytest.raises(ValueError, match="PROBE_RUNNER_MODE=local"):
+        _live(probe_runner_mode="fake")
+    assert Settings(_env_file=None).probe_verifier_isolation == "none"
 
 
 def test_live_mode_rejects_fake_simulation_timeout() -> None:

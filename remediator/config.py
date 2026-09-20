@@ -1,4 +1,5 @@
 from functools import lru_cache
+from pathlib import Path
 from typing import Literal
 
 from pydantic import SecretStr, model_validator
@@ -7,6 +8,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 MIN_LIVE_POLL_INTERVAL_SECONDS = 10.0
 MAX_RECOMMENDED_POLL_INTERVAL_SECONDS = 30.0
 MIN_LIVE_TRIAGE_TIMEOUT_SECONDS = 300.0
+MIN_LIVE_REMEDIATION_TIMEOUT_SECONDS = 600.0
+MIN_LIVE_CI_POLL_INTERVAL_SECONDS = 30.0
+DEFAULT_PR_AUTHOR_LOGINS = "devin-ai-integration[bot]"
 MIN_LIVE_SECRET_LENGTH = 16
 PLACEHOLDER_SECRET = "change-me"
 
@@ -24,7 +28,9 @@ class Settings(BaseSettings):
     github_fake_fail_labels: bool = False
     github_allowed_events: str = "issues"
     github_allowed_actions: str = "opened,labeled"
-    github_required_label: str = "devin-candidate"
+    # Empty by default: every newly opened issue passes through the zero-ACU eligibility
+    # filter. Set a label to make intake opt-in for a deployment.
+    github_required_label: str = ""
     worker_poll_interval_seconds: float = 1.0
     worker_concurrency: int = 2
     worker_lease_seconds: int = 300
@@ -42,6 +48,25 @@ class Settings(BaseSettings):
     devin_poll_interval_seconds: float = 15.0
     devin_http_timeout_seconds: float = 30.0
     devin_http_max_retries: int = 3
+    devin_remediation_max_acu: int = 15
+    devin_remediation_timeout_seconds: float = 5400.0
+    devin_remediation_branch_prefix: str = "devin/"
+    probe_runner_mode: Literal["fake", "local"] = "fake"
+    # "none": the local runner executes inside this (credential-bearing) process and will
+    # refuse every probe as an infrastructure failure; live mode rejects it outright.
+    # "credential_free_container": the operator attests the worker that runs probes holds no
+    # Devin/GitHub/Slack/operator/database secrets (Phase 5 verifier container). The runner
+    # still verifies that claim against its own environment before spawning anything.
+    probe_verifier_isolation: Literal["none", "credential_free_container"] = "none"
+    probe_root: str = "probes"
+    probe_timeout_seconds: int = 900
+    probe_max_output_bytes: int = 65536
+    probe_clone_url_format: str = "https://github.com/{repository}.git"
+    ci_poll_interval_seconds: float = 60.0
+    ci_timeout_seconds: float = 4 * 3600.0
+    github_pr_author_logins: str = DEFAULT_PR_AUTHOR_LOGINS
+    github_required_checks: str = ""
+    remediation_max_changed_files: int = 25
     max_attempts_per_kind: int = 3
     log_level: str = "INFO"
     cookie_secure: bool = False
@@ -87,6 +112,20 @@ class Settings(BaseSettings):
         return frozenset(x.strip() for x in self.slack_approver_user_ids.split(",") if x.strip())
 
     @property
+    def pr_author_logins(self) -> frozenset[str]:
+        return frozenset(
+            x.strip().lower() for x in self.github_pr_author_logins.split(",") if x.strip()
+        )
+
+    @property
+    def required_checks(self) -> tuple[str, ...]:
+        return tuple(x.strip() for x in self.github_required_checks.split(",") if x.strip())
+
+    @property
+    def probe_root_path(self) -> Path:
+        return Path(self.probe_root).expanduser()
+
+    @property
     def allowed_repositories(self) -> frozenset[str]:
         return frozenset(x.strip().lower() for x in self.github_repository.split(",") if x.strip())
 
@@ -128,6 +167,31 @@ class Settings(BaseSettings):
             raise ValueError("SLACK_ACTION_TOKEN_TTL_SECONDS must be positive")
         if self.outbox_max_attempts <= 0:
             raise ValueError("OUTBOX_MAX_ATTEMPTS must be a positive integer")
+        if self.devin_remediation_max_acu <= 0:
+            raise ValueError("DEVIN_REMEDIATION_MAX_ACU must be a positive integer")
+        if self.devin_remediation_timeout_seconds <= 0:
+            raise ValueError("DEVIN_REMEDIATION_TIMEOUT_SECONDS must be positive")
+        prefix = self.devin_remediation_branch_prefix
+        if not prefix or not prefix.endswith("/") or prefix.startswith("/") or ".." in prefix:
+            raise ValueError(
+                "DEVIN_REMEDIATION_BRANCH_PREFIX must be a non-empty ref namespace ending in '/'"
+            )
+        if self.probe_timeout_seconds <= 0:
+            raise ValueError("PROBE_TIMEOUT_SECONDS must be positive")
+        if self.probe_max_output_bytes < 1024:
+            raise ValueError("PROBE_MAX_OUTPUT_BYTES must be at least 1024")
+        if self.ci_poll_interval_seconds < 0:
+            raise ValueError("CI_POLL_INTERVAL_SECONDS must be non-negative")
+        if self.ci_timeout_seconds <= 0:
+            raise ValueError("CI_TIMEOUT_SECONDS must be positive")
+        if not self.probe_root.strip():
+            raise ValueError("PROBE_ROOT must not be empty")
+        if not self.pr_author_logins:
+            raise ValueError("GITHUB_PR_AUTHOR_LOGINS must name the expected integration identity")
+        if "{repository}" not in self.probe_clone_url_format or not (
+            self.probe_clone_url_format.startswith("https://")
+        ):
+            raise ValueError("PROBE_CLONE_URL_FORMAT must be an https template with {repository}")
         if not self.allowed_repositories:
             raise ValueError("GITHUB_REPOSITORY must name at least one allowlisted repository")
         if self.slack_live:
@@ -187,6 +251,39 @@ class Settings(BaseSettings):
             raise ValueError(
                 "DEVIN_POLL_INTERVAL_SECONDS must be at least "
                 f"{MIN_LIVE_POLL_INTERVAL_SECONDS:g}s in live mode"
+            )
+        # Phase 4 fail-closed checks: a live Devin session may open a real PR, so the
+        # evidence chain (GitHub, probe runner, CI) must be real as well.
+        if not self.github_live:
+            raise ValueError(
+                "DEVIN_CLIENT_MODE=live requires GITHUB_CLIENT_MODE=live; PR and CI evidence "
+                "cannot come from the fake GitHub adapter"
+            )
+        if self.devin_remediation_timeout_seconds < MIN_LIVE_REMEDIATION_TIMEOUT_SECONDS:
+            raise ValueError(
+                "DEVIN_REMEDIATION_TIMEOUT_SECONDS must be at least "
+                f"{MIN_LIVE_REMEDIATION_TIMEOUT_SECONDS:.0f} in live mode"
+            )
+        if self.probe_runner_mode != "local":
+            raise ValueError(
+                "DEVIN_CLIENT_MODE=live requires PROBE_RUNNER_MODE=local; the fake probe runner "
+                "is not independent evidence"
+            )
+        if self.probe_verifier_isolation != "credential_free_container":
+            raise ValueError(
+                "DEVIN_CLIENT_MODE=live requires "
+                "PROBE_VERIFIER_ISOLATION=credential_free_container; probes run repository "
+                "code and must never execute inside a process that holds Devin, GitHub, Slack, "
+                "operator or database credentials (see docs/threat-model.md)"
+            )
+        if not self.probe_root_path.is_dir():
+            raise ValueError(
+                f"PROBE_ROOT {self.probe_root!r} must be an existing directory in live mode"
+            )
+        if self.ci_poll_interval_seconds < MIN_LIVE_CI_POLL_INTERVAL_SECONDS:
+            raise ValueError(
+                "CI_POLL_INTERVAL_SECONDS must be at least "
+                f"{MIN_LIVE_CI_POLL_INTERVAL_SECONDS:g}s in live mode"
             )
         return self
 

@@ -8,6 +8,7 @@ COPY alembic alembic
 COPY alembic.ini .
 COPY scripts scripts
 COPY fixtures fixtures
+COPY probes probes
 RUN useradd --create-home appuser && chown -R appuser:appuser /app
 USER appuser
 ENV PATH="/app/.venv/bin:$PATH"

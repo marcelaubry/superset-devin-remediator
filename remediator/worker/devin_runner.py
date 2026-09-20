@@ -28,17 +28,37 @@ from ..devin.client import (
     DevinTransportError,
     SessionSnapshot,
 )
-from ..devin.prompt import TRIAGE_PROMPT_VERSION, TriagePromptInput, render_triage_prompt
+from ..devin.prompt import (
+    REMEDIATION_PROMPT_VERSION,
+    TRIAGE_PROMPT_VERSION,
+    RemediationPromptInput,
+    TriagePromptInput,
+    render_remediation_prompt,
+    render_triage_prompt,
+)
+from ..devin.remediation import REMEDIATION_OUTPUT_SCHEMA
 from ..devin.status import Disposition, classify
-from ..devin.tags import correlation_tags, operation_key
+from ..devin.tags import correlation_tags, operation_key, remediation_operation_key
 from ..devin.triage import TRIAGE_OUTPUT_SCHEMA
 from ..github_refs import BaseCommitResolutionError, BaseCommitResolver
-from ..lifecycle import TERMINAL_STATES, CaseState, InvalidTransition, transition
+from ..lifecycle import (
+    REMEDIATION_PHASE,
+    TERMINAL_STATES,
+    TERMINATION_PENDING_STATES,
+    TRIAGE_PHASE,
+    CaseState,
+    InvalidTransition,
+    PhaseStates,
+    phase_for_state,
+    transition,
+)
 from ..models import (
     ACTIVE_ATTEMPT_STATUSES,
     CANCEL_TERMINATION_REASON,
+    FAILURE_CLASS_SESSION,
     UNRESOLVED_CREATE_ACK,
     WORKER_ERROR_TERMINATION_PREFIX,
+    ApprovalRequest,
     Attempt,
     AttemptKind,
     AttemptStatus,
@@ -46,6 +66,8 @@ from ..models import (
     CreateState,
     NotificationOutbox,
     OutboxChannel,
+    ProbeExecution,
+    ProbeSnapshot,
     WebhookEvent,
 )
 
@@ -76,16 +98,14 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
-def _target_state(kind: AttemptKind) -> CaseState:
-    return CaseState.TRIAGING if kind == AttemptKind.TRIAGE else CaseState.REMEDIATING
+def phase_for_kind(kind: AttemptKind) -> PhaseStates:
+    return TRIAGE_PHASE if kind == AttemptKind.TRIAGE else REMEDIATION_PHASE
 
 
-def _intent_state(kind: AttemptKind) -> CaseState:
-    return (
-        CaseState.TRIAGE_CREATE_INTENT
-        if kind == AttemptKind.TRIAGE
-        else CaseState.REMEDIATION_CREATE_INTENT
-    )
+def _outbox_kind(phase: PhaseStates, event: str) -> str:
+    """Record-only outbox kind for a lifecycle event (`case_failed` / `remediation_failed`)."""
+    prefix = "remediation" if phase is REMEDIATION_PHASE else "case"
+    return f"{prefix}_{event}"
 
 
 def _outbox(case: Case, kind: str, **payload: Any) -> NotificationOutbox:
@@ -95,6 +115,26 @@ def _outbox(case: Case, kind: str, **payload: Any) -> NotificationOutbox:
         kind=kind,
         payload={"issue_number": case.issue_number, **payload},
     )
+
+
+@dataclass(frozen=True)
+class RemediationContext:
+    """Everything a remediation attempt is authorised against, resolved before any POST.
+
+    Built by the processor from the case's *current* approved round, the immutable probe
+    snapshot taken at dispatch and the persisted BASE probe execution that reproduced the
+    defect; the runner never reads probe files or approval state itself.
+    """
+
+    approval: ApprovalRequest
+    triage_output: dict[str, Any]
+    probe: ProbeSnapshot
+    base_execution: ProbeExecution
+    base_ref: str
+
+    @property
+    def base_sha(self) -> str:
+        return self.probe.base_sha
 
 
 async def active_attempts_with_session(session: AsyncSession, case_id: Any) -> list[Attempt]:
@@ -128,24 +168,25 @@ async def fail_case(
     state = CaseState(case.state)
     if state in TERMINAL_STATES:
         return
+    phase = phase_for_state(state)
     live = await active_attempts_with_session(session, case.id)
     if live:
         pending_reason = f"{WORKER_ERROR_TERMINATION_PREFIX}: {reason}; terminating Devin session"
         for attempt in live:
             attempt.status = AttemptStatus.TERMINATION_PENDING
             attempt.reconciliation_reason = pending_reason
-        if state != CaseState.TERMINATION_PENDING:
+        if state != phase.termination_pending:
             await transition(
                 session,
                 case,
-                CaseState.TERMINATION_PENDING,
+                phase.termination_pending,
                 pending_reason,
                 actor,
                 expected_claimed_by=claimed_by,
             )
         return
-    await transition(session, case, CaseState.FAILED, reason, actor, expected_claimed_by=claimed_by)
-    session.add(_outbox(case, "case_failed", reason=reason))
+    await transition(session, case, phase.failed, reason, actor, expected_claimed_by=claimed_by)
+    session.add(_outbox(case, _outbox_kind(phase, "failed"), reason=reason))
 
 
 class DevinRunner:
@@ -160,6 +201,7 @@ class DevinRunner:
         claimed_by: str | None = None,
         clock: Clock = _now,
         sleep: Sleep = asyncio.sleep,
+        remediation: RemediationContext | None = None,
     ) -> None:
         self.session = session
         self.case = case
@@ -169,6 +211,18 @@ class DevinRunner:
         self.claimed_by = claimed_by
         self.clock = clock
         self.sleep = sleep
+        self.remediation = remediation
+        self.phase: PhaseStates = TRIAGE_PHASE
+
+    def _timeout_seconds(self) -> float:
+        if self.phase is REMEDIATION_PHASE:
+            return self.settings.devin_remediation_timeout_seconds
+        return self.settings.devin_triage_timeout_seconds
+
+    def _max_acu(self) -> int:
+        if self.phase is REMEDIATION_PHASE:
+            return self.settings.devin_remediation_max_acu
+        return self.settings.devin_triage_max_acu
 
     async def _transition(self, to_state: CaseState, reason: str) -> None:
         await transition(
@@ -183,6 +237,7 @@ class DevinRunner:
     # ----------------------------------------------------------------- entry
 
     async def run(self, kind: AttemptKind) -> RunOutcome:
+        self.phase = phase_for_kind(kind)
         attempt = await self.session.scalar(
             select(Attempt)
             .where(
@@ -210,8 +265,8 @@ class DevinRunner:
             logger.info(
                 "resuming Devin session %s for case %s", attempt.devin_session_id, self.case.id
             )
-            if CaseState(self.case.state) == CaseState.RECONCILING_CREATE:
-                await self._transition(_target_state(kind), "Devin session re-attached")
+            if CaseState(self.case.state) in {self.phase.reconciling, self.phase.intent}:
+                await self._transition(self.phase.running, "Devin session re-attached")
                 await self.session.commit()
         return await self._poll(attempt)
 
@@ -239,7 +294,21 @@ class DevinRunner:
             placeholder = Attempt(case_id=case.id, kind=kind, idempotency_key="", operation_key="")
             return RunOutcome(RunResult.FAILED, placeholder, reason=refused)
 
-        key = operation_key(case.id, kind.value, ordinal)
+        context = self.remediation
+        if kind == AttemptKind.REMEDIATION:
+            if context is None:
+                reason = "remediation attempt requested without an approved dispatch context"
+                await fail_case(self.session, case, reason, "worker", self.claimed_by)
+                await self.session.commit()
+                placeholder = Attempt(
+                    case_id=case.id, kind=kind, idempotency_key="", operation_key=""
+                )
+                return RunOutcome(RunResult.FAILED, placeholder, reason=reason)
+            key = remediation_operation_key(
+                case.id, context.approval.triage_result_hash, context.base_sha, ordinal
+            )
+        else:
+            key = operation_key(case.id, kind.value, ordinal)
         now = self.clock()
         attempt = Attempt(
             case_id=case.id,
@@ -249,10 +318,20 @@ class DevinRunner:
             create_state=CreateState.PENDING,
             status=AttemptStatus.RUNNING,
             started_at=now,
-            timeout_at=now + timedelta(seconds=self.settings.devin_triage_timeout_seconds),
-            max_acu_limit=self.settings.devin_triage_max_acu,
-            prompt_version=TRIAGE_PROMPT_VERSION,
+            timeout_at=now + timedelta(seconds=self._timeout_seconds()),
+            max_acu_limit=self._max_acu(),
+            prompt_version=(
+                REMEDIATION_PROMPT_VERSION
+                if kind == AttemptKind.REMEDIATION
+                else TRIAGE_PROMPT_VERSION
+            ),
         )
+        if context is not None and kind == AttemptKind.REMEDIATION:
+            attempt.approval_request_id = context.approval.id
+            attempt.triage_result_hash = context.approval.triage_result_hash
+            attempt.probe_snapshot_id = context.probe.id
+            attempt.base_sha = context.base_sha
+            context.base_execution.attempt = attempt
         self.session.add(attempt)
         await self.session.commit()
 
@@ -284,7 +363,7 @@ class DevinRunner:
             attempt.create_state = CreateState.UNCERTAIN
             attempt.status = AttemptStatus.RECONCILING
             attempt.reconciliation_reason = f"create outcome unknown: {exc}"
-            await self._transition(CaseState.RECONCILING_CREATE, attempt.reconciliation_reason)
+            await self._transition(self.phase.reconciling, attempt.reconciliation_reason)
             await self.session.commit()
             reconciled = await self._reconcile_create(attempt)
             return reconciled if isinstance(reconciled, RunOutcome) else attempt
@@ -340,10 +419,10 @@ class DevinRunner:
         self, attempt: Attempt, kind: AttemptKind
     ) -> CreateSessionRequest | str:
         case = self.case
-        if case.repository != self.settings.github_repository:
-            return f"repository {case.repository} is not the allowlisted repository"
-        if kind == AttemptKind.REMEDIATION and self.settings.live_mode:
-            return "remediation sessions are disabled in live mode (Phase 2 is triage only)"
+        if not self.settings.repository_allowed(case.repository):
+            return f"repository {case.repository} is not an allowlisted repository"
+        if kind == AttemptKind.REMEDIATION:
+            return await self._build_remediation_request(attempt)
         try:
             base_sha = await self.resolver.resolve(case.repository, self.settings.github_base_ref)
         except BaseCommitResolutionError as exc:
@@ -372,8 +451,6 @@ class DevinRunner:
             )
         except ValueError as exc:
             return f"prompt rendering refused: {exc}"
-        if kind == AttemptKind.REMEDIATION:
-            prompt = f"[fake remediation] {prompt}"
         return CreateSessionRequest(
             prompt=prompt,
             repository=case.repository,
@@ -388,6 +465,65 @@ class DevinRunner:
             structured_output_schema=TRIAGE_OUTPUT_SCHEMA,
         )
 
+    async def _build_remediation_request(self, attempt: Attempt) -> CreateSessionRequest | str:
+        case = self.case
+        context = self.remediation
+        if context is None:
+            return "remediation attempt requested without an approved dispatch context"
+        probe = context.probe
+        if probe.repository != case.repository or probe.issue_number != case.issue_number:
+            return "probe snapshot does not belong to this case"
+        approval = context.approval
+        approved_by = approval.decided_by_slack_user_id or "unknown"
+        approved_at = approval.decided_at.isoformat() if approval.decided_at else "unknown"
+        issue = await _source_issue(self.session, case)
+        try:
+            prompt = render_remediation_prompt(
+                RemediationPromptInput(
+                    repository=case.repository,
+                    base_ref=context.base_ref,
+                    base_sha=context.base_sha,
+                    branch_prefix=self.settings.devin_remediation_branch_prefix,
+                    issue_number=case.issue_number,
+                    issue_title=str(issue.get("title") or case.issue_title),
+                    issue_body=str(issue.get("body") or ""),
+                    issue_url=str(issue.get("html_url") or case.issue_url),
+                    triage_output=context.triage_output,
+                    triage_result_hash=approval.triage_result_hash,
+                    probe_identifier=probe.probe_identifier,
+                    probe_hash=probe.script_hash,
+                    probe_script=probe.script_content,
+                    probe_expected_base_exit=probe.expected_base_exit_code,
+                    probe_expected_head_exit=probe.expected_head_exit_code,
+                    probe_registry_path=probe.manifest_path,
+                    approved_by=approved_by,
+                    approved_at=approved_at,
+                    operation_key=attempt.operation_key,
+                    case_id=str(case.id),
+                    attempt_id=str(attempt.id),
+                )
+            )
+        except ValueError as exc:
+            return f"prompt rendering refused: {exc}"
+        return CreateSessionRequest(
+            prompt=prompt,
+            repository=case.repository,
+            base_sha=context.base_sha,
+            max_acu_limit=self.settings.devin_remediation_max_acu,
+            operation_key=attempt.operation_key,
+            tags=tuple(
+                correlation_tags(
+                    case.repository,
+                    case.issue_number,
+                    AttemptKind.REMEDIATION.value,
+                    case.id,
+                    attempt.id,
+                )
+            ),
+            structured_output_schema=REMEDIATION_OUTPUT_SCHEMA,
+            title=f"Remediate {case.repository}#{case.issue_number}",
+        )
+
     async def _attach(
         self, attempt: Attempt, snapshot: SessionSnapshot, state: CreateState, reason: str
     ) -> Attempt | RunOutcome:
@@ -399,14 +535,12 @@ class DevinRunner:
         attempt.devin_status = snapshot.status
         attempt.devin_status_detail = snapshot.status_detail
         attempt.reconciliation_reason = None
-        attempt.timeout_at = self.clock() + timedelta(
-            seconds=self.settings.devin_triage_timeout_seconds
-        )
+        attempt.timeout_at = self.clock() + timedelta(seconds=self._timeout_seconds())
         case.devin_session_id = snapshot.session_id
         case.devin_session_url = snapshot.url
         attempt_id = attempt.id
         try:
-            await self._transition(_target_state(attempt.kind), reason)
+            await self._transition(self.phase.running, reason)
         except InvalidTransition:
             await self.session.rollback()
             await self.session.execute(
@@ -437,8 +571,8 @@ class DevinRunner:
 
     async def _reconcile_create(self, attempt: Attempt) -> Attempt | RunOutcome:
         case = self.case
-        if CaseState(case.state) == _intent_state(attempt.kind):
-            await self._transition(CaseState.RECONCILING_CREATE, "reconciling uncertain create")
+        if CaseState(case.state) == self.phase.intent:
+            await self._transition(self.phase.reconciling, "reconciling uncertain create")
         attempt.status = AttemptStatus.RECONCILING
         if attempt.create_state == CreateState.PENDING:
             attempt.create_state = CreateState.UNCERTAIN
@@ -478,10 +612,13 @@ class DevinRunner:
         attempt.error = reason
         attempt.finished_at = self.clock()
         case.failure_reason = reason
-        await self._transition(CaseState.HUMAN_BLOCKED, reason)
-        self.session.add(_outbox(case, "human_blocked", reason=reason))
+        await self._transition(self.phase.human_blocked, reason)
+        self.session.add(_outbox(case, self._human_blocked_kind(), reason=reason))
         await self.session.commit()
         return RunOutcome(RunResult.HUMAN_BLOCKED, attempt, reason=reason)
+
+    def _human_blocked_kind(self) -> str:
+        return "remediation_human_blocked" if self.phase is REMEDIATION_PHASE else "human_blocked"
 
     # ------------------------------------------------------------------ poll
 
@@ -503,7 +640,7 @@ class DevinRunner:
         assert session_id is not None
         if attempt.timeout_at is None:
             attempt.timeout_at = (attempt.started_at or self.clock()) + timedelta(
-                seconds=self.settings.devin_triage_timeout_seconds
+                seconds=self._timeout_seconds()
             )
             await self.session.commit()
         deadline = attempt.timeout_at
@@ -553,7 +690,7 @@ class DevinRunner:
         state = CaseState(fresh)
         if state != CaseState(self.case.state):
             await self.session.refresh(self.case)
-        return state == CaseState.TERMINATION_PENDING
+        return state in TERMINATION_PENDING_STATES
 
     async def _settle(
         self, attempt: Attempt, snapshot: SessionSnapshot, disposition: Disposition, reason: str
@@ -568,9 +705,11 @@ class DevinRunner:
             attempt.error = reason
             attempt.finished_at = self.clock()
             self.case.failure_reason = reason
-            await self._transition(CaseState.HUMAN_BLOCKED, reason)
+            await self._transition(self.phase.human_blocked, reason)
             self.session.add(
-                _outbox(self.case, "human_blocked", reason=reason, devin_url=snapshot.url)
+                _outbox(
+                    self.case, self._human_blocked_kind(), reason=reason, devin_url=snapshot.url
+                )
             )
             await self.session.commit()
             return RunOutcome(RunResult.HUMAN_BLOCKED, attempt, snapshot, reason)
@@ -582,6 +721,9 @@ class DevinRunner:
         attempt.status = AttemptStatus.FAILED
         attempt.error = reason
         attempt.finished_at = self.clock()
+        if self.phase is REMEDIATION_PHASE:
+            attempt.failure_stage = "session"
+            attempt.failure_class = FAILURE_CLASS_SESSION
         await fail_case(self.session, self.case, reason, "worker", self.claimed_by)
         await self.session.commit()
         return RunOutcome(RunResult.FAILED, attempt, snapshot, reason)
@@ -606,7 +748,7 @@ class DevinRunner:
                 Disposition.WAITING_FOR_HUMAN,
                 Disposition.FAILED,
             }:
-                if CaseState(self.case.state) == CaseState.TERMINATION_PENDING and (
+                if CaseState(self.case.state) == self.phase.termination_pending and (
                     mapping.disposition == Disposition.FAILED
                 ):
                     return await self._mark_timed_out(attempt, f"session ended: {mapping.reason}")
@@ -629,8 +771,8 @@ class DevinRunner:
             reason = f"{trigger}; DELETE failed: {exc}"
             attempt.status = AttemptStatus.TERMINATION_PENDING
             attempt.reconciliation_reason = reason
-            if CaseState(self.case.state) != CaseState.TERMINATION_PENDING:
-                await self._transition(CaseState.TERMINATION_PENDING, reason)
+            if CaseState(self.case.state) != self.phase.termination_pending:
+                await self._transition(self.phase.termination_pending, reason)
             self.case.failure_reason = reason
             await self.session.commit()
             return RunOutcome(RunResult.TERMINATION_PENDING, attempt, final, reason)
@@ -670,21 +812,22 @@ class DevinRunner:
         """
         pending = attempt.reconciliation_reason or ""
         now = self.clock()
+        phase = self.phase
         expired = attempt.timeout_at is not None and now >= attempt.timeout_at
         if pending.startswith(CANCEL_TERMINATION_REASON) and not expired:
             reason = f"{CANCEL_TERMINATION_REASON}; {detail}"
             attempt_status, case_state, kind = (
                 AttemptStatus.CANCELLED,
-                CaseState.CANCELLED,
-                "case_cancelled",
+                phase.cancelled,
+                _outbox_kind(phase, "cancelled"),
             )
             result = RunResult.FAILED
         elif pending.startswith(WORKER_ERROR_TERMINATION_PREFIX) and not expired:
             reason = f"{pending}; {detail}"
             attempt_status, case_state, kind = (
                 AttemptStatus.FAILED,
-                CaseState.FAILED,
-                "case_failed",
+                phase.failed,
+                _outbox_kind(phase, "failed"),
             )
             result = RunResult.FAILED
         else:
@@ -692,8 +835,8 @@ class DevinRunner:
             reason = f"Devin session exceeded deadline {deadline}; {detail}"
             attempt_status, case_state, kind = (
                 AttemptStatus.TIMED_OUT,
-                CaseState.TIMED_OUT,
-                "case_timed_out",
+                phase.timed_out,
+                _outbox_kind(phase, "timed_out"),
             )
             result = RunResult.TIMED_OUT
         attempt.status = attempt_status
@@ -717,3 +860,47 @@ async def _source_issue(session: AsyncSession, case: Case) -> dict[str, Any]:
     if source_event is None:
         return {"title": case.issue_title, "body": "", "labels": [], "html_url": case.issue_url}
     return cast(dict[str, Any], source_event.payload.get("issue", {}))
+
+
+async def terminate_running_attempts(session: AsyncSession, case: Case, devin: DevinClient) -> bool:
+    """Terminate every session an active attempt owns or may own.
+
+    Returns False when at least one termination could not be confirmed; such attempts
+    are parked as TERMINATION_PENDING so the case is retried rather than closed.
+    """
+    attempts = list(
+        (
+            await session.scalars(
+                select(Attempt).where(
+                    Attempt.case_id == case.id,
+                    Attempt.status.in_([*ACTIVE_ATTEMPT_STATUSES, AttemptStatus.BLOCKED]),
+                )
+            )
+        ).all()
+    )
+    confirmed = True
+    for attempt in attempts:
+        try:
+            if attempt.devin_session_id:
+                await devin.terminate_session(attempt.devin_session_id)
+            elif attempt.create_sent_at is not None:
+                for match in await devin.find_sessions_by_tag(attempt.operation_key):
+                    try:
+                        await devin.terminate_session(match.session_id)
+                    except DevinSessionNotFound:
+                        pass
+        except DevinSessionNotFound:
+            pass
+        except DevinError as exc:
+            logger.warning(
+                "could not terminate Devin session for attempt %s: %s", attempt.operation_key, exc
+            )
+            attempt.status = AttemptStatus.TERMINATION_PENDING
+            attempt.reconciliation_reason = f"{CANCEL_TERMINATION_REASON}; DELETE failed: {exc}"
+            confirmed = False
+            continue
+        attempt.status = AttemptStatus.CANCELLED
+        attempt.error = CANCEL_TERMINATION_REASON
+        attempt.reconciliation_reason = None
+        attempt.finished_at = datetime.now(UTC)
+    return confirmed

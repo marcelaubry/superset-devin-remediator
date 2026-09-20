@@ -5,19 +5,27 @@ exercise every worker path without network access or ACU spend.
 """
 
 import hashlib
+import re
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
+from ..fixtures import RemediationFixture, fake_head_sha, fake_pr_number, remediation_fixture
 from .client import (
     CreateSessionRequest,
     DevinApiError,
     DevinSessionNotFound,
     DevinTransportError,
+    SessionPullRequest,
     SessionSnapshot,
 )
+from .remediation import REMEDIATION_SCHEMA_VERSION
 from .tags import tag_value
 from .triage import TRIAGE_SCHEMA_VERSION
+
+_PROBE_ID_RE = re.compile(r"^- identifier: `([^`]+)`$", re.MULTILINE)
+_PROBE_HASH_RE = re.compile(r"^- script sha256: `([0-9a-f]{64})`$", re.MULTILINE)
+_BRANCH_PREFIX_RE = re.compile(r"named `([^`<]+)<short-unique-slug>`")
 
 
 class FakeScenario(StrEnum):
@@ -46,11 +54,29 @@ FIXTURE_SCENARIOS: dict[int, FakeScenario] = {
 }
 
 
+# Remediation-kind sessions reuse the generic session scenarios for the failure modes that
+# happen *before* structured output matters; everything else is `SUCCESS` and the
+# remediation fixture decides the output shape.
+_REMEDIATION_SESSION_SCENARIOS: dict[RemediationFixture, FakeScenario] = {
+    RemediationFixture.UNCERTAIN_CREATE: FakeScenario.UNCERTAIN_CREATE,
+    RemediationFixture.SESSION_TIMEOUT: FakeScenario.TIMEOUT,
+    RemediationFixture.MALFORMED_OUTPUT: FakeScenario.MALFORMED_OUTPUT,
+}
+
+
+def remediation_scenario_for(issue_number: int) -> FakeScenario:
+    return _REMEDIATION_SESSION_SCENARIOS.get(
+        remediation_fixture(issue_number), FakeScenario.SUCCESS
+    )
+
+
 def scenario_for(
-    issue_number: int, overrides: dict[int, FakeScenario] | None = None
+    issue_number: int, overrides: dict[int, FakeScenario] | None = None, kind: str = "TRIAGE"
 ) -> FakeScenario:
     if overrides and issue_number in overrides:
         return overrides[issue_number]
+    if kind == "REMEDIATION":
+        return remediation_scenario_for(issue_number)
     if issue_number in FIXTURE_SCENARIOS:
         return FIXTURE_SCENARIOS[issue_number]
     if issue_number % 5 == 0:
@@ -60,6 +86,66 @@ def scenario_for(
     if issue_number % 3 == 0:
         return FakeScenario.NEEDS_HUMAN
     return FakeScenario.SUCCESS
+
+
+def branch_for(issue_number: int, prefix: str = "devin/") -> str:
+    fixture = remediation_fixture(issue_number)
+    if fixture == RemediationFixture.PR_WRONG_BRANCH_PREFIX:
+        prefix = "fix/"
+    return f"{prefix}fix-issue-{issue_number}"
+
+
+def fake_pr_url(repository: str, issue_number: int) -> str:
+    return f"https://github.com/{repository}/pull/{fake_pr_number(issue_number)}"
+
+
+def sample_remediation_output(
+    issue_number: int,
+    repository: str,
+    base_sha: str,
+    probe_identifier: str,
+    probe_hash: str,
+    branch_prefix: str = "devin/",
+) -> dict[str, Any]:
+    fixture = remediation_fixture(issue_number)
+    pr_repository = repository
+    if fixture == RemediationFixture.PR_WRONG_REPOSITORY:
+        pr_repository = "someone-else/superset"
+    outcome = "pr_created"
+    blocking: list[str] = []
+    if fixture == RemediationFixture.NO_CHANGE_NEEDED:
+        outcome = "no_change_needed"
+    elif fixture == RemediationFixture.NEEDS_HUMAN:
+        outcome = "needs_human"
+        blocking = ["Which of the two documented behaviours is intended?"]
+    elif fixture == RemediationFixture.OUTCOME_FAILED:
+        outcome = "failed"
+    created = outcome == "pr_created"
+    pr_url = fake_pr_url(pr_repository, issue_number) if created else None
+    if fixture == RemediationFixture.CONTRADICTORY_PR_URL:
+        pr_url = fake_pr_url(repository, issue_number + 1)
+    head_sha = fake_head_sha(issue_number) if created else None
+    if fixture == RemediationFixture.CONTRADICTORY_HEAD_SHA and head_sha is not None:
+        head_sha = fake_head_sha(issue_number + 1)
+    return {
+        "schema_version": REMEDIATION_SCHEMA_VERSION,
+        "outcome": outcome,
+        "summary": f"simulated remediation of {repository}#{issue_number}: {outcome}",
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+        "branch": branch_for(issue_number, branch_prefix) if created else None,
+        "pr_url": pr_url,
+        "issue_reference": f"{repository}#{issue_number}",
+        "changed_files": (
+            ["superset/views/core.py", "tests/unit_tests/views/test_core.py"] if created else []
+        ),
+        "commits": [head_sha] if head_sha else [],
+        "tests_run": ["pytest tests/unit_tests/views/test_core.py -q"] if created else [],
+        "probe_identifier": probe_identifier,
+        "probe_hash": probe_hash,
+        "risks": ["simulated: low"],
+        "blocking_questions": blocking,
+    }
 
 
 def sample_triage_output(
@@ -137,7 +223,7 @@ class FakeDevinClient:
             request=request,
             issue_number=issue_number,
             kind=kind,
-            scenario=scenario_for(issue_number, self._scenarios),
+            scenario=scenario_for(issue_number, self._scenarios, kind),
             tags=tuple(request.all_tags()),
         )
         self._sessions[session_id] = fake
@@ -147,7 +233,8 @@ class FakeDevinClient:
     async def create_session(self, request: CreateSessionRequest) -> SessionSnapshot:
         self.create_calls += 1
         issue_number = int(tag_value(request.tags, "issue:") or 0)
-        scenario = scenario_for(issue_number, self._scenarios)
+        kind = tag_value(request.tags, "kind:") or "TRIAGE"
+        scenario = scenario_for(issue_number, self._scenarios, kind)
         if scenario == FakeScenario.CREATE_REJECTED:
             raise DevinApiError(422, "simulated: structured_output_schema rejected")
         if request.operation_key in self._by_operation:
@@ -213,10 +300,22 @@ class FakeDevinClient:
     def _output(self, fake: _FakeSession, status: str, detail: str | None) -> dict[str, Any] | None:
         if detail != "finished" or status != "running":
             return None
-        if fake.kind == "REMEDIATION":
-            repository = tag_value(fake.tags, "repo:") or "apache/superset"
-            return {"pr_url": f"https://github.com/{repository}/pull/{9000 + fake.issue_number}"}
         repository = tag_value(fake.tags, "repo:") or "apache/superset"
+        if fake.kind == "REMEDIATION":
+            if fake.scenario == FakeScenario.MALFORMED_OUTPUT:
+                return {"schema_version": REMEDIATION_SCHEMA_VERSION, "outcome": "done"}
+            prompt = fake.request.prompt
+            id_match = _PROBE_ID_RE.search(prompt)
+            hash_match = _PROBE_HASH_RE.search(prompt)
+            prefix_match = _BRANCH_PREFIX_RE.search(prompt)
+            return sample_remediation_output(
+                fake.issue_number,
+                repository,
+                fake.request.base_sha,
+                probe_identifier=id_match.group(1) if id_match else "unknown",
+                probe_hash=hash_match.group(1) if hash_match else "0" * 64,
+                branch_prefix=prefix_match.group(1) if prefix_match else "devin/",
+            )
         match fake.scenario:
             case FakeScenario.MALFORMED_OUTPUT:
                 return {"schema_version": TRIAGE_SCHEMA_VERSION, "outcome": "maybe", "summary": 1}
@@ -225,13 +324,31 @@ class FakeDevinClient:
             case _:
                 return sample_triage_output(fake.issue_number, repository)
 
+    def _pull_requests(
+        self, fake: _FakeSession, output: dict[str, Any] | None
+    ) -> tuple[SessionPullRequest, ...]:
+        """What Devin's own `pull_requests[]` would report, independent of structured output."""
+        if fake.kind != "REMEDIATION" or output is None:
+            return ()
+        fixture = remediation_fixture(fake.issue_number)
+        if output.get("outcome") != "pr_created" and fixture != RemediationFixture.MALFORMED_OUTPUT:
+            return ()
+        repository = tag_value(fake.tags, "repo:") or "apache/superset"
+        if fixture == RemediationFixture.PR_WRONG_REPOSITORY:
+            repository = "someone-else/superset"
+        return (
+            SessionPullRequest(pr_url=fake_pr_url(repository, fake.issue_number), pr_state="open"),
+        )
+
     def _snapshot(self, fake: _FakeSession, status: str, detail: str | None) -> SessionSnapshot:
+        output = self._output(fake, status, detail)
         return SessionSnapshot(
             session_id=fake.session_id,
             url=self._url(fake.session_id),
             status=status,
             status_detail=detail,
             tags=fake.tags,
-            structured_output=self._output(fake, status, detail),
+            structured_output=output,
             acus_consumed=round(min(fake.polls, self._polls_until_finish) * 0.25, 2),
+            pull_requests=self._pull_requests(fake, output),
         )

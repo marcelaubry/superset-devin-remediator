@@ -23,19 +23,22 @@ from ..models import (
     EventStatus,
     WebhookEvent,
 )
+from ..probes.runner import build_probe_runner
 from .outbox import OutboxDispatcher
-from .processor import _terminate_running_attempts, fail_case, process_case, process_event
+from .processor import fail_case, process_case, process_event, terminate_running_attempts
+from .remediation import REMEDIATION_WORK_STATES
 
-CLAIMABLE_STATES = frozenset(
-    {
-        CaseState.RECEIVED,
-        CaseState.TRIAGE_CREATE_INTENT,
-        CaseState.TRIAGING,
-        CaseState.RECONCILING_CREATE,
-        CaseState.REMEDIATION_CREATE_INTENT,
-        CaseState.REMEDIATING,
-        CaseState.TERMINATION_PENDING,
-    }
+CLAIMABLE_STATES = (
+    frozenset(
+        {
+            CaseState.RECEIVED,
+            CaseState.TRIAGE_CREATE_INTENT,
+            CaseState.TRIAGING,
+            CaseState.RECONCILING_CREATE,
+            CaseState.TERMINATION_PENDING,
+        }
+    )
+    | REMEDIATION_WORK_STATES
 )
 
 logger = logging.getLogger(__name__)
@@ -52,6 +55,9 @@ class Worker:
         self.worker_id = f"{socket.gethostname()}:{os.getpid()}:{uuid4().hex[:6]}"
         self.slack = build_slack_client(settings, self.session_factory)
         self.github = build_github_client(settings)
+        self.probes = build_probe_runner(
+            settings.probe_runner_mode, settings.probe_clone_url_format
+        )
         self.outbox = OutboxDispatcher(
             settings, self.session_factory, self.slack, self.github, self.worker_id
         )
@@ -87,7 +93,7 @@ class Worker:
                         if event.case_id:
                             case = await session.get(Case, event.case_id)
                             if case:
-                                await _terminate_running_attempts(session, case, self.devin)
+                                await terminate_running_attempts(session, case, self.devin)
                                 await fail_case(session, case, event.last_error, "worker")
                         continue
                     event.status = EventStatus.PROCESSING
@@ -150,9 +156,13 @@ class Worker:
         async with self.session_factory() as session:
             state = await session.scalar(select(Case.state).where(Case.id == case_id))
             backoff: datetime | None = None
-            if state == CaseState.TERMINATION_PENDING:
+            if state in {CaseState.TERMINATION_PENDING, CaseState.REMEDIATION_TERMINATION_PENDING}:
                 backoff = datetime.now(UTC) + timedelta(
                     seconds=self.settings.devin_poll_interval_seconds
+                )
+            elif state == CaseState.CI_PENDING:
+                backoff = datetime.now(UTC) + timedelta(
+                    seconds=self.settings.ci_poll_interval_seconds
                 )
             await session.execute(
                 update(Case)
@@ -235,6 +245,8 @@ class Worker:
                             self.settings,
                             self.worker_id,
                             self.base_commits,
+                            github=self.github,
+                            probes=self.probes,
                         )
                         logger.info("processed case %s in %s", case.id, fresh_case.state)
         finally:

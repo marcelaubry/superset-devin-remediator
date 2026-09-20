@@ -35,6 +35,7 @@ from ..models import (
     OUTBOX_KIND_GITHUB_REJECTION_COMMENT,
     OUTBOX_KIND_SLACK_APPROVAL_REQUEST,
     OUTBOX_KIND_SLACK_EPHEMERAL_RESPONSE,
+    OUTBOX_KIND_SLACK_REMEDIATION_UPDATE,
     OUTBOX_KIND_SLACK_STATUS_UPDATE,
     OUTBOX_RECORD_ONLY_KINDS,
     ApprovalDecision,
@@ -54,6 +55,7 @@ from ..slack.blocks import (
     fallback_text,
 )
 from ..slack.client import SlackApiError, SlackClient, SlackMessageRef, approval_metadata
+from .remediation import remediation_progress
 
 logger = logging.getLogger(__name__)
 
@@ -283,7 +285,7 @@ class OutboxDispatcher:
             record_event(
                 session, request, "rejection_comment_failed", "worker", f"outbox {row.id}: {error}"
             )
-        elif row.kind == OUTBOX_KIND_SLACK_STATUS_UPDATE:
+        elif row.kind in {OUTBOX_KIND_SLACK_STATUS_UPDATE, OUTBOX_KIND_SLACK_REMEDIATION_UPDATE}:
             record_event(
                 session, request, "slack_update_failed", "worker", f"outbox {row.id}: {error}"
             )
@@ -299,6 +301,10 @@ class OutboxDispatcher:
             await self._slack_approval_request(session, row)
         elif row.channel == OutboxChannel.SLACK and row.kind == OUTBOX_KIND_SLACK_STATUS_UPDATE:
             await self._slack_status_update(session, row)
+        elif (
+            row.channel == OutboxChannel.SLACK and row.kind == OUTBOX_KIND_SLACK_REMEDIATION_UPDATE
+        ):
+            await self._slack_remediation_update(session, row)
         elif row.channel == OutboxChannel.GITHUB and row.kind == OUTBOX_KIND_GITHUB_APPLY_LABEL:
             await self._github_apply_label(session, row)
         elif (
@@ -450,6 +456,43 @@ class OutboxDispatcher:
             "slack_updated",
             "worker",
             f"Slack message updated to `{message.status.value}`",
+        )
+
+    async def _slack_remediation_update(
+        self, session: AsyncSession, row: NotificationOutbox
+    ) -> None:
+        """Phase 4 progress on the approval message. Rendered from persisted evidence at
+        delivery time, so a delayed or retried row never shows stale state; a failure here
+        only ever marks the outbox row and never touches the case."""
+        request, case, attempt = await self._load_request(session, row)
+        if request.slack_channel is None or request.slack_message_ts is None:
+            raise OutboxSkip("no Slack message to update")
+        progress = await remediation_progress(session, case)
+        base = self._message_input(request, case, attempt, token=None)
+        message = ApprovalMessageInput(
+            repository=base.repository,
+            issue_number=base.issue_number,
+            issue_title=base.issue_title,
+            issue_url=base.issue_url,
+            devin_session_url=base.devin_session_url,
+            dashboard_url=base.dashboard_url,
+            triage=base.triage,
+            action_token=None,
+            status=base.status,
+            decision_note=base.decision_note,
+            remediation=progress,
+        )
+        await self.slack.update_message(
+            SlackMessageRef(request.slack_channel, request.slack_message_ts),
+            fallback_text(message),
+            build_approval_blocks(message),
+        )
+        record_event(
+            session,
+            request,
+            "slack_updated",
+            "worker",
+            f"Slack message updated with remediation state `{progress.case_state}`",
         )
 
     async def _github_apply_label(self, session: AsyncSession, row: NotificationOutbox) -> None:
