@@ -67,7 +67,7 @@
   });
   // Polling swaps replace the DOM: carry focus (hx-preserve drops it) and <details> disclosure state across.
   var focused = null;
-  var openDetails = null;
+  var openDetails = [];
   document.body.addEventListener("htmx:beforeSwap", function (evt) {
     var el = document.activeElement;
     if (el && el.id && el.closest("[hx-preserve]")) {
@@ -75,8 +75,9 @@
     }
     var target = evt.detail && evt.detail.target;
     if (target) {
-      openDetails = { target: target, keys: [] };
-      detailsKeys(target).forEach(function (pair) { if (pair[0].open) { openDetails.keys.push(pair[1]); } });
+      var keys = [];
+      detailsKeys(target).forEach(function (pair) { if (pair[0].open) { keys.push(pair[1]); } });
+      openDetails.push({ target: target, keys: keys });
     }
   });
   // Identify each <details> by id or summary text, disambiguating repeats (e.g. BASE/HEAD stdout) by order.
@@ -89,14 +90,16 @@
       return [d, base + "#" + seen[base]];
     });
   }
-  document.body.addEventListener("htmx:afterSettle", function () {
-    if (openDetails && openDetails.keys.length) {
-      var keys = openDetails.keys;
-      detailsKeys(openDetails.target).forEach(function (pair) {
-        if (keys.indexOf(pair[1]) !== -1) { pair[0].open = true; }
+  // Several polling targets settle independently (htmx settles asynchronously), so state is kept per target.
+  document.body.addEventListener("htmx:afterSettle", function (evt) {
+    var settled = evt.detail && evt.detail.target;
+    openDetails = openDetails.filter(function (entry) {
+      if (entry.target !== settled) { return true; }
+      detailsKeys(entry.target).forEach(function (pair) {
+        if (entry.keys.indexOf(pair[1]) !== -1) { pair[0].open = true; }
       });
-    }
-    openDetails = null;
+      return false;
+    });
     if (!focused) { return; }
     var saved = focused;
     focused = null;
