@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -13,6 +14,7 @@ from remediator.devin.triage import (
     TriageValidationError,
     validate_triage_output,
 )
+from remediator.probes import build_probe_runner
 
 
 def test_schema_is_self_contained_draft7_and_small() -> None:
@@ -126,6 +128,12 @@ LIVE_OK: dict[str, Any] = {
     "devin_triage_timeout_seconds": 1800,
     "github_webhook_secret": "webhook-secret-with-enough-entropy",
     "operator_token": "operator-token-with-enough-entropy",
+    # Phase 4: a live Devin session needs a live evidence chain.
+    "github_client_mode": "live",
+    "github_token": "ghp_" + "t" * 40,
+    "probe_runner_mode": "remote",
+    "probe_verifier_url": "http://verifier:8080",
+    "probe_root": str(Path(__file__).resolve().parents[1] / "probes"),
     "_env_file": None,
 }
 
@@ -150,6 +158,42 @@ def test_live_mode_fails_closed_without_credentials(monkeypatch: pytest.MonkeyPa
     assert "apk_unit_test_secret_key" not in repr(ok)
     assert "apk_unit_test_secret_key" not in str(ok.devin_api_key)
     assert "apk_unit_test_secret_key" not in ok.model_dump_json()
+
+
+def test_live_mode_requires_remote_probe_verifier() -> None:
+    """Probes run repository code; the worker (which holds credentials) never executes them.
+    Live mode only accepts the remote verifier, and there is no `local` worker mode at all."""
+    with pytest.raises(ValueError, match="PROBE_RUNNER_MODE=remote"):
+        _live(probe_runner_mode="fake")
+    with pytest.raises(ValueError, match="PROBE_VERIFIER_URL"):
+        _live(probe_verifier_url=None)
+    with pytest.raises(ValueError):
+        Settings(probe_runner_mode="local", _env_file=None)
+    assert Settings(_env_file=None).probe_runner_mode == "fake"
+
+
+def test_worker_factory_never_builds_a_local_runner() -> None:
+    with pytest.raises(ValueError, match="unsupported PROBE_RUNNER_MODE 'local'"):
+        build_probe_runner("local", None)
+    with pytest.raises(ValueError, match="PROBE_VERIFIER_URL"):
+        build_probe_runner("remote", None)
+
+
+def test_env_file_credentials_do_not_enable_local_probes(tmp_path: Path) -> None:
+    """Secrets loaded through pydantic-settings from `.env` are exactly what a probe must never
+    see; the worker's only options are simulation data or the remote verifier."""
+    env = tmp_path / ".env"
+    env.write_text(
+        "DEVIN_API_KEY=apk_env_file_secret\nGITHUB_TOKEN=ghp_env_file_secret\n"
+        "SLACK_BOT_TOKEN=xoxb-env-file\nPROBE_RUNNER_MODE=local\n"
+    )
+    with pytest.raises(ValueError, match="probe_runner_mode"):
+        Settings(_env_file=env)
+    settings = Settings(_env_file=env, probe_runner_mode="fake")
+    assert settings.devin_api_key is not None
+    assert (
+        build_probe_runner(settings.probe_runner_mode, settings.probe_verifier_url).mode == "fake"
+    )
 
 
 def test_live_mode_rejects_fake_simulation_timeout() -> None:

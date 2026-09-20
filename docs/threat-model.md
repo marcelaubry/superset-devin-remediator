@@ -1,21 +1,35 @@
-# Threat model (Phase 3: bounded triage + human-gated GitHub dispatch)
+# Threat model (Phase 4: bounded triage, human-gated dispatch, verified remediation)
 
 Assets: the Devin service-user API key, the Slack bot token and signing secret,
-the GitHub token, ACU spend, the operator dashboard, the integrity of triage
-results, and the integrity of the human approval that gates remediation.
+the GitHub token, the database credentials, ACU spend, the operator dashboard,
+the integrity of triage results, the integrity of the human approval that
+gates remediation, the integrity of the immutable probe (the only independent
+evidence that a PR fixes the issue), and the allowlisted repository's branches
+and settings.
 
 ## Trust boundaries
 
 ```text
-GitHub ──signed webhook──▶ API ──▶ PostgreSQL ◀── Worker ──▶ Devin (triage only)
+GitHub ──signed webhook──▶ API ──▶ PostgreSQL ◀── Worker ──▶ Devin (triage + remediation)
 Slack  ──signed action ──▶ API                     Worker ──▶ Slack (post/update)
-                                                   Worker ──▶ GitHub (label/comment)
+                                                   Worker ──▶ GitHub (label/comment, read pulls/
+                                                             files/compare/timeline/check-runs)
 GitHub ──signed labeled webhook──▶ API  ⇒ REMEDIATION_APPROVED
+probes/ (git-tracked, reviewed) ──▶ Worker snapshot ──▶ ProbeRunner ──▶ isolated checkout
+                                                             of exact base/head SHA
 ```
 
 Slack has no path to Devin. The API never performs outbound HTTP for Slack or
 GitHub; the worker does, through the transactional outbox, and only to the
-allowlisted repository / configured channel.
+allowlisted repository / configured channel. Devin never talks to the
+remediator: its session output is read back and treated as a claim to be
+corroborated by GitHub and by the probe.
+
+The probe runner is a new boundary. It executes repository code (the probe
+script plus whatever the checked-out commit's test suite does), so the process
+that hosts it must hold no credentials. Phase 4 ships the runner and fails
+closed when that condition is not met; the credential-free verifier container
+is the Phase 5 production path (see [known-limitations.md](known-limitations.md)).
 
 | Threat | Vector | Mitigation |
 | --- | --- | --- |
@@ -38,6 +52,21 @@ allowlisted repository / configured channel.
 | Replayed Slack action | captured valid request re-sent | Timestamp window bounds replay; inside the window the `(approval_request, action_ts, user)` unique key makes the replay a `duplicate` no-op that returns the current state. |
 | Spoofed approver | any workspace member clicks | User id must be in `SLACK_APPROVER_USER_IDS`; others are acknowledged with `200 {"ok": false, "outcome": "unauthorized"}` (Slack renders non-2xx as a generic error), receive an ephemeral explanation via `response_url`, and leave an `unauthorized_action` timeline event; the case is unchanged. Slack's own signature binds the user id to the request. |
 | Payload-supplied identity | attacker edits repository/issue/case in the payload | Only the opaque token is read from the payload; its SHA-256 resolves the approval row, which owns the case. Tokens are 256-bit random, hashed at rest, and expire after `SLACK_ACTION_TOKEN_TTL_SECONDS` or on operator expiry. On approval, rejection, expiry or supersession the stored hash is rotated/nulled so a leaked token can never again resolve to a decidable request. |
+| Remediation without a matching approval | forged/replayed `devin:remediate` label, approval of an older triage, label on another issue | The pipeline re-reads the approval row (`decision=APPROVED`) and requires `approval.triage_result_hash == sha256(latest validated triage output)`; a newer triage attempt supersedes the approval; the label is re-read from GitHub on the exact issue; the webhook delivery id is unique. Any failure is `REMEDIATION_FAILED`/`REMEDIATION_HUMAN_BLOCKED` before a create intent exists (0 ACU). |
+| Paying for a defect that is not reproducible | probe missing, altered, or already passing at base | The probe manifest is validated (repo, issue, 40-hex base SHA, script hash recomputed) and snapshotted; the snapshot runs at the pinned base *before* `POST /sessions`. Only the declared failing code permits spend; passing base is `no_change_needed`; missing runtime is `PROBE_INFRASTRUCTURE_BLOCKED`. |
+| Probe supplied by an attacker | probe command in issue text, Slack, or Devin structured output | Probes are loaded only from the git-tracked registry under `PROBE_ROOT`, keyed by repository and issue number; no other source is consulted. Devin's `probe_identifier`/`probe_hash` are compared against the snapshot, never used to locate a script. The PR validator rejects any change under `probes/`. |
+| Devin-reported success trusted as evidence | `outcome=pr_created`, PR URL in chat, Devin-run probe output | Candidates come from `pull_requests[]` only; GitHub must corroborate repo, state, base, head ref/SHA, ancestry, author and closing reference; the remediator runs the identical snapshot at head itself. Structured output or PR URL alone never advances past `PR_DISCOVERED`. |
+| PR linked to the wrong issue / repo / branch | `Closes #10` vs `#1`, fork PR, PR against a release branch, merged PR | Timeline cross-reference from the exact issue, then exact `owner/repo#N` token parse (word-bounded); repository must be allowlisted; `base.ref == GITHUB_BASE_REF`; `merged=false`; head ref must start with the configured prefix; `compare` must show the head ahead of the pinned base. |
+| Scope expansion / privileged file changes | PR edits workflows, CODEOWNERS, repo settings, the probe | Changed files are listed from GitHub (not from Devin's `changed_files`); `.github/`, `probes/`, `CODEOWNERS`, `SECURITY.md`, `.pre-commit-config.yaml`, `setup.cfg`, `pyproject.toml` fail closed; undeclared files or more than `REMEDIATION_MAX_CHANGED_FILES` are human-blocked. |
+| Absent CI mistaken for green | repo with no checks, checks not yet queued | `evaluate_checks` returns `absent` for zero check runs and `pending` for incomplete ones; `CI_PASSED` requires at least one completed successful check (all named in `GITHUB_REQUIRED_CHECKS` when set); the poll is bounded by `CI_TIMEOUT_SECONDS` and expires to `CI_FAILED (timed_out)`. |
+| Automatic fix / merge loop | red probe at head, red CI | The pipeline never re-prompts Devin, never merges, never closes the issue; `REMEDIATION_FAILED`/`CI_FAILED` require an authenticated operator to start a new attempt. |
+| Probe subprocess reads worker credentials | probe or test suite at the checked-out commit reads `os.environ`, `/proc/<pid>/environ`, mounted secret files, the Docker socket, or reaches the database / Devin API over the network | **A scrubbed child environment is not a boundary** inside the credential-bearing worker (same UID, `/proc`, mounted files, network). The worker therefore has no local execution path at all: `build_probe_runner` offers only `fake` and `remote`, and `Settings` rejects `local`. Repository code runs only in the `verifier` container (`docker/verifier/Dockerfile`): no `env_file`, never imports `remediator.config`/pydantic-settings so no `.env` can be read, dedicated UID 65534, read-only root, bounded `/tmp` tmpfs, `cap_drop: ALL`, `no-new-privileges`, PID and memory limits, its own network with no route to PostgreSQL. The boundary is checked at runtime, not declared: `GET /health` reports the verifier's credential exposure, UID, root writability and toolset; `RemoteProbeRunner` refuses (infrastructure failure, never a verdict) if any credential-shaped variable or secret path is visible, the UID is 0, the root is writable or the protocol version differs, and the verifier's `LocalProbeRunner` re-checks its own environment before every run. Tests cover secrets loaded from `.env` into `Settings` (the worker still cannot run a probe locally), a verifier reporting credentials, root or a writable root, and that importing the verifier never imports `Settings`. |
+| Probe escapes limits | infinite loop, output flood, child closes stdout/stderr and keeps running, `setsid`/double-fork escapes the process group, disk/PID/memory exhaustion | The deadline (`min(manifest.timeout, PROBE_TIMEOUT_SECONDS)`, capped again by `VERIFIER_MAX_TIMEOUT_SECONDS`) covers `proc.wait()` as well as both pipes, so closing descriptors does not extend it; on expiry `killpg` plus a `/proc` sweep for every process still carrying the per-run `REMEDIATOR_PROBE_RUN=<uuid>` marker (also run after every normal exit, before the workspace is removed); rlimits (`RLIMIT_NPROC`, `RLIMIT_FSIZE`, optional `RLIMIT_AS`) are inherited by all descendants; the container adds `pids_limit`, `mem_limit`/`memswap_limit` and a size-bounded tmpfs so a probe cannot exhaust the host; per-stream `PROBE_MAX_OUTPUT_BYTES` capture with `output_truncated` recorded. Probes are serialized per verifier (`409` while busy → transient worker retry) and after each run every remaining process of the probe UID is SIGKILLed, so a descendant that clears its environment *and* escapes the process group still dies with its own probe; `init: true` reaps orphans so they cannot pile up as zombies against `pids_limit`. Residual: the escapee lives for the duration of its own probe only; the container, not the worker, is the blast radius. |
+| Wrong commit verified | branch moved after validation, base drifted | Base and head are always addressed by full SHA (`git fetch --depth 1 origin <sha>` + detached checkout); the head SHA verified by the probe is the one whose check runs are polled and the one displayed as "Ready for human review". |
+| Fake evidence in live mode | `PROBE_RUNNER_MODE=fake` or `GITHUB_CLIENT_MODE=fake` with real Devin | `Settings` fails closed: live Devin requires live GitHub, `PROBE_RUNNER_MODE=remote` with a `PROBE_VERIFIER_URL`, existing `PROBE_ROOT`, remediation timeout ≥ 600 s and CI poll interval ≥ 30 s; the verifier is then re-verified via `/health` before every probe. |
+| Deadlock between worker loops corrupts case truth | two loops at `WORKER_CONCURRENCY=2` touching one case's outbox rows and case row in opposite orders; the loser retries through a poisoned session | Single lock order everywhere (case → approval request → outbox row, `FOR NO KEY UPDATE` so FK inserts are not blocked): the dispatcher locks the case first, the processor only inserts outbox rows. `DeadlockDetected`/serialization/connection errors are classified transient: the session is rolled back, the lease released, and the job retried (bounded by `EVENT_MAX_ATTEMPTS`); the case is never marked FAILED from a poisoned session. |
+| Two retries share an operation key / Devin tag | concurrent operator retries allocate the same ordinal | Ordinals are allocated under the case row lock (`allocate_attempt_ordinal`), backed by the partial unique index `(case_id, kind, ordinal)` and the unique `operation_key`; the key embeds the *full* triage hash and *full* base SHA and is used verbatim as the Devin tag (no truncation anywhere). |
+| Second paid remediation | concurrent operator retries, retry while a session is live | Retries are only allowed from `REMEDIATION_FAILED`/`TIMED_OUT`/`HUMAN_BLOCKED`; the case row is locked `FOR UPDATE`; the partial unique index allows one unfinished `REMEDIATION` attempt; a blocked attempt with a known session is terminated first; the operation key embeds the triage hash, base SHA and attempt ordinal so it can never collide with an earlier tag. |
 | Approval bypass | dashboard or API approves directly | No operator approve/reject route exists; `REMEDIATION_APPROVED` is written only by `confirm_label_webhook` from a signature-verified GitHub `issues/labeled` delivery whose label matches `GITHUB_REMEDIATION_LABEL` and whose case has a recorded `APPROVED` decision on the current request and attempt with our own delivery at `LABEL_APPLIED`. A labeled webhook without an approval, or one that arrives before the worker applied the label, is recorded as `label_webhook_unexpected` and never advances the case; the only replay is the worker re-running the same signed, already-persisted delivery once its own `label_applied_at` commit lands (liveness, not a new trust path). |
 | Slack approval starts remediation | Slack → Devin | Approval writes a decision and an outbox row; the only consumer applies a GitHub label and comment. No Phase 3 path creates a `REMEDIATION` attempt; integration tests assert the Devin create count is unchanged. |
 | Duplicate GitHub side effects | outbox retry after partial success, repeated clicks | Approval enqueues at most one `apply_remediation_label` row (unique `dedupe_key`); `label_requested_at` / `comment_requested_at` are committed before each POST; on retry the worker re-reads the issue labels and searches comments for the request-specific marker `<!-- remediator:approval:<id> -->` before writing, so a crash between GitHub accepting the write and our commit cannot duplicate it. The Slack approval message likewise commits `SENDING` + token hash first and reconciles by message metadata before reposting. |
@@ -63,5 +92,16 @@ allowlisted repository / configured channel.
 - Approval tokens live in Slack message blocks; anyone who can read the
   channel can obtain a token, but cannot use it without being an allowlisted
   approver and without a Slack-signed request.
-- Phase 3 does not run remediation sessions, create PRs, or merge; those
-  surfaces are out of scope until Phase 4.
+- The remediation session has write access to the allowlisted fork through
+  Devin's own GitHub integration; the remediator cannot prevent Devin from
+  pushing arbitrary branches, only from having them accepted. Branch
+  protection on the default branch and a review requirement remain necessary.
+- Probe scripts run whatever the checked-out commit's tooling does. A
+  malicious PR head can therefore execute code inside the verifier. This is
+  acceptable only in the credential-free, network-restricted verifier
+  container; it is the reason the in-worker local runner fails closed.
+- `compare` ancestry and timeline cross-references depend on GitHub's
+  eventual consistency; transient errors are retried with the case lease, and
+  a persistent disagreement is a verification failure rather than a pass.
+- Phase 4 does not merge, close the issue, or auto-fix. `CI_PASSED` is an input
+  to human review, not a release decision.

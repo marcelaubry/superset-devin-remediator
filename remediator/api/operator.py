@@ -13,9 +13,18 @@ from sqlalchemy.orm import selectinload
 from ..approvals import expire_request, record_event
 from ..config import Settings, get_settings
 from ..db import get_session
-from ..lifecycle import CaseState, InvalidTransition, transition
+from ..lifecycle import (
+    REMEDIATION_PHASE,
+    REMEDIATION_RETRYABLE_STATES,
+    TERMINAL_STATES,
+    CaseState,
+    InvalidTransition,
+    phase_for_state,
+    transition,
+)
 from ..models import (
     ACTIVE_ATTEMPT_STATUSES,
+    FAILURE_CLASS_INFRASTRUCTURE,
     OUTBOX_KIND_GITHUB_APPLY_LABEL,
     OUTBOX_KIND_SLACK_APPROVAL_REQUEST,
     UNRESOLVED_CREATE_ACK,
@@ -31,8 +40,16 @@ from ..models import (
     OutboxStatus,
     SlackFakeMessage,
 )
+from ..worker.remediation import enqueue_remediation_update, latest_remediation_attempt
 from .auth import COOKIE_NAME, _cookie_value, require_operator
-from .dashboard import TEMPLATE_HELPERS, approval_json, load_case, templates
+from .dashboard import (
+    ATTEMPT_EVIDENCE_OPTIONS,
+    TEMPLATE_HELPERS,
+    approval_json,
+    load_case,
+    remediation_json,
+    templates,
+)
 
 router = APIRouter()
 
@@ -72,7 +89,7 @@ async def case_json(
     case = await session.scalar(
         select(Case)
         .options(
-            selectinload(Case.attempts),
+            *ATTEMPT_EVIDENCE_OPTIONS,
             selectinload(Case.outbox),
             selectinload(Case.approval_requests).selectinload(ApprovalRequest.events),
             selectinload(Case.approval_requests).selectinload(ApprovalRequest.actions),
@@ -92,6 +109,7 @@ async def case_json(
         "ci_status": case.ci_status,
         "attempts": [_attempt_json(attempt) for attempt in case.attempts],
         "approval": approval_json(case),
+        "remediation": remediation_json(case),
         "outbox": [_outbox_json(row) for row in case.outbox],
     }
 
@@ -134,6 +152,19 @@ def _attempt_json(attempt: Attempt) -> dict[str, Any]:
         "structured_output": attempt.structured_output,
         "reconciliation_reason": attempt.reconciliation_reason,
         "error": attempt.error,
+        "approval_request_id": (
+            str(attempt.approval_request_id) if attempt.approval_request_id else None
+        ),
+        "triage_result_hash": attempt.triage_result_hash,
+        "probe_snapshot_id": str(attempt.probe_snapshot_id) if attempt.probe_snapshot_id else None,
+        "devin_pull_requests": attempt.devin_pull_requests,
+        "pr_url": attempt.pr_url,
+        "pr_number": attempt.pr_number,
+        "branch": attempt.branch,
+        "head_sha": attempt.head_sha,
+        "ci_deadline_at": attempt.ci_deadline_at.isoformat() if attempt.ci_deadline_at else None,
+        "failure_stage": attempt.failure_stage,
+        "failure_class": attempt.failure_class,
     }
 
 
@@ -193,15 +224,43 @@ async def _case_action(
     if not case:
         raise HTTPException(status_code=404, detail="case not found")
     try:
+        current = CaseState(case.state)
+        remediation_phase = phase_for_state(current) is REMEDIATION_PHASE
         if to_state == CaseState.CANCELLED and (
-            CaseState(case.state) in {CaseState.TRIAGING, CaseState.REMEDIATING}
+            current in {CaseState.TRIAGING, CaseState.REMEDIATING}
             or await _may_own_session(session, case)
         ):
-            to_state = CaseState.TERMINATION_PENDING
+            to_state = (
+                CaseState.REMEDIATION_TERMINATION_PENDING
+                if remediation_phase
+                else CaseState.TERMINATION_PENDING
+            )
             reason = "operator requested cancel; terminating Devin session"
+        elif (
+            to_state == CaseState.CANCELLED and remediation_phase and current not in TERMINAL_STATES
+        ):
+            to_state = CaseState.REMEDIATION_CANCELLED
+            reason = "operator requested cancel"
         else:
             reason = f"operator requested {to_state.lower()}"
-        if to_state == CaseState.RECEIVED:
+        if to_state == CaseState.RECEIVED and remediation_phase:
+            # A remediation retry never re-runs triage and never re-enters the create
+            # intent directly: it goes back through the zero-ACU dispatch preconditions,
+            # which mint a new attempt and operation key.
+            if current not in REMEDIATION_RETRYABLE_STATES:
+                raise InvalidTransition(f"cannot retry remediation from {current}")
+            await _acknowledge_unresolved(session, case, request)
+            await _refuse_if_active_attempt(session, case)
+            count = await session.scalar(
+                select(func.count())
+                .select_from(Attempt)
+                .where(Attempt.case_id == case.id, Attempt.kind == AttemptKind.REMEDIATION)
+            )
+            if int(count or 0) >= get_settings().max_attempts_per_kind:
+                raise InvalidTransition("attempt cap reached")
+            to_state = CaseState.REMEDIATION_APPROVED
+            reason = "operator requested remediation retry (new attempt)"
+        elif to_state == CaseState.RECEIVED:
             await _acknowledge_unresolved(session, case, request)
             counts = await session.execute(
                 select(Attempt.kind, func.count())
@@ -210,27 +269,9 @@ async def _case_action(
             )
             if any(count >= get_settings().max_attempts_per_kind for _, count in counts.all()):
                 raise InvalidTransition("attempt cap reached")
-            latest = await session.scalar(
-                select(Attempt)
-                .where(Attempt.case_id == case.id)
-                .order_by(Attempt.started_at.desc())
-                .limit(1)
-            )
-            triage_succeeded = await session.scalar(
-                select(Attempt.id).where(
-                    Attempt.case_id == case.id,
-                    Attempt.kind == AttemptKind.TRIAGE,
-                    Attempt.status == AttemptStatus.SUCCEEDED,
-                )
-            )
-            if (
-                latest is not None
-                and latest.kind == AttemptKind.REMEDIATION
-                and triage_succeeded is not None
-            ):
-                to_state = CaseState.REMEDIATION_CREATE_INTENT
-                reason = "retry remediation"
         await transition(session, case, to_state, reason, "operator")
+        if remediation_phase:
+            await _notify_remediation(session, case)
         await session.commit()
     except InvalidTransition as exc:
         await session.rollback()
@@ -258,6 +299,163 @@ async def _case_action(
     if not refreshed:
         raise HTTPException(status_code=404, detail="case not found")
     return {"id": str(refreshed.id), "state": refreshed.state}
+
+
+async def _refuse_if_active_attempt(session: AsyncSession, case: Case) -> None:
+    active = await session.scalar(
+        select(Attempt.operation_key).where(
+            Attempt.case_id == case.id,
+            Attempt.kind == AttemptKind.REMEDIATION,
+            Attempt.status.in_(ACTIVE_ATTEMPT_STATUSES),
+        )
+    )
+    if active is not None:
+        raise InvalidTransition(f"remediation attempt {active} is still active")
+
+
+async def _notify_remediation(session: AsyncSession, case: Case) -> None:
+    request = await session.scalar(
+        select(ApprovalRequest)
+        .where(ApprovalRequest.case_id == case.id)
+        .order_by(ApprovalRequest.created_at.desc())
+        .limit(1)
+    )
+    if request is not None:
+        enqueue_remediation_update(session, request)
+
+
+async def _verified_attempt_action(
+    case_id: UUID,
+    request: Request,
+    session: AsyncSession,
+    *,
+    to_state: CaseState,
+    allowed_from: frozenset[CaseState],
+    stages: frozenset[str],
+    infrastructure_only: bool,
+    reason: str,
+) -> Any:
+    """Re-run a verification step on the *existing* verified attempt (no new Devin session).
+
+    The attempt must have failed in one of `stages`; with `infrastructure_only` the failure
+    must additionally be classified as infrastructure, so a probe that genuinely failed at
+    head or a red CI can never be "retried" into a pass.
+    """
+    case = await session.get(Case, case_id, with_for_update=True)
+    if not case:
+        raise HTTPException(status_code=404, detail="case not found")
+    try:
+        current = CaseState(case.state)
+        if current not in allowed_from:
+            raise InvalidTransition(f"{reason} is not available from {current}")
+        attempt = await latest_remediation_attempt(session, case.id)
+        if attempt is None or attempt.head_sha is None or attempt.pr_url is None:
+            raise InvalidTransition("no verified remediation attempt to re-check")
+        if attempt.status in ACTIVE_ATTEMPT_STATUSES:
+            raise InvalidTransition(f"attempt {attempt.operation_key} still owns a session")
+        if attempt.failure_stage not in stages:
+            raise InvalidTransition(
+                f"attempt failed at stage {attempt.failure_stage!r}, not one of {sorted(stages)}"
+            )
+        if infrastructure_only and attempt.failure_class != FAILURE_CLASS_INFRASTRUCTURE:
+            raise InvalidTransition(
+                f"attempt failure is classified {attempt.failure_class!r}; only "
+                "infrastructure failures may be re-run"
+            )
+        attempt.failure_stage = None
+        attempt.failure_class = None
+        attempt.error = None
+        if to_state == CaseState.CI_PENDING:
+            attempt.ci_deadline_at = None
+            case.ci_status = None
+        case.failure_reason = None
+        await transition(session, case, to_state, f"operator requested {reason}", "operator")
+        await _notify_remediation(session, case)
+        await session.commit()
+    except InvalidTransition as exc:
+        await session.rollback()
+        refreshed = await load_case(session, case_id)
+        if not refreshed:
+            raise HTTPException(status_code=404, detail="case not found") from exc
+        return _render_case(request, refreshed, str(exc))
+    refreshed = await load_case(session, case_id)
+    if not refreshed:
+        raise HTTPException(status_code=404, detail="case not found")
+    return _render_case(request, refreshed)
+
+
+@router.post("/operator/cases/{case_id}/retry-ci")
+async def retry_ci(
+    case_id: UUID,
+    request: Request,
+    _: str = Depends(require_operator),
+    session: AsyncSession = Depends(get_session),
+) -> Any:
+    """Re-synchronise GitHub checks for the verified head SHA (e.g. after a manual re-run
+    on GitHub, or after a CI timeout / GitHub outage). Never re-runs Devin."""
+    return await _verified_attempt_action(
+        case_id,
+        request,
+        session,
+        to_state=CaseState.CI_PENDING,
+        allowed_from=frozenset({CaseState.CI_FAILED, CaseState.REMEDIATION_FAILED}),
+        stages=frozenset({"ci"}),
+        infrastructure_only=False,
+        reason="CI synchronisation retry",
+    )
+
+
+@router.post("/operator/cases/{case_id}/retry-probe")
+async def retry_probe(
+    case_id: UUID,
+    request: Request,
+    _: str = Depends(require_operator),
+    session: AsyncSession = Depends(get_session),
+) -> Any:
+    """Re-run probe verification only when the *runner* failed (missing tools, clone or
+    checkout errors). A probe that ran and produced the wrong exit code is a verification
+    verdict and cannot be retried.
+
+    Before a session exists (PROBE_INFRASTRUCTURE_BLOCKED) this re-runs BASE on the
+    persisted snapshot at zero ACUs; after a PR exists it re-runs only HEAD on the
+    already-verified attempt. Neither path creates a Devin session."""
+    case = await session.get(Case, case_id, with_for_update=True)
+    if not case:
+        raise HTTPException(status_code=404, detail="case not found")
+    if CaseState(case.state) == CaseState.PROBE_INFRASTRUCTURE_BLOCKED:
+        try:
+            await _refuse_if_active_attempt(session, case)
+            case.failure_reason = None
+            await transition(
+                session,
+                case,
+                CaseState.PROBE_VALIDATING_BASE,
+                "operator requested base probe retry after infrastructure failure",
+                "operator",
+            )
+            await _notify_remediation(session, case)
+            await session.commit()
+        except InvalidTransition as exc:
+            await session.rollback()
+            refreshed = await load_case(session, case_id)
+            if not refreshed:
+                raise HTTPException(status_code=404, detail="case not found") from exc
+            return _render_case(request, refreshed, str(exc))
+        refreshed = await load_case(session, case_id)
+        if not refreshed:
+            raise HTTPException(status_code=404, detail="case not found")
+        return _render_case(request, refreshed)
+    await session.rollback()
+    return await _verified_attempt_action(
+        case_id,
+        request,
+        session,
+        to_state=CaseState.PROBE_VALIDATING_HEAD,
+        allowed_from=frozenset({CaseState.REMEDIATION_FAILED}),
+        stages=frozenset({"probe_head"}),
+        infrastructure_only=True,
+        reason="head probe verification retry",
+    )
 
 
 @router.post("/operator/cases/{case_id}/retry")

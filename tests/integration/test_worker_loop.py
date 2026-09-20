@@ -1,16 +1,21 @@
 import asyncio
 from datetime import UTC, datetime, timedelta
 
+import asyncpg
 import pytest
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql.asyncpg import AsyncAdapt_asyncpg_dbapi
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import remediator.worker as worker_module
 from remediator.config import Settings
 from remediator.devin.fake import FakeDevinClient
+from remediator.devin.tags import remediation_operation_key
 from remediator.lifecycle import CaseState, transition
-from remediator.models import Case, EventStatus, WebhookEvent
-from remediator.worker import Worker
+from remediator.models import Attempt, AttemptKind, AttemptStatus, Case, EventStatus, WebhookEvent
+from remediator.worker import Worker, is_transient_db_error
+from remediator.worker.devin_runner import allocate_attempt_ordinal
 from remediator.worker.processor import process_case
 
 
@@ -249,3 +254,150 @@ async def test_event_processing_releases_case_lease(
     assert case.state == CaseState.AWAITING_REMEDIATION_APPROVAL
     assert case.claimed_by is None
     assert case.lease_expires_at is None
+
+
+def _deadlock() -> OperationalError:
+    cause = asyncpg.DeadlockDetectedError("deadlock detected")
+    orig = AsyncAdapt_asyncpg_dbapi.Error("deadlock detected")
+    orig.__cause__ = cause
+    return OperationalError("UPDATE cases ...", {}, orig)
+
+
+def test_transient_db_error_classification() -> None:
+    assert is_transient_db_error(_deadlock()) is True
+    unique = AsyncAdapt_asyncpg_dbapi.Error("dup")
+    unique.__cause__ = asyncpg.UniqueViolationError("dup")
+    assert is_transient_db_error(IntegrityError("INSERT", {}, unique)) is False
+    assert is_transient_db_error(RuntimeError("x")) is False
+
+
+@pytest.mark.asyncio
+async def test_deadlock_releases_the_job_for_retry_instead_of_failing_the_case(
+    integration_session_factory: async_sessionmaker[AsyncSession],
+    test_database_url: str,
+) -> None:
+    """A deadlock/serialization failure says nothing about the case: the lease is released
+    and the job is retried; the case must never be marked FAILED through a poisoned session."""
+    event = WebhookEvent(
+        delivery_id="loop-deadlock",
+        event_type="issues",
+        action="opened",
+        repository="apache/superset",
+        payload=payload(4215),
+        status=EventStatus.PENDING,
+    )
+    async with integration_session_factory() as session:
+        session.add(event)
+        await session.commit()
+
+    settings = Settings(
+        database_url=test_database_url, worker_poll_interval_seconds=0.01, worker_concurrency=1
+    )
+    worker = Worker(settings)
+    calls = 0
+
+    async def flaky_process_event(
+        session, event, devin, settings, claimed_by=None, resolver=None
+    ) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise _deadlock()
+        event.status = EventStatus.PROCESSED
+        event.processed_at = datetime.now(UTC)
+        await session.commit()
+
+    original = worker_module.process_event
+    worker_module.process_event = flaky_process_event
+
+    async def stop_when_done() -> None:
+        for _ in range(500):
+            async with integration_session_factory() as session:
+                status = await session.scalar(select(WebhookEvent.status))
+            if status == EventStatus.PROCESSED:
+                worker.stop()
+                return
+            await asyncio.sleep(0.01)
+        worker.stop()
+
+    try:
+        await asyncio.wait_for(asyncio.gather(worker._run_loop(), stop_when_done()), timeout=5)
+    finally:
+        worker_module.process_event = original
+        await worker.devin.aclose()
+        await worker.engine.dispose()
+
+    async with integration_session_factory() as session:
+        stored = await session.scalar(select(WebhookEvent))
+        assert stored is not None
+        assert stored.status == EventStatus.PROCESSED
+        assert stored.attempts_count == 2
+        assert (await session.scalar(select(Case).where(Case.state == CaseState.FAILED))) is None
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_concurrent_ordinal_allocation_never_collides(
+    integration_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Two workers retrying the same case at once must get distinct ordinals (case row lock),
+    and the database must refuse a duplicate even if the lock were bypassed."""
+    async with integration_session_factory() as session:
+        case = Case(
+            issue_number=4216,
+            repository="apache/superset",
+            issue_title="ordinal",
+            issue_url="https://github.com/apache/superset/issues/4216",
+            state=CaseState.RECEIVED,
+        )
+        session.add(case)
+        await session.commit()
+        case_id = case.id
+
+    gate = asyncio.Barrier(4)
+
+    async def allocate() -> int:
+        async with integration_session_factory() as session:
+            await gate.wait()
+            ordinal = await allocate_attempt_ordinal(session, case_id, AttemptKind.REMEDIATION)
+            # hold the lock across a yield so the others really do queue behind it
+            await asyncio.sleep(0.05)
+            session.add(
+                Attempt(
+                    case_id=case_id,
+                    kind=AttemptKind.REMEDIATION,
+                    ordinal=ordinal,
+                    idempotency_key=f"{case_id}:REMEDIATION:{ordinal}",
+                    operation_key=remediation_operation_key(case_id, "a" * 64, "b" * 40, ordinal),
+                    status=AttemptStatus.FAILED,
+                    finished_at=datetime.now(UTC),
+                )
+            )
+            await session.commit()
+            return ordinal
+
+    ordinals = await asyncio.wait_for(asyncio.gather(*(allocate() for _ in range(4))), timeout=10)
+    assert sorted(ordinals) == [1, 2, 3, 4]
+
+    async with integration_session_factory() as session:
+        session.add(
+            Attempt(
+                case_id=case_id,
+                kind=AttemptKind.REMEDIATION,
+                ordinal=2,
+                idempotency_key="bypassed-lock",
+                operation_key="op:bypassed-lock",
+                status=AttemptStatus.FAILED,
+                finished_at=datetime.now(UTC),
+            )
+        )
+        with pytest.raises(IntegrityError, match="uq_attempts_case_kind_ordinal"):
+            await session.commit()
+
+
+def test_remediation_operation_key_keeps_full_hashes() -> None:
+    key = remediation_operation_key("case", "a" * 64, "b" * 40, 3)
+    assert key.endswith(f":{'a' * 64}:{'b' * 40}:3")
+    assert len(key) <= 255
+    with pytest.raises(ValueError):
+        remediation_operation_key("case", "a" * 12, "b" * 40, 1)

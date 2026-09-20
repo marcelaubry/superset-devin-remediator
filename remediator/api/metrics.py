@@ -17,3 +17,8 @@ outbox_deliveries_total = Counter(
     "Outbox dispatch attempts by channel and outcome",
     ["channel", "result"],
 )
+
+worker_transient_db_errors_total = Counter(
+    "worker_transient_db_errors_total",
+    "Worker jobs released for retry after a deadlock, serialization or connection error",
+)

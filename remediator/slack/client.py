@@ -103,13 +103,13 @@ class FakeSlackClient:
         clock: Callable[[], float] = time.time,
     ) -> None:
         self._sessions = session_factory
-        self._fail_posts = fail_posts
+        self.fail_posts = fail_posts
         self._failing_issue_attempts = failing_issue_attempts
         self._post_attempts: dict[int, int] = {}
         self._clock = clock
 
     def __repr__(self) -> str:
-        return f"FakeSlackClient(fail_posts={self._fail_posts})"
+        return f"FakeSlackClient(fail_posts={self.fail_posts})"
 
     async def aclose(self) -> None:
         return None
@@ -122,7 +122,7 @@ class FakeSlackClient:
         *,
         metadata: dict[str, Any] | None = None,
     ) -> SlackMessageRef:
-        if self._fail_posts:
+        if self.fail_posts:
             raise SlackApiError("chat.postMessage", FAKE_POST_FAILURE, retryable=True)
         match = _ISSUE_REF.search(text)
         issue_number = int(match.group(1)) if match else None
@@ -186,6 +186,8 @@ class FakeSlackClient:
     async def update_message(
         self, ref: SlackMessageRef, text: str, blocks: list[dict[str, Any]]
     ) -> SlackMessageRef:
+        if self.fail_posts:
+            raise SlackApiError("chat.update", FAKE_POST_FAILURE, retryable=True)
         async with self._sessions() as session:
             existing = await session.scalar(
                 select(SlackFakeMessage.id).where(

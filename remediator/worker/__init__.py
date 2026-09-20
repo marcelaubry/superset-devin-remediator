@@ -6,10 +6,13 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from uuid import uuid4
 
+import asyncpg
 from sqlalchemy import exists, select, update
+from sqlalchemy.exc import DBAPIError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..adapters import build_github_client, build_slack_client
+from ..api.metrics import worker_transient_db_errors_total
 from ..config import Settings
 from ..db import build_engine, build_session_factory
 from ..devin import build_devin_client
@@ -23,22 +26,53 @@ from ..models import (
     EventStatus,
     WebhookEvent,
 )
+from ..probes import build_probe_runner
+from ..probes.remote import RemoteProbeRunner
 from .outbox import OutboxDispatcher
-from .processor import _terminate_running_attempts, fail_case, process_case, process_event
+from .processor import fail_case, process_case, process_event, terminate_running_attempts
+from .remediation import REMEDIATION_WORK_STATES
 
-CLAIMABLE_STATES = frozenset(
-    {
-        CaseState.RECEIVED,
-        CaseState.TRIAGE_CREATE_INTENT,
-        CaseState.TRIAGING,
-        CaseState.RECONCILING_CREATE,
-        CaseState.REMEDIATION_CREATE_INTENT,
-        CaseState.REMEDIATING,
-        CaseState.TERMINATION_PENDING,
-    }
+CLAIMABLE_STATES = (
+    frozenset(
+        {
+            CaseState.RECEIVED,
+            CaseState.TRIAGE_CREATE_INTENT,
+            CaseState.TRIAGING,
+            CaseState.RECONCILING_CREATE,
+            CaseState.TERMINATION_PENDING,
+        }
+    )
+    | REMEDIATION_WORK_STATES
 )
 
 logger = logging.getLogger(__name__)
+
+
+TRANSIENT_SQLSTATES = frozenset(
+    {
+        "40P01",  # deadlock_detected
+        "40001",  # serialization_failure
+        "55P03",  # lock_not_available
+        "57P01",  # admin_shutdown
+        "08000",  # connection_exception
+        "08003",
+        "08006",
+    }
+)
+
+
+def is_transient_db_error(exc: BaseException) -> bool:
+    """Errors a retry can fix; never a verdict about the case."""
+    if not isinstance(exc, DBAPIError):
+        return False
+    if exc.connection_invalidated or isinstance(exc, OperationalError):
+        return True
+    # SQLAlchemy's asyncpg adapter wraps the driver error; the asyncpg exception (with its
+    # SQLSTATE) is the wrapper's __cause__.
+    cause = exc.orig.__cause__ if exc.orig is not None else None
+    if isinstance(cause, asyncpg.PostgresError):
+        return cause.sqlstate in TRANSIENT_SQLSTATES
+    return isinstance(cause, asyncpg.PostgresConnectionError | asyncpg.InterfaceError)
 
 
 class Worker:
@@ -52,6 +86,7 @@ class Worker:
         self.worker_id = f"{socket.gethostname()}:{os.getpid()}:{uuid4().hex[:6]}"
         self.slack = build_slack_client(settings, self.session_factory)
         self.github = build_github_client(settings)
+        self.probes = build_probe_runner(settings.probe_runner_mode, settings.probe_verifier_url)
         self.outbox = OutboxDispatcher(
             settings, self.session_factory, self.slack, self.github, self.worker_id
         )
@@ -87,7 +122,7 @@ class Worker:
                         if event.case_id:
                             case = await session.get(Case, event.case_id)
                             if case:
-                                await _terminate_running_attempts(session, case, self.devin)
+                                await terminate_running_attempts(session, case, self.devin)
                                 await fail_case(session, case, event.last_error, "worker")
                         continue
                     event.status = EventStatus.PROCESSING
@@ -150,9 +185,13 @@ class Worker:
         async with self.session_factory() as session:
             state = await session.scalar(select(Case.state).where(Case.id == case_id))
             backoff: datetime | None = None
-            if state == CaseState.TERMINATION_PENDING:
+            if state in {CaseState.TERMINATION_PENDING, CaseState.REMEDIATION_TERMINATION_PENDING}:
                 backoff = datetime.now(UTC) + timedelta(
                     seconds=self.settings.devin_poll_interval_seconds
+                )
+            elif state == CaseState.CI_PENDING:
+                backoff = datetime.now(UTC) + timedelta(
+                    seconds=self.settings.ci_poll_interval_seconds
                 )
             await session.execute(
                 update(Case)
@@ -235,6 +274,8 @@ class Worker:
                             self.settings,
                             self.worker_id,
                             self.base_commits,
+                            github=self.github,
+                            probes=self.probes,
                         )
                         logger.info("processed case %s in %s", case.id, fresh_case.state)
         finally:
@@ -283,7 +324,7 @@ class Worker:
             if not event and not case:
                 outbox_row = await self.outbox.claim()
                 if outbox_row is not None:
-                    await self.outbox.dispatch(outbox_row.id)
+                    await self.outbox.dispatch(outbox_row.id, outbox_row.case_id)
                     continue
                 await asyncio.sleep(self.settings.worker_poll_interval_seconds)
                 continue
@@ -306,6 +347,27 @@ class Worker:
                         await self._cancel_unsent_attempts(session, case.id)
                         await session.commit()
                     await self._release_case(case.id)
+            except DBAPIError as exc:
+                if not is_transient_db_error(exc):
+                    raise
+                # Deadlock / serialization / connection loss: the job's transaction is
+                # already rolled back by the session context manager, nothing was
+                # committed half-way, and the failure says nothing about the case. Release
+                # the lease so another (or this) worker retries; attempts_count on webhook
+                # events still bounds the retries.
+                logger.warning(
+                    "job hit a transient database error, releasing for retry: %s",
+                    str(exc.orig or exc).splitlines()[0],
+                )
+                worker_transient_db_errors_total.inc()
+                if event:
+                    async with self.session_factory() as session:
+                        await session.execute(
+                            update(WebhookEvent)
+                            .where(WebhookEvent.id == event.id)
+                            .values(last_error=f"transient database error: {exc.orig!s}"[:2000])
+                        )
+                        await session.commit()
             except Exception as exc:
                 logger.exception("job failed")
                 if event:
@@ -350,6 +412,8 @@ class Worker:
             await self.base_commits.aclose()
             await self.slack.aclose()
             await self.github.aclose()
+            if isinstance(self.probes, RemoteProbeRunner):
+                await self.probes.aclose()
             await self.engine.dispose()
 
     def stop(self) -> None:

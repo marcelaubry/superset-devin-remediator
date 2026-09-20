@@ -165,6 +165,63 @@ async def test_processor_rejection(integration_session: AsyncSession) -> None:
 
 
 @pytest.mark.asyncio
+async def test_unlabeled_opened_issue_is_evaluated_and_only_remediate_label_remediates(
+    integration_session: AsyncSession,
+) -> None:
+    """Intake needs no label: an unlabeled `opened` issue is triaged (zero-ACU eligibility,
+    then the triage session) and parks at approval. `labeled` deliveries for other labels are
+    inert, and `devin:remediate` without a delivered Slack approval never starts remediation."""
+    settings = Settings(_env_file=None)
+    assert settings.github_required_label == ""
+    body = (
+        "Steps to reproduce:\n1. Run.\nExpected behavior works. "
+        "Actual behavior fails. Acceptance criteria: fixed. Similar existing pattern."
+    )
+    opened = WebhookEvent(
+        delivery_id="integration-unlabeled-opened",
+        event_type="issues",
+        action="opened",
+        repository="apache/superset",
+        payload=payload(4222, body, []),
+        status=EventStatus.PENDING,
+    )
+    integration_session.add(opened)
+    await integration_session.commit()
+    await process_event(integration_session, opened, FakeDevinClient(), settings)
+    case = await integration_session.scalar(select(Case).where(Case.issue_number == 4222))
+    assert case and case.state == CaseState.AWAITING_REMEDIATION_APPROVAL
+    assert opened.status == EventStatus.PROCESSED
+
+    for delivery, label in (
+        ("integration-bug-label", "bug"),
+        ("integration-rem", "devin:remediate"),
+    ):
+        labeled_payload = payload(4222, body, [label])
+        labeled_payload["label"] = {"name": label}
+        labeled = WebhookEvent(
+            delivery_id=delivery,
+            event_type="issues",
+            action="labeled",
+            repository="apache/superset",
+            payload=labeled_payload,
+            status=EventStatus.PENDING,
+        )
+        integration_session.add(labeled)
+        await integration_session.commit()
+        await process_event(integration_session, labeled, FakeDevinClient(), settings)
+        await integration_session.refresh(case)
+        assert labeled.status == EventStatus.PROCESSED
+        assert case.state == CaseState.AWAITING_REMEDIATION_APPROVAL
+    assert labeled.last_error == "label webhook without matching approval"
+    remediation_attempts = await integration_session.scalar(
+        select(func.count())
+        .select_from(Attempt)
+        .where(Attempt.case_id == case.id, Attempt.kind == AttemptKind.REMEDIATION)
+    )
+    assert remediation_attempts == 0
+
+
+@pytest.mark.asyncio
 async def test_processor_triage_infeasible(integration_session: AsyncSession) -> None:
     event = WebhookEvent(
         delivery_id="integration-triage-infeasible",
@@ -286,7 +343,13 @@ async def test_reconcile_remediation_create_intent(
     client = FakeDevinClient()
     await seed_remediation_session(client, case, key)
     await process_case(integration_session, case, client, Settings())
-    assert case.state == CaseState.CI_PASSED
+    # The uncertain create is reconciled by exact tag and the paid session is observed to
+    # completion without a second POST. Because this legacy attempt carries no Phase 4
+    # dispatch context (approval + immutable probe snapshot) the pipeline then fails closed
+    # instead of trusting the session's output.
+    assert client.create_calls == 1
+    assert case.state == CaseState.REMEDIATION_FAILED
+    assert case.failure_reason and "probe snapshot" in case.failure_reason
     transitions = list(
         (
             await integration_session.scalars(
@@ -296,7 +359,12 @@ async def test_reconcile_remediation_create_intent(
             )
         ).all()
     )
-    assert any(t.to_state == CaseState.RECONCILING_CREATE for t in transitions)
+    states = [t.to_state for t in transitions]
+    assert CaseState.REMEDIATION_RECONCILING_CREATE in states
+    assert states.index(CaseState.REMEDIATING) > states.index(
+        CaseState.REMEDIATION_RECONCILING_CREATE
+    )
+    assert CaseState.OUTPUT_VALIDATING in states
 
 
 @pytest.mark.asyncio
@@ -324,7 +392,7 @@ async def test_reconcile_missing_session_fails(
     await integration_session.commit()
     client = FakeDevinClient()
     await process_case(integration_session, case, client, Settings(reconcile_retry_delay_seconds=0))
-    assert case.state == CaseState.HUMAN_BLOCKED
+    assert case.state == CaseState.REMEDIATION_HUMAN_BLOCKED
     assert case.failure_reason and "create outcome unknown" in case.failure_reason
     assert client.create_calls == 0
 
@@ -468,8 +536,10 @@ async def test_reconcile_retries_missing_session(
         Settings(reconcile_retry_delay_seconds=0),
         claimed_by="worker",
     )
-    assert case.state == CaseState.CI_PASSED
     assert retry_client.calls == 2
+    assert retry_client.create_calls == 0
+    assert case.state == CaseState.REMEDIATION_FAILED
+    assert case.failure_reason and "probe snapshot" in case.failure_reason
 
 
 @pytest.mark.asyncio

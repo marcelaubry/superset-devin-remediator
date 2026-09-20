@@ -4,7 +4,7 @@ Phase 1/2 scenarios post signed GitHub `issues.opened` webhooks and wait for the
 settle. Phase 3 scenarios continue from a validated remediation candidate: read the fake
 Slack channel via the operator API, submit correctly (or deliberately incorrectly) signed
 Slack interaction payloads to POST /webhooks/slack/actions, let the worker process the
-outbox, post the signed GitHub `labeled` webhook and wait for REMEDIATION_APPROVED.
+outbox, post the signed GitHub `labeled` webhook and wait for the Phase 4 precondition gate.
 Nothing here bypasses production validation or writes to the database.
 """
 
@@ -47,7 +47,7 @@ SCENARIOS = {
 
 # Phase 3: each scenario starts from a distinct fixture issue so runs do not interfere.
 PHASE3_SCENARIOS = {
-    "approve": "issue_good_candidate.json",  # 4213: full happy path to REMEDIATION_APPROVED
+    "approve": "issue_good_candidate.json",  # 4213: approval + label; no probe -> zero-ACU gate
     "reject": "issue_approval_reject.json",  # 4219
     "slack-negative": "issue_approval_negative.json",  # 4217: bad sig / stale / unauthorized / dup
     "expired-token": "issue_approval_expired.json",  # 4216
@@ -55,8 +55,33 @@ PHASE3_SCENARIOS = {
     "github-label-failure": "issue_label_failure.json",  # 4688: fake GitHub fails, retry
 }
 
+# Phase 4: fixture issue numbers are pinned in remediator.fixtures.REMEDIATION_FIXTURES and
+# each has an immutable probe under probes/apache/superset/<n>/. Payloads are derived from
+# the good-candidate fixture so triage always yields `remediation_candidate`.
+PHASE4_SCENARIOS: dict[str, int] = {
+    "remediate": 4702,  # BASE fails -> session -> PR -> HEAD passes -> CI_PASSED
+    "remediate-base-passes": 4744,  # probe already passes at base: zero ACUs, human review
+    "remediate-probe-infra": 4748,  # runner unavailable: PROBE_INFRASTRUCTURE_BLOCKED, zero ACUs
+    "remediate-head-fails": 4747,  # PR exists but probe still fails at head: no fix chain
+    "remediate-forbidden-files": 4738,  # PR touches probes/workflows: fails closed
+    "remediate-ci-failed": 4751,  # required checks fail for the verified head SHA
+    "remediate-uncertain-create": 4706,  # POST unknown -> tag reconciliation, single session
+    "remediate-unlabeled-intake": 4222,  # unlabeled opened issue is evaluated; `bug` label inert
+}
+
+REMEDIATION_RESTING_STATES = {
+    "REMEDIATION_HUMAN_BLOCKED",
+    "PROBE_INFRASTRUCTURE_BLOCKED",
+    "REMEDIATION_FAILED",
+    "REMEDIATION_TIMED_OUT",
+    "REMEDIATION_CANCELLED",
+    "CI_PASSED",
+    "CI_FAILED",
+}
+
 TERMINAL_STATES = {
     "AWAITING_REMEDIATION_APPROVAL",
+    *REMEDIATION_RESTING_STATES,
     "REMEDIATION_APPROVED",
     "REMEDIATION_REJECTED",
     "APPROVAL_DELIVERY_FAILED",
@@ -70,6 +95,10 @@ TERMINAL_STATES = {
 
 ACTION_APPROVE = "approve_remediation"
 ACTION_REJECT = "reject_remediation"
+
+# Phase 3 fixtures register no immutable probe, so once the signed label webhook lands the
+# Phase 4 precondition gate fails closed (zero ACUs) instead of parking in REMEDIATION_APPROVED.
+PHASE3_POST_LABEL_STATES = ("REMEDIATION_APPROVED", "REMEDIATION_HUMAN_BLOCKED")
 
 
 def _environment(name: str, default: str) -> str:
@@ -347,8 +376,8 @@ class Simulator:
     def run_approve(self) -> None:
         fixture = PHASE3_SCENARIOS["approve"]
         repository, number, case = self.open_candidate(fixture)
-        if case["state"] == "REMEDIATION_APPROVED":
-            print("  already REMEDIATION_APPROVED from a previous run")
+        if case["state"] in PHASE3_POST_LABEL_STATES:
+            print(f"  already {case['state']} from a previous run")
             self.summarize(case)
             return
         case = self.wait_approval(repository, number, notification_status="SENT")
@@ -380,8 +409,9 @@ class Simulator:
         )
         webhook = self.label_webhook(fixture)
         print(f"  labeled webhook: {webhook.status_code} {webhook.json()}")
-        case = self.wait_state(repository, number, "REMEDIATION_APPROVED")
+        case = self.wait_state(repository, number, *PHASE3_POST_LABEL_STATES)
         self.check(case["approval"]["delivery_status"] == "CONFIRMED", "label confirmed by webhook")
+        self.check_no_paid_remediation(case)
         self.wait_for(
             repository,
             number,
@@ -520,8 +550,8 @@ class Simulator:
     def run_github_label_failure(self) -> None:
         fixture = PHASE3_SCENARIOS["github-label-failure"]
         repository, number, case = self.open_candidate(fixture)
-        if case["state"] == "REMEDIATION_APPROVED":
-            print("  already REMEDIATION_APPROVED from a previous run")
+        if case["state"] in PHASE3_POST_LABEL_STATES:
+            print(f"  already {case['state']} from a previous run")
             self.summarize(case)
             return
         self.wait_approval(repository, number, notification_status="SENT")
@@ -546,11 +576,300 @@ class Simulator:
         )
         webhook = self.label_webhook(fixture)
         print(f"  labeled webhook: {webhook.status_code} {webhook.json()}")
-        case = self.wait_state(repository, number, "REMEDIATION_APPROVED")
+        case = self.wait_state(repository, number, *PHASE3_POST_LABEL_STATES)
+        self.check_no_paid_remediation(case)
         self.summarize(case)
+
+    def check_no_paid_remediation(self, case: dict[str, Any]) -> None:
+        remediation = [a for a in case["attempts"] if a["kind"] == "REMEDIATION"]
+        self.check(
+            all(a["create_state"] != "CREATED" and a["devin_status"] is None for a in remediation),
+            f"no probe registered: {case['state']} without a paid remediation session",
+        )
 
     def run_phase3(self, scenario: str) -> None:
         print(f"== phase3 {scenario}")
+        try:
+            getattr(self, "run_" + scenario.replace("-", "_"))()
+        except (SimulationError, httpx.HTTPError) as exc:
+            self.check(False, f"{scenario}: {exc}")
+
+    # ------------------------------------------------------------------ phase 4
+    def phase4_payload(self, number: int, labels: list[str] | None = None) -> dict[str, Any]:
+        payload = self.load(PHASE3_SCENARIOS["approve"])
+        payload["issue"]["number"] = number
+        payload["issue"]["html_url"] = f"https://github.com/apache/superset/issues/{number}"
+        payload["issue"]["title"] = f"Remediation fixture #{number}"
+        if labels is not None:
+            payload["issue"]["labels"] = [{"name": name} for name in labels]
+        return payload
+
+    def label_event(self, payload: dict[str, Any], label: str) -> httpx.Response:
+        event = json.loads(json.dumps(payload))
+        event["action"] = "labeled"
+        event["label"] = {"name": label}
+        event["issue"]["labels"].append({"name": label})
+        return self.github_post(event)
+
+    def remediation_attempts(self, case: dict[str, Any]) -> list[dict[str, Any]]:
+        return list((case.get("remediation") or {}).get("attempts") or [])
+
+    def probe_runs(self, case: dict[str, Any]) -> list[tuple[str, str, Any]]:
+        runs: list[tuple[str, str, Any]] = []
+        for attempt in self.remediation_attempts(case):
+            for run in attempt.get("probe_executions") or []:
+                runs.append((run["target"], run["verdict"], run.get("exit_code")))
+        return runs
+
+    def approve_fixture(self, number: int) -> tuple[str, dict[str, Any], dict[str, Any]]:
+        """Phase 3 in full for a Phase 4 fixture issue: open, Slack-approve, label webhook."""
+        payload = self.phase4_payload(number)
+        repository = payload["repository"]["full_name"]
+        existing = self.case(repository, number)
+        if existing is not None:
+            print(f"  {repository}#{number} already exists in state {existing['state']}")
+            return repository, payload, existing
+        response = self.github_post(payload)
+        print(f"  opened {repository}#{number}: {response.status_code} {response.json()}")
+        self.wait_approval(repository, number, notification_status="SENT")
+        token = self.slack_token(repository, number)
+        click = self.slack_click(token)
+        self.check(click.json().get("outcome") == "approved", "signed Slack approval accepted")
+        case = self.wait_approval(repository, number, delivery_status="LABEL_APPLIED")
+        self.check(
+            not self.remediation_attempts(case),
+            "approval alone creates no remediation attempt or session",
+        )
+        webhook = self.label_event(payload, "devin:remediate")
+        self.check(
+            webhook.json().get("accepted") is True, "signed devin:remediate webhook accepted"
+        )
+        return repository, payload, case
+
+    def settle(self, repository: str, number: int) -> dict[str, Any]:
+        return self.wait_for(
+            repository,
+            number,
+            lambda c: c["state"] in REMEDIATION_RESTING_STATES,
+            "remediation to settle",
+            timeout=240,
+        )
+
+    def summarize_remediation(self, case: dict[str, Any]) -> None:
+        remediation = case.get("remediation") or {}
+        print(
+            "  remediation",
+            json.dumps(
+                {
+                    "state": case["state"],
+                    "ci_status": case.get("ci_status"),
+                    "failure_reason": case.get("failure_reason"),
+                    "ready_for_human_review": remediation.get("ready_for_human_review"),
+                    "actions": remediation.get("actions"),
+                    "attempts": [
+                        {
+                            "status": a["status"],
+                            "session": a.get("devin_session_id"),
+                            "acus": a.get("devin_acus_consumed"),
+                            "pr": a.get("pr_url"),
+                            "head": (a.get("head_sha") or "")[:12],
+                            "stage": a.get("failure_stage"),
+                            "class": a.get("failure_class"),
+                        }
+                        for a in remediation.get("attempts") or []
+                    ],
+                    "probes": self.probe_runs(case),
+                    "outbox": [
+                        (r["kind"], r["status"], r["attempts_count"]) for r in case["outbox"]
+                    ],
+                }
+            ),
+        )
+
+    def run_remediate(self) -> None:
+        number = PHASE4_SCENARIOS["remediate"]
+        repository, payload, _ = self.approve_fixture(number)
+        case = self.settle(repository, number)
+        self.check(case["state"] == "CI_PASSED", f"reached CI_PASSED ({case['state']})")
+        attempts = self.remediation_attempts(case)
+        self.check(len(attempts) == 1, f"exactly one paid remediation attempt ({len(attempts)})")
+        runs = self.probe_runs(case)
+        self.check(
+            [(t, v) for t, v, _ in runs] == [("BASE", "MATCHED"), ("HEAD", "MATCHED")],
+            f"BASE reproduced before the session, HEAD verified after the PR ({runs})",
+        )
+        self.check(
+            bool(attempts and attempts[0].get("pr_url") and attempts[0].get("head_sha")),
+            "PR URL and GitHub-corroborated head SHA recorded",
+        )
+        self.check(
+            bool(attempts and attempts[0].get("ci_snapshots")),
+            "CI snapshot recorded for the verified head SHA",
+        )
+        self.check(
+            (case.get("remediation") or {}).get("ready_for_human_review") is True,
+            "ready for human review (no auto-merge, no auto-close)",
+        )
+        duplicate = self.label_event(payload, "devin:remediate")
+        print(f"  duplicate label webhook: {duplicate.status_code} {duplicate.json()}")
+        time.sleep(2)
+        again = self.case(repository, number) or case
+        self.check(
+            len(self.remediation_attempts(again)) == 1 and again["state"] == "CI_PASSED",
+            "duplicate devin:remediate webhook creates no second attempt",
+        )
+        self.wait_for(
+            repository,
+            number,
+            lambda c: all(r["status"] == "SENT" for r in c["outbox"]),
+            "all Slack remediation updates sent",
+        )
+        blocks = json.dumps(self.slack_message(repository, number)["blocks"])
+        self.check("human review" in blocks.lower(), "Slack shows ready-for-human-review")
+        self.summarize_remediation(again)
+
+    def run_remediate_base_passes(self) -> None:
+        number = PHASE4_SCENARIOS["remediate-base-passes"]
+        repository, _, _ = self.approve_fixture(number)
+        case = self.settle(repository, number)
+        self.check(
+            case["state"] == "REMEDIATION_HUMAN_BLOCKED"
+            and "no_change_needed" in (case.get("failure_reason") or ""),
+            f"BASE already passes -> no_change_needed for a human ({case['state']})",
+        )
+        self.check(not self.remediation_attempts(case), "zero attempts, zero Devin sessions")
+        snapshots = (case.get("remediation") or {}).get("probe_snapshots") or []
+        self.check(len(snapshots) == 1, "immutable probe snapshot persisted at dispatch")
+        self.summarize_remediation(case)
+
+    def run_remediate_probe_infra(self) -> None:
+        number = PHASE4_SCENARIOS["remediate-probe-infra"]
+        repository, _, _ = self.approve_fixture(number)
+        case = self.settle(repository, number)
+        self.check(
+            case["state"] == "PROBE_INFRASTRUCTURE_BLOCKED",
+            f"runner unavailable is never success ({case['state']})",
+        )
+        self.check(not self.remediation_attempts(case), "zero attempts, zero Devin sessions")
+        unauth = self.client.post(f"/operator/cases/{case['id']}/retry-probe")
+        self.check(unauth.status_code in {401, 303}, "probe retry requires authentication")
+        retry = self.client.post(f"/operator/cases/{case['id']}/retry-probe", headers=self.operator)
+        self.check(
+            retry.status_code == 200, f"operator BASE probe retry accepted ({retry.status_code})"
+        )
+        case = self.settle(repository, number)
+        self.check(
+            case["state"] == "PROBE_INFRASTRUCTURE_BLOCKED" and not self.remediation_attempts(case),
+            "retry re-ran BASE only; still blocked at zero ACUs while the runtime is missing",
+        )
+        self.summarize_remediation(case)
+
+    def run_remediate_head_fails(self) -> None:
+        number = PHASE4_SCENARIOS["remediate-head-fails"]
+        repository, _, _ = self.approve_fixture(number)
+        case = self.settle(repository, number)
+        attempts = self.remediation_attempts(case)
+        self.check(
+            case["state"] == "REMEDIATION_FAILED"
+            and bool(attempts)
+            and attempts[-1].get("failure_stage") == "probe_head",
+            f"HEAD probe failure is a verification failure ({case['state']})",
+        )
+        self.check(len(attempts) == 1, "no automatic repair chain: still one attempt")
+        runs = self.probe_runs(case)
+        self.check(
+            [(t, v) for t, v, _ in runs] == [("BASE", "MATCHED"), ("HEAD", "MISMATCHED")],
+            f"identical probe ran at BASE then HEAD ({runs})",
+        )
+        retry = self.client.post(f"/operator/cases/{case['id']}/retry-probe", headers=self.operator)
+        self.check(
+            retry.status_code in {200, 409}
+            and (self.case(repository, number) or case)["state"] == "REMEDIATION_FAILED",
+            "a genuine probe verdict cannot be retried as an infrastructure failure",
+        )
+        self.summarize_remediation(case)
+
+    def run_remediate_forbidden_files(self) -> None:
+        number = PHASE4_SCENARIOS["remediate-forbidden-files"]
+        repository, _, _ = self.approve_fixture(number)
+        case = self.settle(repository, number)
+        attempts = self.remediation_attempts(case)
+        self.check(
+            case["state"] == "REMEDIATION_FAILED"
+            and bool(attempts)
+            and attempts[-1].get("failure_stage") == "pr",
+            f"PR touching probes/workflows fails closed ({case['state']})",
+        )
+        self.check(
+            all(t == "BASE" for t, _, _ in self.probe_runs(case)),
+            "HEAD probe never ran for a rejected PR",
+        )
+        self.summarize_remediation(case)
+
+    def run_remediate_ci_failed(self) -> None:
+        number = PHASE4_SCENARIOS["remediate-ci-failed"]
+        repository, _, _ = self.approve_fixture(number)
+        case = self.settle(repository, number)
+        self.check(
+            case["state"] == "CI_FAILED" and case.get("ci_status") == "failure",
+            f"failed required check for the verified head ({case['state']})",
+        )
+        self.check(len(self.remediation_attempts(case)) == 1, "no automatic regression-fix chain")
+        retry = self.client.post(f"/operator/cases/{case['id']}/retry-ci", headers=self.operator)
+        self.check(retry.status_code == 200, f"operator CI re-sync accepted ({retry.status_code})")
+        case = self.settle(repository, number)
+        self.check(
+            case["state"] == "CI_FAILED" and len(self.remediation_attempts(case)) == 1,
+            "CI re-sync re-reads checks on the same attempt; still failed, no new session",
+        )
+        self.summarize_remediation(case)
+
+    def run_remediate_uncertain_create(self) -> None:
+        number = PHASE4_SCENARIOS["remediate-uncertain-create"]
+        repository, _, _ = self.approve_fixture(number)
+        case = self.settle(repository, number)
+        attempts = self.remediation_attempts(case)
+        self.check(
+            len(attempts) == 1 and bool(attempts[0].get("devin_session_id")),
+            "uncertain POST reconciled by exact tag: one session attached, no second POST",
+        )
+        self.check(case["state"] == "CI_PASSED", f"reconciled session completed ({case['state']})")
+        self.summarize_remediation(case)
+
+    def run_remediate_unlabeled_intake(self) -> None:
+        number = PHASE4_SCENARIOS["remediate-unlabeled-intake"]
+        payload = self.phase4_payload(number, labels=["bug"])
+        repository = payload["repository"]["full_name"]
+        if self.case(repository, number) is None:
+            response = self.github_post(payload)
+            print(
+                f"  opened unlabeled {repository}#{number}: "
+                f"{response.status_code} {response.json()}"
+            )
+            self.check(
+                response.json().get("accepted") is True,
+                "unlabeled issues/opened accepted with GITHUB_REQUIRED_LABEL unset (default)",
+            )
+        case = self.wait_state(repository, number, "AWAITING_REMEDIATION_APPROVAL")
+        self.check(
+            case["state"] == "AWAITING_REMEDIATION_APPROVAL",
+            "unlabeled issue evaluated by eligibility filter and triaged to approval",
+        )
+        inert = self.label_event(payload, "enhancement")
+        print(f"  unrelated label webhook: {inert.status_code} {inert.json()}")
+        premature = self.label_event(payload, "devin:remediate")
+        print(f"  premature devin:remediate webhook: {premature.status_code} {premature.json()}")
+        time.sleep(2)
+        case = self.case(repository, number) or case
+        self.check(
+            case["state"] == "AWAITING_REMEDIATION_APPROVAL"
+            and not self.remediation_attempts(case),
+            "neither an unrelated label nor devin:remediate without a Slack approval remediates",
+        )
+        self.summarize(case)
+
+    def run_phase4(self, scenario: str) -> None:
+        print(f"== phase4 {scenario}")
         try:
             getattr(self, "run_" + scenario.replace("-", "_"))()
         except (SimulationError, httpx.HTTPError) as exc:
@@ -560,7 +879,9 @@ class Simulator:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--scenario", choices=[*SCENARIOS, *PHASE3_SCENARIOS, "all", "phase3"], default="all"
+        "--scenario",
+        choices=[*SCENARIOS, *PHASE3_SCENARIOS, *PHASE4_SCENARIOS, "all", "phase3", "phase4"],
+        default="all",
     )
     parser.add_argument("--delivery-id", default=None, help="(ignored; kept for compatibility)")
     parser.add_argument("--repeat", type=int, default=1)
@@ -568,14 +889,21 @@ def main() -> None:
     parser.add_argument("--wait", action="store_true")
     args = parser.parse_args()
     base_url = _environment("BASE_URL", "http://localhost:8000")
+    ingest: list[str] = []
+    phase3: list[str] = []
+    phase4: list[str] = []
     if args.scenario == "all":
-        ingest, phase3 = list(SCENARIOS), list(PHASE3_SCENARIOS)
+        ingest, phase3, phase4 = list(SCENARIOS), list(PHASE3_SCENARIOS), list(PHASE4_SCENARIOS)
     elif args.scenario == "phase3":
-        ingest, phase3 = [], list(PHASE3_SCENARIOS)
+        phase3 = list(PHASE3_SCENARIOS)
+    elif args.scenario == "phase4":
+        phase4 = list(PHASE4_SCENARIOS)
     elif args.scenario in SCENARIOS:
-        ingest, phase3 = [args.scenario], []
+        ingest = [args.scenario]
+    elif args.scenario in PHASE3_SCENARIOS:
+        phase3 = [args.scenario]
     else:
-        ingest, phase3 = [], [args.scenario]
+        phase4 = [args.scenario]
     with httpx.Client(base_url=base_url, timeout=10) as client:
         simulator = Simulator(client)
         for scenario in ingest:
@@ -584,11 +912,13 @@ def main() -> None:
             )
         for scenario in phase3:
             simulator.run_phase3(scenario)
+        for scenario in phase4:
+            simulator.run_phase4(scenario)
         if simulator.failures:
             print(f"{len(simulator.failures)} check(s) failed:", *simulator.failures, sep="\n  ")
             sys.exit(1)
-        if phase3:
-            print("all phase 3 checks passed")
+        if phase3 or phase4:
+            print("all phase 3/4 checks passed")
 
 
 if __name__ == "__main__":

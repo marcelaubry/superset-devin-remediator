@@ -1,0 +1,15 @@
+schema_version: probe.v1
+repository: apache/superset
+issue_number: 4727
+base_sha: c4f3751792f6a1bb61eca7b54d1aa06a1306bc50
+script: probe.sh
+script_sha256: 2f7f88c6d6fed151266b9ca1525766e1ae966a2db34f02807ca59b6df87ae7bd
+expected_exit_codes:
+  base: 1
+  head: 0
+timeout_seconds: 600
+runtime:
+  tools:
+  - bash
+  - python3
+description: Fixture probe for deterministic remediation scenario pr_wrong_branch_prefix

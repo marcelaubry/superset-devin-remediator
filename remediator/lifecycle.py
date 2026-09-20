@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, cast
@@ -20,11 +21,23 @@ class CaseState(StrEnum):
     REMEDIATION_APPROVED = "REMEDIATION_APPROVED"
     REMEDIATION_REJECTED = "REMEDIATION_REJECTED"
     REMEDIATION_CREATE_INTENT = "REMEDIATION_CREATE_INTENT"
+    REMEDIATION_RECONCILING_CREATE = "REMEDIATION_RECONCILING_CREATE"
     REMEDIATING = "REMEDIATING"
+    REMEDIATION_HUMAN_BLOCKED = "REMEDIATION_HUMAN_BLOCKED"
     OUTPUT_VALIDATING = "OUTPUT_VALIDATING"
+    PR_DISCOVERED = "PR_DISCOVERED"
+    PR_VALIDATING = "PR_VALIDATING"
+    PROBE_VALIDATING_BASE = "PROBE_VALIDATING_BASE"
+    PROBE_INFRASTRUCTURE_BLOCKED = "PROBE_INFRASTRUCTURE_BLOCKED"
+    PROBE_VALIDATING_HEAD = "PROBE_VALIDATING_HEAD"
     PR_VALIDATED = "PR_VALIDATED"
     CI_PENDING = "CI_PENDING"
     CI_PASSED = "CI_PASSED"
+    CI_FAILED = "CI_FAILED"
+    REMEDIATION_FAILED = "REMEDIATION_FAILED"
+    REMEDIATION_TERMINATION_PENDING = "REMEDIATION_TERMINATION_PENDING"
+    REMEDIATION_TIMED_OUT = "REMEDIATION_TIMED_OUT"
+    REMEDIATION_CANCELLED = "REMEDIATION_CANCELLED"
     HUMAN_BLOCKED = "HUMAN_BLOCKED"
     RECONCILING_CREATE = "RECONCILING_CREATE"
     TERMINATION_PENDING = "TERMINATION_PENDING"
@@ -37,14 +50,63 @@ class CaseState(StrEnum):
 TERMINAL_STATES = frozenset(
     {
         CaseState.CI_PASSED,
+        CaseState.CI_FAILED,
         CaseState.TIMED_OUT,
         CaseState.POLICY_REJECTED,
         CaseState.REMEDIATION_REJECTED,
+        CaseState.REMEDIATION_FAILED,
+        CaseState.REMEDIATION_TIMED_OUT,
+        CaseState.REMEDIATION_CANCELLED,
         CaseState.FAILED,
         CaseState.CANCELLED,
     }
 )
+
+# States owned by the Phase 4 remediation pipeline. Failures, cancellations and
+# terminations inside this set always use the REMEDIATION_* variants so the audit trail
+# never conflates a lost triage session with a lost remediation session.
+REMEDIATION_PHASE_STATES = frozenset(
+    {
+        CaseState.REMEDIATION_APPROVED,
+        CaseState.REMEDIATION_CREATE_INTENT,
+        CaseState.REMEDIATION_RECONCILING_CREATE,
+        CaseState.REMEDIATING,
+        CaseState.REMEDIATION_HUMAN_BLOCKED,
+        CaseState.OUTPUT_VALIDATING,
+        CaseState.PR_DISCOVERED,
+        CaseState.PR_VALIDATING,
+        CaseState.PROBE_VALIDATING_BASE,
+        CaseState.PROBE_INFRASTRUCTURE_BLOCKED,
+        CaseState.PROBE_VALIDATING_HEAD,
+        CaseState.PR_VALIDATED,
+        CaseState.CI_PENDING,
+        CaseState.CI_PASSED,
+        CaseState.CI_FAILED,
+        CaseState.REMEDIATION_FAILED,
+        CaseState.REMEDIATION_TERMINATION_PENDING,
+        CaseState.REMEDIATION_TIMED_OUT,
+        CaseState.REMEDIATION_CANCELLED,
+    }
+)
+# Remediation states in which a Devin session may exist for the current attempt.
+REMEDIATION_SESSION_STATES = frozenset(
+    {
+        CaseState.REMEDIATION_CREATE_INTENT,
+        CaseState.REMEDIATION_RECONCILING_CREATE,
+        CaseState.REMEDIATING,
+        CaseState.REMEDIATION_TERMINATION_PENDING,
+    }
+)
+# Remediation states from which an authenticated operator may start a *new* attempt.
+REMEDIATION_RETRYABLE_STATES = frozenset(
+    {
+        CaseState.REMEDIATION_FAILED,
+        CaseState.REMEDIATION_TIMED_OUT,
+        CaseState.REMEDIATION_HUMAN_BLOCKED,
+    }
+)
 _ACTIVE = frozenset(CaseState) - TERMINAL_STATES
+_REMEDIATION_EXITS = frozenset({CaseState.REMEDIATION_FAILED, CaseState.REMEDIATION_CANCELLED})
 TRANSITIONS: dict[CaseState, frozenset[CaseState]] = {
     CaseState.RECEIVED: frozenset(
         {
@@ -111,49 +173,102 @@ TRANSITIONS: dict[CaseState, frozenset[CaseState]] = {
             CaseState.TERMINATION_PENDING,
         }
     ),
+    CaseState.REMEDIATION_REJECTED: frozenset(),
+    # ----------------------------------------------------------- Phase 4 pipeline
+    # Dispatch preconditions are evaluated here, then the immutable probe must reproduce
+    # the defect at the pinned base SHA; nothing paid happens until the durable create
+    # intent is committed in REMEDIATION_CREATE_INTENT.
     CaseState.REMEDIATION_APPROVED: frozenset(
+        {CaseState.PROBE_VALIDATING_BASE, CaseState.REMEDIATION_HUMAN_BLOCKED} | _REMEDIATION_EXITS
+    ),
+    CaseState.PROBE_VALIDATING_BASE: frozenset(
         {
             CaseState.REMEDIATION_CREATE_INTENT,
-            CaseState.FAILED,
-            CaseState.CANCELLED,
-            CaseState.TERMINATION_PENDING,
+            CaseState.PROBE_INFRASTRUCTURE_BLOCKED,
+            CaseState.REMEDIATION_HUMAN_BLOCKED,
         }
+        | _REMEDIATION_EXITS
     ),
-    CaseState.REMEDIATION_REJECTED: frozenset(),
+    # Missing runtime/tools for the probe: zero ACUs were spent; an operator re-runs the
+    # base probe once the verifier is repaired.
+    CaseState.PROBE_INFRASTRUCTURE_BLOCKED: frozenset(
+        {CaseState.PROBE_VALIDATING_BASE, CaseState.REMEDIATION_CANCELLED}
+    ),
     CaseState.REMEDIATION_CREATE_INTENT: frozenset(
         {
-            CaseState.RECONCILING_CREATE,
+            CaseState.REMEDIATION_RECONCILING_CREATE,
             CaseState.REMEDIATING,
-            CaseState.FAILED,
-            CaseState.CANCELLED,
-            CaseState.TERMINATION_PENDING,
+            CaseState.REMEDIATION_TERMINATION_PENDING,
         }
+        | _REMEDIATION_EXITS
+    ),
+    CaseState.REMEDIATION_RECONCILING_CREATE: frozenset(
+        {
+            CaseState.REMEDIATING,
+            CaseState.REMEDIATION_HUMAN_BLOCKED,
+            CaseState.REMEDIATION_TERMINATION_PENDING,
+        }
+        | _REMEDIATION_EXITS
     ),
     CaseState.REMEDIATING: frozenset(
         {
             CaseState.OUTPUT_VALIDATING,
-            CaseState.HUMAN_BLOCKED,
-            CaseState.TIMED_OUT,
-            CaseState.FAILED,
-            CaseState.CANCELLED,
-            CaseState.TERMINATION_PENDING,
+            CaseState.REMEDIATION_HUMAN_BLOCKED,
+            CaseState.REMEDIATION_TIMED_OUT,
+            CaseState.REMEDIATION_TERMINATION_PENDING,
         }
+        | _REMEDIATION_EXITS
     ),
     CaseState.OUTPUT_VALIDATING: frozenset(
+        {CaseState.PR_DISCOVERED, CaseState.REMEDIATION_HUMAN_BLOCKED} | _REMEDIATION_EXITS
+    ),
+    CaseState.PR_DISCOVERED: frozenset(
+        {CaseState.PR_VALIDATING, CaseState.REMEDIATION_HUMAN_BLOCKED} | _REMEDIATION_EXITS
+    ),
+    CaseState.PR_VALIDATING: frozenset(
+        {CaseState.PROBE_VALIDATING_HEAD, CaseState.REMEDIATION_HUMAN_BLOCKED} | _REMEDIATION_EXITS
+    ),
+    CaseState.PROBE_VALIDATING_HEAD: frozenset(
+        {CaseState.PR_VALIDATED, CaseState.REMEDIATION_HUMAN_BLOCKED} | _REMEDIATION_EXITS
+    ),
+    CaseState.PR_VALIDATED: frozenset({CaseState.CI_PENDING} | _REMEDIATION_EXITS),
+    CaseState.CI_PENDING: frozenset(
+        {CaseState.CI_PASSED, CaseState.CI_FAILED, CaseState.REMEDIATION_HUMAN_BLOCKED}
+        | _REMEDIATION_EXITS
+    ),
+    # Terminal for the automation: required checks passed for the verified head SHA.
+    # Merge and issue closure remain human decisions.
+    CaseState.CI_PASSED: frozenset(),
+    # An operator may re-synchronise CI (e.g. after a manual re-run on GitHub).
+    CaseState.CI_FAILED: frozenset({CaseState.CI_PENDING, CaseState.REMEDIATION_CANCELLED}),
+    CaseState.REMEDIATION_HUMAN_BLOCKED: frozenset(
+        {CaseState.REMEDIATION_APPROVED, CaseState.REMEDIATION_TERMINATION_PENDING}
+        | _REMEDIATION_EXITS
+    ),
+    CaseState.REMEDIATION_TERMINATION_PENDING: frozenset(
         {
-            CaseState.PR_VALIDATED,
-            CaseState.FAILED,
-            CaseState.CANCELLED,
-            CaseState.TERMINATION_PENDING,
+            CaseState.OUTPUT_VALIDATING,
+            CaseState.REMEDIATION_HUMAN_BLOCKED,
+            CaseState.REMEDIATION_TIMED_OUT,
+        }
+        | _REMEDIATION_EXITS
+    ),
+    # Retries always create a new attempt/operation key; PROBE_VALIDATING_HEAD / CI_PENDING
+    # are only reachable again for infrastructure failures (operator "retry probe
+    # verification" / "retry CI synchronisation") on the already-verified attempt.
+    CaseState.REMEDIATION_FAILED: frozenset(
+        {
+            CaseState.REMEDIATION_APPROVED,
+            CaseState.PROBE_VALIDATING_HEAD,
+            CaseState.CI_PENDING,
+            CaseState.REMEDIATION_CANCELLED,
         }
     ),
-    CaseState.PR_VALIDATED: frozenset(
-        {CaseState.CI_PENDING, CaseState.FAILED, CaseState.CANCELLED, CaseState.TERMINATION_PENDING}
+    CaseState.REMEDIATION_TIMED_OUT: frozenset(
+        {CaseState.REMEDIATION_APPROVED, CaseState.REMEDIATION_CANCELLED}
     ),
-    CaseState.CI_PENDING: frozenset(
-        {CaseState.CI_PASSED, CaseState.FAILED, CaseState.CANCELLED, CaseState.TERMINATION_PENDING}
-    ),
-    CaseState.CI_PASSED: frozenset(),
+    CaseState.REMEDIATION_CANCELLED: frozenset(),
+    # ------------------------------------------------------- generic (Phase 1-3)
     CaseState.HUMAN_BLOCKED: frozenset(
         {
             CaseState.CANCELLED,
@@ -165,7 +280,6 @@ TRANSITIONS: dict[CaseState, frozenset[CaseState]] = {
     CaseState.RECONCILING_CREATE: frozenset(
         {
             CaseState.TRIAGING,
-            CaseState.REMEDIATING,
             CaseState.HUMAN_BLOCKED,
             CaseState.FAILED,
             CaseState.CANCELLED,
@@ -181,15 +295,58 @@ TRANSITIONS: dict[CaseState, frozenset[CaseState]] = {
             CaseState.FAILED,
         }
     ),
-    CaseState.TIMED_OUT: frozenset({CaseState.RECEIVED, CaseState.REMEDIATION_CREATE_INTENT}),
+    CaseState.TIMED_OUT: frozenset({CaseState.RECEIVED}),
     CaseState.POLICY_REJECTED: frozenset(),
-    CaseState.FAILED: frozenset({CaseState.RECEIVED, CaseState.REMEDIATION_CREATE_INTENT}),
+    CaseState.FAILED: frozenset({CaseState.RECEIVED}),
     CaseState.CANCELLED: frozenset(),
 }
-for _state in _ACTIVE:
+for _state in _ACTIVE - REMEDIATION_PHASE_STATES:
     TRANSITIONS[_state] = TRANSITIONS[_state] | frozenset(
         {CaseState.FAILED, CaseState.CANCELLED, CaseState.TERMINATION_PENDING}
     )
+
+
+@dataclass(frozen=True)
+class PhaseStates:
+    """The state vocabulary a Devin-session-running phase uses for one attempt kind."""
+
+    intent: CaseState
+    running: CaseState
+    reconciling: CaseState
+    human_blocked: CaseState
+    termination_pending: CaseState
+    timed_out: CaseState
+    failed: CaseState
+    cancelled: CaseState
+
+
+TRIAGE_PHASE = PhaseStates(
+    intent=CaseState.TRIAGE_CREATE_INTENT,
+    running=CaseState.TRIAGING,
+    reconciling=CaseState.RECONCILING_CREATE,
+    human_blocked=CaseState.HUMAN_BLOCKED,
+    termination_pending=CaseState.TERMINATION_PENDING,
+    timed_out=CaseState.TIMED_OUT,
+    failed=CaseState.FAILED,
+    cancelled=CaseState.CANCELLED,
+)
+REMEDIATION_PHASE = PhaseStates(
+    intent=CaseState.REMEDIATION_CREATE_INTENT,
+    running=CaseState.REMEDIATING,
+    reconciling=CaseState.REMEDIATION_RECONCILING_CREATE,
+    human_blocked=CaseState.REMEDIATION_HUMAN_BLOCKED,
+    termination_pending=CaseState.REMEDIATION_TERMINATION_PENDING,
+    timed_out=CaseState.REMEDIATION_TIMED_OUT,
+    failed=CaseState.REMEDIATION_FAILED,
+    cancelled=CaseState.REMEDIATION_CANCELLED,
+)
+TERMINATION_PENDING_STATES = frozenset(
+    {TRIAGE_PHASE.termination_pending, REMEDIATION_PHASE.termination_pending}
+)
+
+
+def phase_for_state(state: CaseState | str) -> PhaseStates:
+    return REMEDIATION_PHASE if CaseState(state) in REMEDIATION_PHASE_STATES else TRIAGE_PHASE
 
 
 class InvalidTransition(Exception):

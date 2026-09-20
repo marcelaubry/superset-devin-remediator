@@ -106,6 +106,51 @@ def _link(url: str | None, label: str) -> str:
 
 
 @dataclass(frozen=True)
+class RemediationProgress:
+    """Phase 4 evidence rendered under the approval message; every field is DB-sourced."""
+
+    case_state: str
+    headline: str
+    devin_session_url: str | None = None
+    pr_url: str | None = None
+    pr_number: int | None = None
+    head_sha: str | None = None
+    probe_base: str | None = None
+    probe_head: str | None = None
+    ci_summary: str | None = None
+    failure_reason: str | None = None
+    ready_for_review: bool = False
+
+
+# Case states → status headline. Anything not listed renders the raw state name.
+REMEDIATION_HEADLINES: dict[str, str] = {
+    "REMEDIATION_APPROVED": ":hourglass_flowing_sand: Remediation queued",
+    "REMEDIATION_CREATE_INTENT": ":hourglass_flowing_sand: Remediation queued",
+    "REMEDIATION_RECONCILING_CREATE": ":mag: Reconciling Devin session creation",
+    "REMEDIATING": ":gear: Devin remediation session running",
+    "REMEDIATION_HUMAN_BLOCKED": ":raised_hand: Remediation needs a human",
+    "OUTPUT_VALIDATING": ":gear: Validating Devin output",
+    "PR_DISCOVERED": ":mag: PR discovered — verifying with GitHub",
+    "PR_VALIDATING": ":mag: Verifying PR with GitHub",
+    "PROBE_VALIDATING_BASE": ":test_tube: Reproducing defect at base with approved probe",
+    "PROBE_INFRASTRUCTURE_BLOCKED": ":construction: Probe runtime unavailable — no session created",
+    "PROBE_VALIDATING_HEAD": ":test_tube: Running approved probe against PR head",
+    "PR_VALIDATED": ":white_check_mark: PR verified independently — waiting for CI",
+    "CI_PENDING": ":hourglass_flowing_sand: CI pending",
+    "CI_PASSED": ":tada: Ready for human review",
+    "CI_FAILED": ":x: CI failed",
+    "REMEDIATION_FAILED": ":x: Remediation failed",
+    "REMEDIATION_TERMINATION_PENDING": ":stop_sign: Terminating Devin session",
+    "REMEDIATION_TIMED_OUT": ":alarm_clock: Remediation timed out",
+    "REMEDIATION_CANCELLED": ":no_entry: Remediation cancelled",
+}
+
+
+def remediation_headline(case_state: str) -> str:
+    return REMEDIATION_HEADLINES.get(case_state, f":grey_question: {case_state}")
+
+
+@dataclass(frozen=True)
 class ApprovalMessageInput:
     repository: str
     issue_number: int
@@ -117,14 +162,43 @@ class ApprovalMessageInput:
     action_token: str | None
     status: ApprovalMessageStatus
     decision_note: str | None = None
+    remediation: RemediationProgress | None = None
 
 
 def fallback_text(message: ApprovalMessageInput) -> str:
+    status: str = message.status
+    if message.remediation is not None:
+        status = message.remediation.case_state
     return truncate(
         f"Remediation approval for {message.repository}#{message.issue_number}: "
-        f"{message.issue_title} [{message.status}]",
+        f"{message.issue_title} [{status}]",
         SECTION_MAX,
     )
+
+
+def _remediation_blocks(progress: RemediationProgress) -> list[dict[str, Any]]:
+    lines = [f"*Remediation:* {_safe(progress.headline, ITEM_MAX)}"]
+    if progress.devin_session_url:
+        lines.append(f"Devin session: {_link(progress.devin_session_url, 'open session')}")
+    if progress.pr_url:
+        label = f"PR #{progress.pr_number}" if progress.pr_number else "pull request"
+        head = f" @ `{_safe(progress.head_sha[:12], 12)}`" if progress.head_sha else ""
+        lines.append(f"PR: {_link(progress.pr_url, label)}{head}")
+    if progress.probe_base or progress.probe_head:
+        lines.append(
+            f"Probe base: {_safe(progress.probe_base or 'not run', ITEM_MAX)} · "
+            f"head: {_safe(progress.probe_head or 'not run', ITEM_MAX)}"
+        )
+    if progress.ci_summary:
+        lines.append(f"CI: {_safe(progress.ci_summary, ITEM_MAX)}")
+    if progress.failure_reason:
+        lines.append(f"Reason: {_safe(progress.failure_reason, 600)}")
+    if progress.ready_for_review and progress.pr_url:
+        lines.append(
+            f":eyes: *Ready for human review* — {_link(progress.pr_url, 'review the PR')} "
+            "(nothing is merged or closed automatically)"
+        )
+    return [_section("\n".join(lines), block_id="remediation")]
 
 
 def build_approval_blocks(message: ApprovalMessageInput) -> list[dict[str, Any]]:
@@ -185,6 +259,8 @@ def build_approval_blocks(message: ApprovalMessageInput) -> list[dict[str, Any]]
             ],
         },
     ]
+    if message.remediation is not None:
+        blocks.extend(_remediation_blocks(message.remediation))
     actions: list[dict[str, Any]] = []
     if message.status is ApprovalMessageStatus.AWAITING and message.action_token:
         value = truncate(message.action_token, BUTTON_VALUE_MAX)

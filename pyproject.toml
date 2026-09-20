@@ -13,12 +13,13 @@ dependencies = [
   "prometheus-client>=0.20.0",
   "pydantic-settings>=2.5.2",
   "python-multipart>=0.0.9",
+  "pyyaml>=6.0.1",
   "sqlalchemy[asyncio]>=2.0.35",
   "uvicorn[standard]>=0.30.6",
 ]
 
 [dependency-groups]
-dev = ["mypy>=1.11.2", "pytest>=8.3.3", "pytest-asyncio>=0.24.0", "ruff>=0.6.8", "types-psycopg2>=2.9.21.20240819"]
+dev = ["mypy>=1.11.2", "pytest>=8.3.3", "pytest-asyncio>=0.24.0", "ruff>=0.6.8", "types-psycopg2>=2.9.21.20240819", "types-pyyaml>=6.0.12.20240808"]
 
 [tool.uv]
 default-groups = ["dev"]

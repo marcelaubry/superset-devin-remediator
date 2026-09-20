@@ -25,6 +25,7 @@ from .client import (
     DevinSessionNotFound,
     DevinTransportError,
     SessionSnapshot,
+    parse_pull_requests,
 )
 
 logger = logging.getLogger(__name__)
@@ -72,6 +73,7 @@ def _parse_snapshot(payload: dict[str, Any]) -> SessionSnapshot:
         structured_output=output if isinstance(output, dict) else None,
         acus_consumed=float(acus) if isinstance(acus, int | float) else None,
         updated_at=updated_at,
+        pull_requests=parse_pull_requests(payload.get("pull_requests")),
         extra={k: v for k, v in payload.items() if k in {"title", "status_detail", "is_archived"}},
     )
 

@@ -1,0 +1,15 @@
+schema_version: probe.v1
+repository: apache/superset
+issue_number: 4736
+base_sha: c4f3751792f6a1bb61eca7b54d1aa06a1306bc50
+script: probe.sh
+script_sha256: 7937ad0b7c9da19f8e8d50836778e996869842b4320ce19d96e950aaca432742
+expected_exit_codes:
+  base: 1
+  head: 0
+timeout_seconds: 600
+runtime:
+  tools:
+  - bash
+  - python3
+description: Fixture probe for deterministic remediation scenario pr_issue_substring

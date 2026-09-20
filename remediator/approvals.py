@@ -108,6 +108,10 @@ def enqueue(
 async def open_request_for_case(
     session: AsyncSession, case_id: Any, *, for_update: bool = False
 ) -> ApprovalRequest | None:
+    """Newest approval round for the case. With ``for_update`` the case row is locked first
+    and both rows are taken ``FOR NO KEY UPDATE``: every writer (case processor, label
+    webhook, outbox dispatcher) shares the order case -> approval request -> outbox row, and
+    NO KEY UPDATE lets outbox inserts take their foreign-key KEY SHARE locks meanwhile."""
     stmt = (
         select(ApprovalRequest)
         .where(ApprovalRequest.case_id == case_id)
@@ -115,7 +119,10 @@ async def open_request_for_case(
         .limit(1)
     )
     if for_update:
-        stmt = stmt.with_for_update()
+        await session.execute(
+            select(Case.id).where(Case.id == case_id).with_for_update(key_share=True)
+        )
+        stmt = stmt.with_for_update(key_share=True)
     request: ApprovalRequest | None = await session.scalar(stmt)
     return request
 

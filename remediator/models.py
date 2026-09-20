@@ -120,10 +120,43 @@ OUTBOX_KIND_GITHUB_NOT_FEASIBLE = "triage_not_feasible"
 OUTBOX_KIND_GITHUB_APPLY_LABEL = "apply_remediation_label"
 OUTBOX_KIND_GITHUB_REJECTION_COMMENT = "rejection_comment"
 OUTBOX_KIND_SLACK_EPHEMERAL_RESPONSE = "slack_ephemeral_response"
+# Phase 4: progress of the remediation pipeline rendered onto the approval Slack message.
+OUTBOX_KIND_SLACK_REMEDIATION_UPDATE = "remediation_status_update"
 # Phase 1/2 record-only intents: kept on the outbox as an audit trail, never delivered.
 OUTBOX_RECORD_ONLY_KINDS: frozenset[str] = frozenset(
-    {"eligibility_rejected", "case_completed", "case_failed", "human_blocked"}
+    {
+        "eligibility_rejected",
+        "case_completed",
+        "case_failed",
+        "human_blocked",
+        "case_cancelled",
+        "case_timed_out",
+        "remediation_failed",
+        "remediation_human_blocked",
+        "remediation_cancelled",
+        "remediation_timed_out",
+        "remediation_ready_for_review",
+    }
 )
+
+
+class ProbeTarget(str, enum.Enum):
+    BASE = "BASE"
+    HEAD = "HEAD"
+
+
+class ProbeVerdict(str, enum.Enum):
+    """Outcome of one independent probe execution."""
+
+    MATCHED = "MATCHED"  # exit code equals the approved expectation
+    MISMATCHED = "MISMATCHED"  # probe ran to completion (or timed out) with another exit code
+    INFRASTRUCTURE = "INFRASTRUCTURE"  # checkout/runtime failure; says nothing about the code
+
+
+FAILURE_CLASS_INFRASTRUCTURE = "infrastructure"
+FAILURE_CLASS_VERIFICATION = "verification"
+FAILURE_CLASS_POLICY = "policy"
+FAILURE_CLASS_SESSION = "session"
 
 
 class WebhookEvent(Base):
@@ -196,6 +229,9 @@ class Case(Base):
     outbox: Mapped[list["NotificationOutbox"]] = relationship(
         order_by="NotificationOutbox.created_at"
     )
+    probe_snapshots: Mapped[list["ProbeSnapshot"]] = relationship(
+        order_by="ProbeSnapshot.created_at"
+    )
 
 
 class Attempt(Base):
@@ -209,11 +245,24 @@ class Attempt(Base):
             postgresql_where=text("finished_at IS NULL"),
         ),
         Index("ix_attempts_devin_session_id", "devin_session_id"),
+        Index(
+            "uq_attempts_case_kind_ordinal",
+            "case_id",
+            "kind",
+            "ordinal",
+            unique=True,
+            postgresql_where=text("ordinal IS NOT NULL"),
+        ),
     )
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     case_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("cases.id", ondelete="CASCADE"))
     kind: Mapped[AttemptKind] = mapped_column(Enum(AttemptKind, name="attempt_kind"))
+    # 1-based per (case, kind); allocated under a case row lock (DevinRunner._create) and
+    # backed by the partial unique index above. Legacy rows may be NULL.
+    ordinal: Mapped[int | None] = mapped_column(Integer)
     idempotency_key: Mapped[str] = mapped_column(String(255), unique=True)
+    # Full operation identity (case, phase, complete triage-result hash, complete base SHA,
+    # ordinal); also the exact Devin session tag. Never truncated.
     operation_key: Mapped[str] = mapped_column(String(255), unique=True)
     create_state: Mapped[CreateState] = mapped_column(
         Enum(CreateState, name="create_state"), default=CreateState.PENDING
@@ -240,7 +289,157 @@ class Attempt(Base):
     structured_output: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     error: Mapped[str | None] = mapped_column(Text)
     reconciliation_reason: Mapped[str | None] = mapped_column(Text)
+    # Phase 4 provenance: what this remediation attempt was authorised against.
+    approval_request_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey(
+            "approval_requests.id",
+            ondelete="SET NULL",
+            use_alter=True,
+            name="fk_attempts_approval_request_id",
+        )
+    )
+    triage_result_hash: Mapped[str | None] = mapped_column(String(64))
+    probe_snapshot_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("probe_snapshots.id", ondelete="SET NULL")
+    )
+    devin_pull_requests: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB)
+    pr_url: Mapped[str | None] = mapped_column(Text)
+    pr_number: Mapped[int | None] = mapped_column(Integer)
+    branch: Mapped[str | None] = mapped_column(String(255))
+    head_sha: Mapped[str | None] = mapped_column(String(64))
+    ci_deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    failure_stage: Mapped[str | None] = mapped_column(String(64))
+    failure_class: Mapped[str | None] = mapped_column(String(32))
     case: Mapped[Case] = relationship(back_populates="attempts")
+    probe_snapshot: Mapped["ProbeSnapshot | None"] = relationship(foreign_keys=[probe_snapshot_id])
+    probe_executions: Mapped[list["ProbeExecution"]] = relationship(
+        back_populates="attempt", order_by="ProbeExecution.started_at"
+    )
+    pull_request_evidence: Mapped[list["PullRequestEvidence"]] = relationship(
+        back_populates="attempt", order_by="PullRequestEvidence.created_at"
+    )
+    ci_snapshots: Mapped[list["CiSnapshot"]] = relationship(
+        back_populates="attempt", order_by="CiSnapshot.observed_at"
+    )
+
+
+class ProbeSnapshot(Base):
+    """Immutable copy of the approved probe taken at dispatch.
+
+    Execution always uses ``script_content`` from this row, never a file that may have
+    changed on disk or a copy carried by the remediation branch.
+    """
+
+    __tablename__ = "probe_snapshots"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    case_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("cases.id", ondelete="CASCADE"))
+    repository: Mapped[str] = mapped_column(String(255))
+    issue_number: Mapped[int] = mapped_column(Integer)
+    probe_identifier: Mapped[str] = mapped_column(String(255))
+    base_sha: Mapped[str] = mapped_column(String(64))
+    manifest_path: Mapped[str] = mapped_column(Text)
+    script_path: Mapped[str] = mapped_column(Text)
+    manifest: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    manifest_hash: Mapped[str] = mapped_column(String(64))
+    script_hash: Mapped[str] = mapped_column(String(64))
+    script_content: Mapped[str] = mapped_column(Text)
+    registry_commit: Mapped[str | None] = mapped_column(String(64))
+    expected_base_exit_code: Mapped[int] = mapped_column(Integer)
+    expected_head_exit_code: Mapped[int] = mapped_column(Integer)
+    timeout_seconds: Mapped[int] = mapped_column(Integer)
+    runtime: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), default=lambda: datetime.now(UTC)
+    )
+    executions: Mapped[list["ProbeExecution"]] = relationship(
+        back_populates="snapshot", order_by="ProbeExecution.started_at"
+    )
+
+
+class ProbeExecution(Base):
+    __tablename__ = "probe_executions"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    case_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("cases.id", ondelete="CASCADE"))
+    # NULL until a Devin attempt is authorised: the BASE run happens before any attempt
+    # exists and is the evidence that permits the durable create intent.
+    attempt_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("attempts.id", ondelete="CASCADE")
+    )
+    probe_snapshot_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("probe_snapshots.id", ondelete="CASCADE")
+    )
+    target: Mapped[ProbeTarget] = mapped_column(Enum(ProbeTarget, name="probe_target"))
+    commit_sha: Mapped[str] = mapped_column(String(64))
+    script_hash: Mapped[str] = mapped_column(String(64))
+    runner_mode: Mapped[str] = mapped_column(String(32))
+    command_identity: Mapped[str] = mapped_column(Text)
+    expected_exit_code: Mapped[int] = mapped_column(Integer)
+    exit_code: Mapped[int | None] = mapped_column(Integer)
+    verdict: Mapped[ProbeVerdict] = mapped_column(Enum(ProbeVerdict, name="probe_verdict"))
+    timed_out: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    duration_ms: Mapped[int | None] = mapped_column(Integer)
+    stdout: Mapped[str] = mapped_column(Text, default="")
+    stderr: Mapped[str] = mapped_column(Text, default="")
+    output_truncated: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    error: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), default=lambda: datetime.now(UTC)
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    attempt: Mapped[Attempt | None] = relationship(back_populates="probe_executions")
+    snapshot: Mapped["ProbeSnapshot"] = relationship(back_populates="executions")
+
+
+class PullRequestEvidence(Base):
+    """What GitHub said about the discovered PR when it was validated."""
+
+    __tablename__ = "pull_request_evidence"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    case_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("cases.id", ondelete="CASCADE"))
+    attempt_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("attempts.id", ondelete="CASCADE"))
+    repository: Mapped[str] = mapped_column(String(255))
+    pr_number: Mapped[int] = mapped_column(Integer)
+    pr_url: Mapped[str] = mapped_column(Text)
+    state: Mapped[str] = mapped_column(String(32))
+    draft: Mapped[bool] = mapped_column(Boolean)
+    merged: Mapped[bool] = mapped_column(Boolean)
+    base_ref: Mapped[str] = mapped_column(String(255))
+    base_sha: Mapped[str] = mapped_column(String(64))
+    head_ref: Mapped[str] = mapped_column(String(255))
+    head_sha: Mapped[str] = mapped_column(String(64))
+    head_repository: Mapped[str | None] = mapped_column(String(255))
+    author_login: Mapped[str | None] = mapped_column(String(255))
+    author_type: Mapped[str | None] = mapped_column(String(64))
+    compare_status: Mapped[str | None] = mapped_column(String(32))
+    ahead_by: Mapped[int | None] = mapped_column(Integer)
+    behind_by: Mapped[int | None] = mapped_column(Integer)
+    changed_files: Mapped[list[str]] = mapped_column(JSONB, default=list)
+    closing_reference_source: Mapped[str | None] = mapped_column(String(32))
+    closing_issue_numbers: Mapped[list[int]] = mapped_column(JSONB, default=list)
+    checks: Mapped[list[str]] = mapped_column(JSONB, default=list)
+    valid: Mapped[bool] = mapped_column(Boolean, default=False)
+    verdict: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), default=lambda: datetime.now(UTC)
+    )
+    attempt: Mapped[Attempt] = relationship(back_populates="pull_request_evidence")
+
+
+class CiSnapshot(Base):
+    __tablename__ = "ci_snapshots"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    case_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("cases.id", ondelete="CASCADE"))
+    attempt_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("attempts.id", ondelete="CASCADE"))
+    head_sha: Mapped[str] = mapped_column(String(64))
+    overall: Mapped[str] = mapped_column(String(32))
+    checks: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, default=list)
+    required_checks: Mapped[list[str]] = mapped_column(JSONB, default=list)
+    missing_required: Mapped[list[str]] = mapped_column(JSONB, default=list)
+    summary: Mapped[str] = mapped_column(Text, default="")
+    observed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), default=lambda: datetime.now(UTC)
+    )
+    attempt: Mapped[Attempt] = relationship(back_populates="ci_snapshots")
 
 
 class StateTransition(Base):
@@ -336,7 +535,7 @@ class ApprovalRequest(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
     case: Mapped[Case] = relationship(back_populates="approval_requests")
-    attempt: Mapped[Attempt] = relationship()
+    attempt: Mapped[Attempt] = relationship(foreign_keys=[attempt_id])
     actions: Mapped[list["SlackAction"]] = relationship(
         back_populates="request", order_by="SlackAction.created_at"
     )

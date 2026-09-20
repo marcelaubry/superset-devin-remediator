@@ -6,6 +6,7 @@ from sqlalchemy import desc, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ..adapters import build_github_client
 from ..approvals import (
     confirm_label_webhook,
     create_approval_request,
@@ -13,10 +14,11 @@ from ..approvals import (
     issue_label_names,
 )
 from ..config import Settings
-from ..devin.client import DevinClient, DevinError, DevinSessionNotFound
+from ..devin.client import DevinClient
 from ..devin.triage import TriageValidationError, validate_triage_output
+from ..github.client import GitHubIssuesClient
 from ..github_refs import BaseCommitResolver, build_base_commit_resolver
-from ..lifecycle import CaseState, transition
+from ..lifecycle import REMEDIATION_PHASE_STATES, CaseState, phase_for_state, transition
 from ..models import (
     ACTIVE_ATTEMPT_STATUSES,
     CANCEL_TERMINATION_REASON,
@@ -31,10 +33,19 @@ from ..models import (
     Recommendation,
     WebhookEvent,
 )
+from ..probes import build_probe_runner
+from ..probes.runner import ProbeRunner
 from ..rubric import IssueSnapshot, evaluate
-from .devin_runner import DevinRunner, RunOutcome, RunResult, fail_case
+from .devin_runner import (
+    DevinRunner,
+    RunOutcome,
+    RunResult,
+    fail_case,
+    terminate_running_attempts,
+)
+from .remediation import REMEDIATION_WORK_STATES, RemediationPipeline
 
-__all__ = ["fail_case", "process_case", "process_event"]
+__all__ = ["fail_case", "process_case", "process_event", "terminate_running_attempts"]
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +56,7 @@ RESUMABLE_STATES = frozenset(
         CaseState.TRIAGING,
         CaseState.RECONCILING_CREATE,
         CaseState.REMEDIATION_CREATE_INTENT,
+        CaseState.REMEDIATION_RECONCILING_CREATE,
         CaseState.REMEDIATING,
     }
 )
@@ -186,122 +198,20 @@ async def _evaluate_eligibility(session: AsyncSession, case: Case, claimed_by: s
     return True
 
 
-async def _process_remediation(
-    session: AsyncSession,
-    case: Case,
-    runner: DevinRunner,
-    claimed_by: str | None = None,
-) -> None:
-    outcome = await runner.run(AttemptKind.REMEDIATION)
-    if outcome.result != RunResult.FINISHED:
-        return
-    outcome.attempt.status = AttemptStatus.SUCCEEDED
-    await transition(
-        session,
-        case,
-        CaseState.OUTPUT_VALIDATING,
-        "validating Devin output",
-        "worker",
-        expected_claimed_by=claimed_by,
-    )
-    await session.commit()
-    pr_url = (outcome.attempt.structured_output or {}).get("pr_url")
-    if not isinstance(pr_url, str) or not pr_url:
-        reason = "missing pr_url in structured output"
-        await fail_case(session, case, reason, "worker", claimed_by)
-        await session.commit()
-        return
-    case.pr_url = pr_url
-    try:
-        case.pr_number = int(pr_url.rsplit("/", 1)[-1])
-    except ValueError:
-        case.pr_number = None
-    for state, reason in (
-        (CaseState.PR_VALIDATED, "structured PR output validated"),
-        (CaseState.CI_PENDING, "waiting for CI"),
-    ):
-        await transition(session, case, state, reason, "worker", expected_claimed_by=claimed_by)
-        await session.commit()
-    case.ci_status = "success"
-    await transition(
-        session,
-        case,
-        CaseState.CI_PASSED,
-        "fake CI passed",
-        "worker",
-        expected_claimed_by=claimed_by,
-    )
-    session.add(
-        NotificationOutbox(
-            case_id=case.id,
-            channel=OutboxChannel.GITHUB,
-            kind="case_completed",
-            payload={"pr_url": pr_url},
-        )
-    )
-    await session.commit()
-
-
-async def _terminate_running_attempts(
-    session: AsyncSession, case: Case, devin: DevinClient
-) -> bool:
-    """Terminate every session an active attempt owns or may own.
-
-    Returns False when at least one termination could not be confirmed; such attempts
-    are parked as TERMINATION_PENDING so the case is retried rather than closed.
-    """
-    attempts = list(
-        (
-            await session.scalars(
-                select(Attempt).where(
-                    Attempt.case_id == case.id,
-                    Attempt.status.in_([*ACTIVE_ATTEMPT_STATUSES, AttemptStatus.BLOCKED]),
-                )
-            )
-        ).all()
-    )
-    confirmed = True
-    for attempt in attempts:
-        try:
-            if attempt.devin_session_id:
-                await devin.terminate_session(attempt.devin_session_id)
-            elif attempt.create_sent_at is not None:
-                for match in await devin.find_sessions_by_tag(attempt.operation_key):
-                    try:
-                        await devin.terminate_session(match.session_id)
-                    except DevinSessionNotFound:
-                        pass
-        except DevinSessionNotFound:
-            pass
-        except DevinError as exc:
-            logger.warning(
-                "could not terminate Devin session for attempt %s: %s", attempt.operation_key, exc
-            )
-            attempt.status = AttemptStatus.TERMINATION_PENDING
-            attempt.reconciliation_reason = f"{CANCEL_TERMINATION_REASON}; DELETE failed: {exc}"
-            confirmed = False
-            continue
-        attempt.status = AttemptStatus.CANCELLED
-        attempt.error = CANCEL_TERMINATION_REASON
-        attempt.reconciliation_reason = None
-        attempt.finished_at = datetime.now(UTC)
-    return confirmed
-
-
 async def _terminate_case(
     session: AsyncSession,
     case: Case,
     devin: DevinClient,
     claimed_by: str | None = None,
 ) -> None:
-    if not await _terminate_running_attempts(session, case, devin):
+    if not await terminate_running_attempts(session, case, devin):
         case.failure_reason = "operator requested cancel; Devin session termination pending"
         await session.commit()
         return
     await transition(
         session,
         case,
-        CaseState.CANCELLED,
+        phase_for_state(case.state).cancelled,
         CANCEL_TERMINATION_REASON,
         "worker",
         expected_claimed_by=claimed_by,
@@ -325,10 +235,27 @@ async def process_case(
     settings: Settings,
     claimed_by: str | None = None,
     resolver: BaseCommitResolver | None = None,
+    github: GitHubIssuesClient | None = None,
+    probes: ProbeRunner | None = None,
 ) -> None:
     resolver = resolver or build_base_commit_resolver(settings)
-    runner = DevinRunner(session, case, devin, settings, resolver, claimed_by=claimed_by)
     state = CaseState(case.state)
+    if state in REMEDIATION_PHASE_STATES:
+        if state not in REMEDIATION_WORK_STATES:
+            return
+        pipeline = RemediationPipeline(
+            session,
+            case,
+            devin,
+            github or build_github_client(settings),
+            probes or build_probe_runner(settings.probe_runner_mode, settings.probe_verifier_url),
+            settings,
+            resolver,
+            claimed_by=claimed_by,
+        )
+        await pipeline.process()
+        return
+    runner = DevinRunner(session, case, devin, settings, resolver, claimed_by=claimed_by)
     if state == CaseState.RECEIVED:
         if not await _evaluate_eligibility(session, case, claimed_by):
             return
@@ -339,12 +266,6 @@ async def process_case(
     ):
         outcome = await runner.run(AttemptKind.TRIAGE)
         await _finish_triage(session, case, outcome, settings, claimed_by)
-    if CaseState(case.state) in {
-        CaseState.REMEDIATION_CREATE_INTENT,
-        CaseState.REMEDIATING,
-        CaseState.RECONCILING_CREATE,
-    }:
-        await _process_remediation(session, case, runner, claimed_by)
     if state == CaseState.TERMINATION_PENDING:
         pending = await _pending_termination_attempt(session, case)
         if pending is None:
