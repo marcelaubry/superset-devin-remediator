@@ -40,35 +40,51 @@
   `RemoteProbeRunner` sends a signed `verifier.v2` request (identifier and
   hashes, never the script) after validating `/capabilities` (no credentials
   visible, non-root, read-only root, required tools present).
-- **Verifier service (`remediator/verifier`, `docker/verifier/Dockerfile`):**
-  the only process that executes repository code. Separate container with no
-  provider/database secrets, no `.env`, no Docker socket, no import of
-  `remediator.config`, dedicated UID, read-only root, bounded tmpfs, dropped
-  capabilities, `no-new-privileges`, PID/memory/CPU limits and its own network.
-  Speaks `verifier.v2`: every request carries an HMAC-SHA256 signature over
-  `timestamp.body` with `PROBE_VERIFIER_SECRET` (the only secret it holds), a
-  request id for replay/idempotency, exact repository + 40-hex SHA, and the
-  probe *identifier and hashes only* — the script is loaded from the
-  verifier's read-only registry mount and must hash-match the approved
-  snapshot. `LocalProbeRunner` lives here: exact-commit clone of the
-  allowlisted repository into a temp workspace, manifest `setup` argv steps
-  (pinned Node 24 / npm / Yarn, Git, Python 3) with a keyed download cache,
-  snapshotted script with fixed argv and minimal environment, deadline covering
-  process exit, rlimits, marker-based descendant kill, workspace cleanup, and
-  bounded structured evidence including tool versions and an
-  infrastructure-vs-product failure class. `GET /capabilities` reports the
-  isolation facts the worker verifies before spending. See
-  [probes.md](probes.md) and [threat-model.md](threat-model.md).
+- **Verifier front (`verifier` service, `remediator/verifier`):** the
+  worker-facing half of the verifier. Holds exactly one secret, the HMAC key
+  (Docker secret file), and executes no repository code. Speaks
+  `verifier.v2`: every request carries an HMAC-SHA256 signature over
+  `timestamp.body`, a request id for replay/idempotency, exact repository +
+  40-hex SHA, and the probe *identifier and hashes only*; the front rebinds
+  the request to its own read-only registry mount, enforces allowlist and
+  timeouts, then forwards to the runner over `verifier-internal`
+  (`VERIFIER_EXECUTION=runner`). Its signed `GET /capabilities` merges the
+  runner's isolation facts with `execution` and `key_isolated_from_probes`;
+  unauthenticated `/health` is liveness only.
+- **Verifier runner (`verifier-runner`, `remediator/verifier/executor`):**
+  the only process that executes repository code, in a separate container
+  and UID with **no secret at all** (not even the HMAC key), no `.env`, no
+  Docker socket, read-only root, disk-backed `/workspace` volume wiped per
+  run, dropped capabilities, `no-new-privileges`, PID/memory/CPU limits, and
+  a single `internal: true` network. `LocalProbeRunner` lives here:
+  exact-commit fetch of the allowlisted repository, manifest `setup` argv
+  steps (pinned Node 24 / npm / Yarn, Git, Python 3) with a keyed download
+  cache, snapshotted script with fixed argv and minimal environment,
+  deadline covering process exit, rlimits, every subprocess (fetch steps
+  included) in its own session with a run marker and process-group kill,
+  a UID-wide post-run sweep (hence `VERIFIER_MAX_CONCURRENT` must be 1),
+  workspace cleanup, and bounded structured evidence including tool versions
+  and an infrastructure-vs-product failure class. It self-reports
+  `direct_egress` by attempting a bounded connection to a public host.
+- **Egress proxy (`egress-proxy`, `remediator/verifier/egress_proxy`):** the
+  runner's only route out. Accepts `CONNECT host:443` for exact lower-case
+  hostnames in `EGRESS_ALLOWED_HOSTS` (GitHub, the npm/yarn registries and `cdn.sheetjs.com`, which Superset's lockfile resolves `xlsx` from, by
+  default); rejects wildcards, IP literals, other ports and plain HTTP.
+  Holds nothing. See [probes.md](probes.md) and
+  [threat-model.md](threat-model.md).
 - **Capacity manager (`remediator/capacity.py`):** PostgreSQL lease table
   under an advisory lock enforcing `MAX_CONCURRENT_TRIAGE` /
   `MAX_CONCURRENT_REMEDIATION` / `MAX_CONCURRENT_PROBES`, a per-repository
   remediation limit, one active remediation per case and manifest
-  `resource_keys`. Denied cases park at zero ACUs. See
-  [concurrency.md](concurrency.md).
+  `resource_keys`. Denied cases park at zero ACUs and are admitted FIFO by
+  `waiting_since` per global limit. See [concurrency.md](concurrency.md).
 - **Readiness (`python -m remediator.readiness`):** read-only pre-flight of
   configuration, database, Devin/GitHub/Slack identity and permissions,
-  verifier isolation and Node capability, webhook URL, allowlists and limits;
-  mutating checks need `--allow-mutations`. See [readiness.md](readiness.md).
+  verifier key separation, isolation, egress and Node capability, webhook
+  URL, allowlists and limits; `--verifier-smoke` runs the real pinned
+  Superset Jest probe through the runner; mutating checks need
+  `--allow-mutations --confirm-channel <SLACK_CHANNEL_ID>`. See
+  [readiness.md](readiness.md).
 - **Metrics (`/metrics`):** authenticated, low-cardinality Prometheus text with
   a `mode=live|simulated` label; see [metrics.md](metrics.md).
 - **Slack adapter (`remediator/slack`):** request signature verification
@@ -703,12 +719,12 @@ the Devin client closes and the database engine is disposed.
 
 ## Deferred beyond Phase 5
 
-- **Verifier hardening:** the credential-free, HMAC-authenticated `verifier`
-  exists (Phase 5); still to do are enforced egress (only anonymous GitHub
-  clones and the npm registry), TLS/mTLS on the internal link instead of
-  plain HTTP on the compose network, a shared idempotency store across
-  verifier restarts, and per-probe sub-UIDs or namespaces / container
-  recycling so a verifier is never reused after a suspicious run.
+- **Verifier hardening:** the key-holding front, credential-free runner and
+  exact-host egress proxy exist (Phase 5); still to do are TLS/mTLS on the
+  two internal hops instead of plain HTTP on the compose networks, a shared
+  idempotency store across front restarts, and per-probe sub-UIDs or
+  namespaces / container recycling so a runner is never reused after a
+  suspicious run (which would also lift the one-probe-per-runner limit).
 - **Post-merge verification:** `MERGED` and `MERGE_VERIFIED` remain
   documented future states; no automatic regression-issue creation.
 - **GitHub App identity:** replace the PAT with an installation token and pin

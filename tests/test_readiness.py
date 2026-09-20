@@ -72,6 +72,8 @@ def _capabilities() -> dict[str, object]:
             "memory_limit_bytes": 3_221_225_472,
             "cpu_quota": "200000 100000",
             "docker_socket_present": False,
+            "direct_egress": False,
+            "egress_proxy_configured": True,
         },
         "tools": {"git": True, "bash": True, "python3": True, "node": True, "npm": True},
         "tool_versions": {"git": "2.43", "bash": "5.2", "node": "v24.16.0", "npm": "11.13.0"},
@@ -81,6 +83,7 @@ def _capabilities() -> dict[str, object]:
         "max_timeout_seconds": 3600,
         "cache_enabled": True,
         "in_flight": 0,
+        "execution": "runner",
     }
 
 
@@ -196,7 +199,9 @@ async def test_mutating_check_requires_explicit_flag() -> None:
     await run_checks(settings, probes=probes)
     assert not any(r.url.path.endswith("chat.postMessage") for r in recorder.requests)
 
-    results = await run_checks(settings, allow_mutations=True, probes=probes)
+    results = await run_checks(
+        settings, allow_mutations=True, confirm_channel="C0123456789", probes=probes
+    )
     posts = [r for r in recorder.requests if r.url.path.endswith("chat.postMessage")]
     assert len(posts) == 1
     assert _by_name(results)["slack.test_message"].mutating is True
@@ -245,10 +250,34 @@ async def test_verifier_isolation_gaps_and_allowlist_mismatch_fail() -> None:
     assert by_name["verifier.isolation"].status == "fail"
     assert by_name["verifier.allowlist"].status == "fail"
     assert by_name["verifier.node"].status == "warn"
+    assert by_name["verifier.key_separation"].status == "pass"
+    assert by_name["verifier.egress"].status == "pass"
 
     strict = await readiness.check_verifier(_live_settings(), Probes(verifier=transport))
     assert strict[0].name == "verifier.health" and strict[0].status == "fail"
     assert "isolation not enforced" in strict[0].detail
+
+
+@pytest.mark.asyncio
+async def test_verifier_key_colocation_and_open_egress_fail_readiness() -> None:
+    colocated = _capabilities()
+    colocated["execution"] = "in-process"
+    results = readiness._verifier_results(_live_settings(), Capabilities.model_validate(colocated))  # noqa: SLF001
+    key = _by_name(results)["verifier.key_separation"]
+    assert key.status == "fail" and "HMAC key" in key.detail
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, json=colocated))
+    strict = await readiness.check_verifier(_live_settings(), Probes(verifier=transport))
+    assert strict[0].status == "fail" and "HMAC key" in strict[0].detail
+
+    for direct, phrase in ((True, "reach the internet directly"), (None, "not verified")):
+        caps = _capabilities()
+        caps["isolation"] = {**caps["isolation"], "direct_egress": direct}  # type: ignore[dict-item]
+        results = readiness._verifier_results(_live_settings(), Capabilities.model_validate(caps))  # noqa: SLF001
+        egress = _by_name(results)["verifier.egress"]
+        assert egress.status == "fail" and phrase in egress.detail
+        transport = httpx.MockTransport(lambda request, caps=caps: httpx.Response(200, json=caps))
+        strict = await readiness.check_verifier(_live_settings(), Probes(verifier=transport))
+        assert strict[0].status == "fail" and "egress" in strict[0].detail
 
 
 @pytest.mark.asyncio
@@ -310,3 +339,142 @@ def test_main_reports_settings_errors_without_secrets(
     out = capsys.readouterr().out
     assert "config.load" in out and "DEVIN_CLIENT_MODE=live" in out
     assert "must-not-print" not in out and "input_value" not in out
+
+
+@pytest.mark.asyncio
+async def test_mutations_need_the_channel_confirmation_too() -> None:
+    recorder = Recorder()
+    transport = recorder.transport(_happy_handler)
+    probes = Probes(slack=transport, devin=transport, github=transport, verifier=transport)
+    settings = _live_settings(
+        probe_runner_mode="fake",
+        probe_verifier_url=None,
+        probe_verifier_shared_secret=None,
+        devin_client_mode="fake",
+        devin_api_key=None,
+        devin_org_id=None,
+        github_client_mode="fake",
+        github_token=None,
+        public_base_url="",
+    )
+    for confirm in (None, "C0000000000"):
+        results = await run_checks(
+            settings, allow_mutations=True, confirm_channel=confirm, probes=probes
+        )
+        gate = _by_name(results)["mutations.confirmation"]
+        assert gate.status == "fail" and gate.mutating is True
+        assert "slack.test_message" not in _by_name(results)
+    assert not any(r.url.path.endswith("chat.postMessage") for r in recorder.requests)
+
+    results = await run_checks(
+        settings, allow_mutations=True, confirm_channel="C0123456789", probes=probes
+    )
+    assert _by_name(results)["slack.test_message"].status == "pass"
+    assert "mutations.confirmation" not in _by_name(results)
+
+
+def _smoke_handler(
+    exit_code: int | None, infra: str | None = None
+) -> Callable[..., httpx.Response]:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/capabilities":
+            caps = _capabilities()
+            caps["repository_allowlist"] = ["apache/superset"]
+            return httpx.Response(200, json=caps)
+        assert request.url.path == "/probe"
+        body = json.loads(request.content)
+        assert body["issue_number"] == 0 and body["target"] == "BASE"
+        assert "script_content" not in body
+        from remediator.models import ProbeTarget
+        from remediator.probes.runner import ProbeRunSpec, command_identity
+
+        identity = command_identity(
+            ProbeRunSpec(
+                repository=body["repository"],
+                issue_number=0,
+                commit_sha=body["commit_sha"],
+                target=ProbeTarget.BASE,
+                probe_identifier=body["probe_identifier"],
+                script_hash=body["script_hash"],
+                script_content="",
+                timeout_seconds=body["timeout_seconds"],
+                max_output_bytes=body["max_output_bytes"],
+                required_tools=(),
+            )
+        )
+        return httpx.Response(
+            200,
+            json={
+                "request_id": body["request_id"],
+                "repository": body["repository"],
+                "commit_sha": body["commit_sha"],
+                "probe_identifier": body["probe_identifier"],
+                "script_hash": body["script_hash"],
+                "runner_mode": "local",
+                "command_identity": identity,
+                "exit_code": exit_code,
+                "stdout": "Tests: 3 passed",
+                "stderr": "" if exit_code == 0 else f"jest failed token={DEVIN_KEY}",
+                "output_truncated": False,
+                "timed_out": False,
+                "duration_ms": 61_000,
+                "infrastructure_error": infra,
+                "failure_stage": "setup" if infra else None,
+                "tool_versions": {"node": "v24.16.0", "npm": "11.13.0"},
+            },
+        )
+
+    return handler
+
+
+@pytest.mark.asyncio
+async def test_verifier_smoke_is_opt_in_and_classifies_results() -> None:
+    settings = _live_settings(probe_root="probes", probe_smoke_probe="apache/superset#0")
+    recorder = Recorder()
+    probes = Probes(verifier=recorder.transport(_smoke_handler(0)))
+
+    results = await readiness.check_verifier_smoke(settings, probes)
+    assert [r.status for r in results] == ["pass"]
+    assert (
+        "apache/superset#0@sha256:" in results[0].detail and "@ 4511c1381930" in results[0].detail
+    )
+    assert any(r.url.path == "/probe" for r in recorder.requests)
+
+    failed = await readiness.check_verifier_smoke(
+        settings, Probes(verifier=httpx.MockTransport(_smoke_handler(1)))
+    )
+    assert failed[0].status == "fail" and "exit=1 expected=0" in failed[0].detail
+
+    infra = await readiness.check_verifier_smoke(
+        settings, Probes(verifier=httpx.MockTransport(_smoke_handler(None, "npm ci failed")))
+    )
+    assert infra[0].status == "fail" and infra[0].detail.startswith("infrastructure: npm ci")
+
+    # Not part of the default run; opt-in adds it and redaction still applies to its output.
+    default = await run_checks(
+        settings, probes=Probes(verifier=httpx.MockTransport(_happy_handler))
+    )
+    assert "verifier.smoke" not in _by_name(default)
+    opted = await run_checks(
+        settings,
+        verifier_smoke=True,
+        probes=Probes(verifier=httpx.MockTransport(_smoke_handler(1))),
+    )
+    smoke = _by_name(opted)["verifier.smoke"]
+    assert smoke.status == "fail" and DEVIN_KEY not in smoke.detail
+
+
+@pytest.mark.asyncio
+async def test_verifier_smoke_skips_without_a_remote_verifier_and_rejects_bad_probe() -> None:
+    fake = _live_settings(
+        probe_runner_mode="fake",
+        probe_verifier_url=None,
+        probe_verifier_shared_secret=None,
+        devin_client_mode="fake",
+        devin_api_key=None,
+        devin_org_id=None,
+    )
+    assert (await readiness.check_verifier_smoke(fake, Probes()))[0].status == "skip"
+    bad = _live_settings(probe_smoke_probe="apache/superset#999999")
+    result = (await readiness.check_verifier_smoke(bad, Probes()))[0]
+    assert result.status == "fail" and "not loadable" in result.detail

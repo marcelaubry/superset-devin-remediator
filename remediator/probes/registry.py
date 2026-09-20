@@ -253,7 +253,19 @@ async def registry_commit_for(root: Path, relative: Path) -> str | None:
     return sha if proc.returncode == 0 and _SHA_RE.match(sha) else None
 
 
-async def load_approved_probe(root: Path, repository: str, issue_number: int) -> ApprovedProbe:
+SMOKE_ISSUE_NUMBER = 0
+"""Reserved probe slot per repository: exercised by `readiness --verifier-smoke` only. It is
+never a case (GitHub issues start at 1) and `load_approved_probe` refuses it unless the
+caller opts in, so it can never drive remediation."""
+
+
+async def load_approved_probe(
+    root: Path, repository: str, issue_number: int, *, allow_smoke: bool = False
+) -> ApprovedProbe:
+    if issue_number <= SMOKE_ISSUE_NUMBER and not (
+        allow_smoke and issue_number == SMOKE_ISSUE_NUMBER
+    ):
+        raise ProbeRegistryError(f"issue number {issue_number} is reserved; not a remediable case")
     root = root.resolve()
     directory = probe_directory(root, repository, issue_number)
     manifest_path = directory / MANIFEST_FILENAME

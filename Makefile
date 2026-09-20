@@ -1,4 +1,4 @@
-.PHONY: fmt lint typecheck test up migrate simulate readiness readiness-mutating audit
+.PHONY: fmt lint typecheck test up migrate simulate readiness readiness-smoke readiness-mutating audit
 fmt:
 	uv run ruff format .
 lint:
@@ -15,8 +15,11 @@ simulate:
 	uv run python scripts/simulate.py --scenario all --wait
 readiness:
 	uv run python -m remediator.readiness
+readiness-smoke:
+	uv run python -m remediator.readiness --verifier-smoke
 readiness-mutating:
-	uv run python -m remediator.readiness --allow-mutations
+	@test -n "$(CONFIRM_CHANNEL)" || (echo "usage: make readiness-mutating CONFIRM_CHANNEL=<SLACK_CHANNEL_ID>" && exit 2)
+	uv run python -m remediator.readiness --allow-mutations --confirm-channel "$(CONFIRM_CHANNEL)"
 # Dependency, image and secret-hygiene audits (docker required for the image/gitleaks scans)
 audit:
 	uv export --no-dev --no-hashes -q -o /tmp/remediator-requirements.txt

@@ -126,8 +126,9 @@ spend zero ACUs.
   pending/passed/failed/cancelled/skipped/timed-out are distinguished, absent
   checks never pass, `GITHUB_REQUIRED_CHECKS` names the required ones.
   `CI_PASSED` still requires human PR review; nothing merges or closes.
-- Repository code executes in exactly one place: the **verifier container**
-  (`docker/verifier/Dockerfile`, `remediator.verifier`).
+- Repository code executes in exactly one place: the **verifier runner**
+  (`verifier-runner` service, `remediator.verifier.executor`), behind a
+  key-holding front and an exact-host egress proxy.
 
   ```text
   API / worker (Devin, GitHub, Slack, operator, DB credentials)
@@ -135,34 +136,40 @@ spend zero ACUs.
       │  repository, exact 40-hex SHA, probe id, script + manifest hashes
       │  (never the script, never a URL, never a credential)
       ▼
-  verifier (only secret: the HMAC key; read-only probe registry mount)
-      │  allowlist + hash check → anonymous clone of the exact SHA →
-      │  manifest setup argv (npm ci …) → probe.sh, no shell
+  verifier (front, UID 65533; only secret: the HMAC key; runs no repo code)
+      │  signature + allowlist + registry hash check, forwarded over an
+      │  internal-only network
       ▼
-  bounded evidence: exit code, duration, stdout/stderr, tool versions,
-  infrastructure-vs-product class
+  verifier-runner (UID 65534; NO secret at all, not even the HMAC key)
+      │  anonymous fetch of the exact SHA → manifest setup argv (npm ci …)
+      │  → probe.sh, no shell; internet only via
+      ▼                    egress-proxy: CONNECT :443 to github.com,
+  bounded evidence          registry.npmjs.org, … (exact hosts, no IPs)
   ```
 
-  The verifier has no `.env`, no Docker socket, no provider or database
-  credential and never imports `remediator.config`; it runs as a dedicated
-  non-root UID on a read-only root filesystem with a bounded `/tmp`,
-  `cap_drop: ALL`, `no-new-privileges`, PID/memory/CPU limits and its own
-  network, and ships pinned Git, Bash, Python 3, Node 24, npm and Yarn for the
-  Superset frontend probes. The worker only ever uses `PROBE_RUNNER_MODE=fake`
-  (simulation) or `remote`; before each probe it reads `/capabilities` and any
-  visible credential, UID 0, writable root, missing tool or (in live mode)
-  unproven isolation property makes the run an *infrastructure* failure, never
-  a verdict. Requests carry a request id and are idempotent per verifier
-  process. Dependency installs may reach the network (the verifier holds no
-  customer secret); cache keys include the lockfile hash, runtime versions and
-  repository identity, and cache contents can never decide a verdict. See
+  No verifier service has `.env`, a Docker socket, a provider or database
+  credential, or an import of `remediator.config`; each runs as its own
+  non-root UID on a read-only root filesystem with `cap_drop: ALL`,
+  `no-new-privileges`, PID/memory/CPU limits. The runner's only network is
+  `internal: true`, its workspace is a disk-backed volume wiped after every
+  run, and the image ships pinned Git, Bash, Python 3, Node 24, npm and Yarn
+  for the Superset frontend probes. The worker only ever uses
+  `PROBE_RUNNER_MODE=fake` (simulation) or `remote`; before each probe it
+  reads the signed `/capabilities` and `execution != runner`, any visible
+  credential, UID 0, writable root, missing tool, possible direct egress or
+  (in live mode) an unproven isolation property makes the run an
+  *infrastructure* failure, never a verdict. Requests carry a request id and
+  are idempotent per front process. Cache keys include the lockfile hash,
+  runtime versions and repository identity, and cache contents can never
+  decide a verdict. `make readiness-smoke` runs the real pinned Superset Jest
+  probe (`probes/apache/superset/0`) through the whole path. See
   [docs/probes.md](docs/probes.md), [docs/threat-model.md](docs/threat-model.md)
   and [docs/known-limitations.md](docs/known-limitations.md).
 - **Concurrency and spend:** `MAX_CONCURRENT_TRIAGE`,
   `MAX_CONCURRENT_REMEDIATION`, `MAX_CONCURRENT_PROBES`, a per-repository
   remediation limit, one active remediation per case and manifest
   `resource_keys` are PostgreSQL leases shared by every worker. A case that
-  finds a limit full is parked at zero ACUs and retried; leases heartbeat,
+  finds a limit full is parked at zero ACUs and admitted FIFO; leases heartbeat,
   expire and reconcile after crashes; cancel keeps the slot until Devin
   confirms termination. See [docs/concurrency.md](docs/concurrency.md).
 - **Metrics:** `GET /metrics` (operator token) exposes low-cardinality
@@ -175,9 +182,11 @@ spend zero ACUs.
 - **Readiness:** `make readiness` runs a read-only redacted pass/fail report
   (config placeholders, database/migrations, Devin identity and session-list
   permission, GitHub identity/default branch/labels/permissions, Slack
-  identity/channel/approvers, verifier isolation and Node capability, webhook
-  base URL, allowlists, limits). `make readiness-mutating` additionally posts a
-  Slack test message. See [docs/readiness.md](docs/readiness.md).
+  identity/channel/approvers, verifier key separation/isolation/egress and
+  Node capability, webhook base URL, allowlists, limits).
+  `make readiness-smoke` adds the real Superset probe run;
+  `make readiness-mutating CONFIRM_CHANNEL=<SLACK_CHANNEL_ID>` additionally
+  posts a Slack test message. See [docs/readiness.md](docs/readiness.md).
 - **Request hardening:** body-size limit (`413`), Origin/CSRF checks and a
   rate limit on operator mutations, security headers, SSRF validation of
   provider/verifier URLs, secret redaction in nested errors, allowlisted-host
@@ -312,6 +321,7 @@ failed termination, concurrent retries, and worker restart in every state.
 | `PROBE_VERIFIER_SHARED_SECRET` | unset | HMAC key (>= 32 chars) shared only with the verifier; required with `remote`. Mounted into the verifier as a Docker secret from `docker/secrets/verifier_hmac_key` |
 | `PROBE_VERIFIER_REQUEST_TIMEOUT_SECONDS` | `30` | HTTP timeout for capability checks (probe requests use the probe timeout) |
 | `PROBE_VERIFIER_REQUIRE_ISOLATION` | `true` | Refuse a verifier that cannot prove `no-new-privileges`, empty capability sets and cgroup limits; forced on in live mode |
+| `PROBE_SMOKE_PROBE` | `apache/superset#0` | Reserved registry slot (issue 0 is never a case) run by `readiness --verifier-smoke` |
 | `MAX_CONCURRENT_TRIAGE` / `MAX_CONCURRENT_REMEDIATION` / `MAX_CONCURRENT_PROBES` | `2` / `1` / `1` | Global lease limits shared by all workers |
 | `MAX_CONCURRENT_REMEDIATION_PER_REPOSITORY` | `1` | Remediation leases per repository |
 | `CAPACITY_WAIT_BACKOFF_SECONDS` | `5` | Re-check delay for a case parked on a full limit |
@@ -546,7 +556,7 @@ never trusts Devin-reported probe results. See
 lifecycle semantics, and status mapping;
 [docs/threat-model.md](docs/threat-model.md) for the spend, secret, and probe
 isolation boundaries; and [docs/known-limitations.md](docs/known-limitations.md)
-for what remains (notably enforced verifier egress, TLS on the internal
-verifier link, and unresolved Debian base-image CVEs). `MERGED` and
+for what remains (notably TLS on the internal verifier hops, one probe at a
+time per runner, and unresolved Debian base-image CVEs). `MERGED` and
 `MERGE_VERIFIED` stay documented future states; nothing files regression
 issues automatically.

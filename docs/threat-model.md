@@ -31,26 +31,39 @@ The verifier boundary (Phase 5):
 | Side | Holds | Never sees |
 | --- | --- | --- |
 | API / worker | every provider credential, database URL, operator token, the verifier HMAC key | repository code; there is no local probe runner |
-| verifier | the HMAC key (via Docker secret file), the read-only probe registry, anonymous network egress for `git clone` and package downloads | `.env`, the Docker socket, any `*_TOKEN`/`*_SECRET`/`*_API_KEY`/`DATABASE_URL`, the database network |
+| `verifier` (front, UID 65533) | the HMAC key (via Docker secret file), the read-only probe registry | repository code, `.env`, the Docker socket, any provider credential, the database network, the internet |
+| `verifier-runner` (UID 65534) | the read-only probe registry, a disk-backed workspace, a route to `egress-proxy` | **any secret at all, the HMAC key included**; `.env`; the Docker socket; the worker network; the internet directly |
+| `egress-proxy` (UID 65532) | an exact hostname allowlist | everything else |
 
-The HMAC key is the single shared value. It authenticates *who may ask* the
-verifier to run an already-registered probe; it grants nothing else, and a
-verifier compromised by a malicious commit can only lie about verdicts for
-the repository it was already asked to run. The worker treats the verifier's
-answer as evidence, not authority: it checks the request id, repository, SHA,
-script hash and command identity of the response and refuses (infrastructure
-failure, never a pass) a verifier whose signed `/capabilities` show a
-credential, UID 0, writable root, missing tool or — with
+The HMAC key is the single shared value between worker and front. It
+authenticates *who may ask* the verifier to run an already-registered probe
+and grants nothing else. Because the key never reaches the runner, a probe or
+test suite compromised by a malicious commit cannot read it from `os.environ`,
+`/proc`, or `/run/secrets` and therefore cannot forge, replay or self-approve
+a verdict for another SHA; it can only lie about the run it is already in.
+The worker treats the verifier's answer as evidence, not authority: it checks
+the request id, repository, SHA, script hash and command identity of the
+response and refuses (infrastructure failure, never a pass) a verifier whose
+signed `/capabilities` show `execution != runner`, a credential, UID 0,
+writable root, missing tool, `direct_egress` true or unverified, or — with
 `PROBE_VERIFIER_REQUIRE_ISOLATION` (forced in live mode) — missing
 `no-new-privileges`, non-empty capability sets or absent cgroup PID/memory
 limits. Docker Desktop hosts that cannot present those cgroup facts therefore
 fail closed rather than being trusted with a weaker sandbox.
 
-Network egress from the verifier is required (dependencies are installed from
-registries by declared `setup` steps) and is *not* credential-bearing.
-Package lifecycle scripts execute as the verifier UID with the same access a
-malicious commit already has; the registry's `--ignore-scripts` guidance in
-[probes.md](probes.md) reduces, but does not remove, that surface.
+Network egress from the runner is required (dependencies are installed from
+registries by declared `setup` steps) and is *not* credential-bearing. It is
+enforced by topology: the runner's only network is `internal: true` (no
+gateway), so `git fetch` and `npm ci` go through `egress-proxy`, which admits
+`CONNECT` to exact allowlisted hosts on :443 only (`EGRESS_ALLOWED_HOSTS`).
+The runner attempts a bounded direct connection to a public host on every
+capability read and reports the outcome as `direct_egress`; readiness and the
+worker fail when it succeeds. A compromised probe can still push the
+repository contents it already has to any allowlisted host (e.g. another
+GitHub repository or an npm package it controls), and package lifecycle
+scripts execute as the runner UID with the same access a malicious commit
+already has; approved manifests use `--ignore-scripts`, which reduces but
+does not remove that surface.
 
 Slack has no path to Devin. The API never performs outbound HTTP for Slack or
 GitHub; the worker does, through the transactional outbox, and only to the

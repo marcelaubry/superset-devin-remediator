@@ -3,6 +3,7 @@ the verifier <-> worker boundary. No external repository is touched: every probe
 a throw-away git repository created in tmp_path."""
 
 import asyncio
+import dataclasses
 import hashlib
 import json
 import os
@@ -19,7 +20,13 @@ import remediator.probes.runner as runner_module
 import remediator.verifier as verifier_module
 from remediator.models import ProbeTarget
 from remediator.probes import build_probe_runner
-from remediator.probes.registry import ApprovedProbe, load_approved_probe, write_probe
+from remediator.probes.registry import (
+    SMOKE_ISSUE_NUMBER,
+    ApprovedProbe,
+    ProbeRegistryError,
+    load_approved_probe,
+    write_probe,
+)
 from remediator.probes.remote import RemoteProbeRunner, VerifierBusyError, new_request_id
 from remediator.probes.runner import (
     PROBE_RUN_MARKER,
@@ -31,7 +38,7 @@ from remediator.probes.runner import (
     credential_exposure,
     marked_pids,
 )
-from remediator.verifier import VerifierConfig, create_app, health
+from remediator.verifier import VerifierConfig, create_app, executor, health
 from remediator.verifier.protocol import (
     SIGNATURE_HEADER,
     TIMESTAMP_HEADER,
@@ -119,6 +126,31 @@ async def test_local_runner_executes_exact_commit_and_bounds_output(tmp_path: Pa
     assert not list(tmp_path.glob("probe-*")), "workspace must be removed"
 
 
+async def test_failed_setup_step_reports_the_tail_of_its_stderr(tmp_path: Path) -> None:
+    """Package managers print the real error after pages of warnings; the infrastructure
+    detail must keep the end, not the beginning."""
+    _, sha = _git_repo(tmp_path)
+    spec = dataclasses.replace(
+        _spec(sha, "exit 0"),
+        required_tools=("python3",),
+        setup_steps=(
+            (
+                "python3",
+                "-c",
+                "import sys\n"
+                "for i in range(400): print('warn deprecated filler', i, file=sys.stderr)\n"
+                "print('error code E403 FINAL_CAUSE', file=sys.stderr)\n"
+                "sys.exit(1)",
+            ),
+        ),
+    )
+    result = await _runner(tmp_path).run(spec)
+    assert result.infrastructure_error is not None
+    assert "setup step python3 -c exited 1" in result.infrastructure_error
+    assert "FINAL_CAUSE" in result.infrastructure_error
+    assert "filler 0\n" not in result.infrastructure_error
+
+
 async def test_timeout_covers_process_exit_not_just_output(tmp_path: Path) -> None:
     """A child that closes stdout/stderr and keeps running must still die at the deadline."""
     _, sha = _git_repo(tmp_path)
@@ -199,13 +231,18 @@ def test_credential_exposure_sees_env_and_files(tmp_path: Path) -> None:
     assert credential_exposure({"PATH": "/bin"}, ()) == []
 
 
-def test_credential_exposure_allows_only_the_verifiers_own_secret_file(tmp_path: Path) -> None:
+def test_credential_exposure_allows_the_hmac_key_only_where_no_probe_runs(tmp_path: Path) -> None:
     secrets = tmp_path / "run" / "secrets"
     secrets.mkdir(parents=True)
     (secrets / "verifier_hmac_key").write_text("k")
-    assert credential_exposure({}, (str(secrets),)) == []
+    # The executor (default) may hold nothing, not even the verifier's own key.
+    assert credential_exposure({}, (str(secrets),)) == [f"{secrets}/verifier_hmac_key"]
+    # The key-holding front may hold exactly that one file.
+    assert credential_exposure({}, (str(secrets),), allow_own_secret=True) == []
     (secrets / "github_token").write_text("t")
-    assert credential_exposure({}, (str(secrets),)) == [f"{secrets}/github_token"]
+    assert credential_exposure({}, (str(secrets),), allow_own_secret=True) == [
+        f"{secrets}/github_token"
+    ]
 
 
 async def test_missing_tool_is_infrastructure_failure(tmp_path: Path) -> None:
@@ -244,6 +281,9 @@ def _verifier_config(tmp_path: Path, **env: str) -> VerifierConfig:
     cfg = VerifierConfig(
         {
             "VERIFIER_HMAC_KEY": SECRET,
+            # Front and executor in one process; the split is covered by the executor tests.
+            "VERIFIER_EXECUTION": "in-process",
+            "VERIFIER_EGRESS_CHECK": "off",
             "VERIFIER_CLONE_URL_FORMAT": "https://example.invalid/{repository}.git",
             "VERIFIER_WORKSPACE_ROOT": str(tmp_path),
             "VERIFIER_PROBE_ROOT": str(tmp_path / REGISTRY),
@@ -331,12 +371,28 @@ def test_verifier_config_requires_key_and_allowlist(tmp_path: Path) -> None:
         VerifierConfig({"VERIFIER_HMAC_KEY": SECRET})
     with pytest.raises(ValueError, match="owner/repo"):
         VerifierConfig({"VERIFIER_HMAC_KEY": SECRET, "VERIFIER_REPOSITORY_ALLOWLIST": "nope"})
+    with pytest.raises(ValueError, match="VERIFIER_RUNNER_URL"):
+        VerifierConfig({"VERIFIER_HMAC_KEY": SECRET, "VERIFIER_REPOSITORY_ALLOWLIST": "acme/demo"})
+    with pytest.raises(ValueError, match="VERIFIER_MAX_CONCURRENT must be 1"):
+        VerifierConfig(
+            {
+                "VERIFIER_HMAC_KEY": SECRET,
+                "VERIFIER_REPOSITORY_ALLOWLIST": "acme/demo",
+                "VERIFIER_EXECUTION": "in-process",
+                "VERIFIER_MAX_CONCURRENT": "2",
+            }
+        )
     key_file = tmp_path / "key"
     key_file.write_text(SECRET + "\n")
     cfg = VerifierConfig(
-        {"VERIFIER_HMAC_KEY_FILE": str(key_file), "VERIFIER_REPOSITORY_ALLOWLIST": "acme/demo"}
+        {
+            "VERIFIER_HMAC_KEY_FILE": str(key_file),
+            "VERIFIER_REPOSITORY_ALLOWLIST": "acme/demo",
+            "VERIFIER_RUNNER_URL": "http://verifier-runner:8081",
+        }
     )
     assert cfg.hmac_key == SECRET
+    assert cfg.execution == "runner"
 
 
 def test_verifier_config_scrubs_key_from_process_environment(
@@ -344,6 +400,7 @@ def test_verifier_config_scrubs_key_from_process_environment(
 ) -> None:
     monkeypatch.setenv("VERIFIER_HMAC_KEY", SECRET)
     monkeypatch.setenv("VERIFIER_REPOSITORY_ALLOWLIST", "acme/demo")
+    monkeypatch.setenv("VERIFIER_RUNNER_URL", "http://verifier-runner:8081")
     cfg = VerifierConfig()
     assert cfg.hmac_key == SECRET
     assert "VERIFIER_HMAC_KEY" not in os.environ, "probe children must not inherit the key"
@@ -406,6 +463,9 @@ async def test_verifier_requires_authentication(
         assert caps.json()["registry_present"] is True
         health_response = await client.get("/health")
         assert health_response.status_code == 200
+        assert set(health_response.json()) == {"status", "protocol_version"}, (
+            "unauthenticated /health must not enumerate uid, tools or credential state"
+        )
     assert not list(tmp_path.glob("probe-*")), "rejected requests must not touch the workspace"
 
 
@@ -563,6 +623,8 @@ def _capabilities_json(**overrides: object) -> dict[str, object]:
             "cpu_quota": "200000 100000",
             "docker_socket_present": False,
             "credential_exposure": [],
+            "direct_egress": False,
+            "egress_proxy_configured": True,
         },
         "tools": {"git": True, "bash": True, "node": True},
         "tool_versions": {"git": "git version 2.x", "bash": "5", "node": "v24.16.0"},
@@ -572,6 +634,7 @@ def _capabilities_json(**overrides: object) -> dict[str, object]:
         "max_timeout_seconds": 3600,
         "cache_enabled": False,
         "in_flight": 0,
+        "execution": "runner",
     }
     merged = {**base, **overrides}
     if "isolation_overrides" in overrides:
@@ -636,6 +699,15 @@ def _remote_spec(sha: str = "a" * 40, script: str = "exit 1\n") -> ProbeRunSpec:
         (_capabilities_json(isolation_overrides={"pids_limit": None}), "pids limit"),
         (_capabilities_json(isolation_overrides={"memory_limit_bytes": None}), "memory limit"),
         (_capabilities_json(repository_allowlist=["acme/other"]), "not in the verifier allowlist"),
+        # A verifier that runs probes next to its HMAC key (or predates the split and does
+        # not say) is refused in live mode: the probe could read the key.
+        (_capabilities_json(execution="in-process"), "HMAC key would be readable"),
+        (
+            {k: v for k, v in _capabilities_json().items() if k != "execution"},
+            "HMAC key would be readable",
+        ),
+        (_capabilities_json(isolation_overrides={"direct_egress": True}), "direct internet egress"),
+        (_capabilities_json(isolation_overrides={"direct_egress": None}), "egress restriction"),
     ],
 )
 async def test_remote_runner_refuses_untrustworthy_verifier(
@@ -841,7 +913,38 @@ def test_verifier_entrypoint_pins_the_stdlib_event_loop(monkeypatch: pytest.Monk
 
     monkeypatch.setenv("VERIFIER_HMAC_KEY", SECRET)
     monkeypatch.setenv("VERIFIER_REPOSITORY_ALLOWLIST", "acme/demo")
+    monkeypatch.setenv("VERIFIER_RUNNER_URL", "http://verifier-runner:8081")
     calls: list[dict[str, object]] = []
     monkeypatch.setattr(uvicorn, "run", lambda app, **kw: calls.append(kw))
     entrypoint.main()
     assert calls and calls[0]["loop"] == "asyncio"
+    monkeypatch.delenv("VERIFIER_RUNNER_URL")
+    monkeypatch.setenv("VERIFIER_EGRESS_CHECK", "off")
+    executor.main()
+    assert len(calls) == 2 and calls[1]["loop"] == "asyncio"
+
+
+@pytest.mark.asyncio
+async def test_reserved_smoke_probe_never_loads_for_remediation(tmp_path: Path) -> None:
+    _, sha = _git_repo(tmp_path)
+    write_probe(
+        tmp_path / REGISTRY,
+        repository="acme/demo",
+        issue_number=SMOKE_ISSUE_NUMBER,
+        base_sha=sha,
+        script="exit 0",
+        expected_base_exit_code=0,
+        expected_head_exit_code=1,
+        tools=("bash",),
+    )
+    # The worker's remediation path (default arguments) refuses issue 0 and negatives ...
+    for issue in (SMOKE_ISSUE_NUMBER, -1):
+        with pytest.raises(ProbeRegistryError, match="reserved"):
+            await load_approved_probe(tmp_path / REGISTRY, "acme/demo", issue)
+    with pytest.raises(ProbeRegistryError, match="reserved"):
+        await load_approved_probe(tmp_path / REGISTRY, "acme/demo", -1, allow_smoke=True)
+    # ... while readiness/verifier opt in explicitly.
+    probe = await load_approved_probe(
+        tmp_path / REGISTRY, "acme/demo", SMOKE_ISSUE_NUMBER, allow_smoke=True
+    )
+    assert probe.issue_number == 0

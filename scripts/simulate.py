@@ -910,10 +910,12 @@ class Simulator:
         mode = _environment("METRICS_MODE", "simulated")
         numbers = list(range(PHASE5_FIRST_ISSUE, PHASE5_FIRST_ISSUE + 20))
         repository = "apache/superset"
+        fresh = 0
         for number in numbers:
             if self.case(repository, number) is None:
                 response = self.github_post(self.phase4_payload(number))
                 self.check(response.json().get("accepted") is True, f"issue #{number} accepted")
+                fresh += 1
         peak = 0
         waited_peak = 0
         deadline = time.monotonic() + 600
@@ -936,8 +938,15 @@ class Simulator:
         self.check(len(settled) == len(numbers), "all twenty cases left the triage queue")
         self.check(peak <= limit, f"active triage jobs never exceeded the limit ({peak}<={limit})")
         loops = int(_environment("WORKER_CONCURRENCY", "2"))
-        if loops > limit:
+        contended = loops > limit and fresh > limit
+        if contended:
             self.check(waited_peak > 0, "the surplus cases were parked waiting for capacity")
+        elif fresh <= limit:
+            print(
+                f"  note: only {fresh} of the twenty issues were new (the rest settled in an "
+                "earlier run against this database); the limit was never contended, so parking "
+                "cannot be observed here (reset the database to re-exercise it)"
+            )
         else:
             print(
                 f"  note: WORKER_CONCURRENCY={loops} <= MAX_CONCURRENT_TRIAGE={limit}; the limit "
@@ -952,7 +961,7 @@ class Simulator:
             self.check(len(triage) <= 1, f"issue #{number} created at most one triage session")
         denied = self.metric("capacity_denied_total", worker=True, mode=mode, kind="triage") or 0
         print(f"  triage sessions={sessions} capacity_denied_total={denied:.0f}")
-        if loops > limit:
+        if contended:
             self.check(denied > 0, "worker /metrics counted the capacity denials")
 
     def run_phase5(self, scenario: str) -> None:

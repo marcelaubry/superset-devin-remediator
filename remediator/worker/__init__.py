@@ -182,7 +182,7 @@ class Worker:
                         (Case.lease_expires_at.is_(None) | (Case.lease_expires_at < now)),
                         ~active_event,
                     )
-                    .order_by(Case.state_entered_at)
+                    .order_by(Case.waiting_since.asc().nulls_last(), Case.state_entered_at)
                     .with_for_update(skip_locked=True)
                     .limit(1)
                 )

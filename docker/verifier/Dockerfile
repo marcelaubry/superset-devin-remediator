@@ -52,7 +52,10 @@ RUN uv sync --frozen --no-dev
 COPY remediator remediator
 # UID/GID 65534 (nobody) owns nothing else on the host; RLIMIT_NPROC and the /proc marker
 # sweep in remediator.probes.runner rely on the probe UID running nothing but probes.
-RUN chown -R root:root /app /opt/node && chmod -R a-w /app /opt/node
+# The same image also serves the key-holding front (UID 65533) and the egress proxy
+# (UID 65532) with different entrypoints; only the runner gets /workspace.
+RUN chown -R root:root /app /opt/node && chmod -R a-w /app /opt/node \
+ && mkdir /workspace && chown 65534:65534 /workspace && chmod 700 /workspace
 USER 65534:65534
 ENV VERIFIER_WORKSPACE_ROOT=/tmp \
     VERIFIER_PROBE_ROOT=/probes \

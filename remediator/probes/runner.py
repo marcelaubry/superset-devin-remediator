@@ -90,15 +90,21 @@ CREDENTIAL_ENV_NAMES = frozenset(
 CREDENTIAL_ENV_SUFFIXES = ("_TOKEN", "_SECRET", "_API_KEY", "_PASSWORD", "_PRIVATE_KEY")
 # Files whose presence means the process runs inside a credential-bearing deployment.
 CREDENTIAL_PATHS = ("/run/secrets", "/var/run/docker.sock", ".env")
-# The verifier's own request-authentication key is the one Compose secret it may hold; any
-# other entry under /run/secrets is a provider or database credential and fails the boundary.
+# The verifier *front*'s request-authentication key is the one Compose secret it may hold;
+# any other entry under /run/secrets is a provider or database credential and fails the
+# boundary. The process that executes probes may hold no secret at all (`allow_own_secret`
+# False): repository code runs under its UID and can read whatever it can read.
 VERIFIER_OWN_SECRET_FILES = frozenset({"verifier_hmac_key"})
 
 
 def credential_exposure(
-    environ: dict[str, str] | None = None, paths: tuple[str, ...] = CREDENTIAL_PATHS
+    environ: dict[str, str] | None = None,
+    paths: tuple[str, ...] = CREDENTIAL_PATHS,
+    *,
+    allow_own_secret: bool = False,
 ) -> list[str]:
     """Names of credentials visible to this process; empty means the boundary holds."""
+    own = VERIFIER_OWN_SECRET_FILES if allow_own_secret else frozenset()
     env = os.environ if environ is None else environ
     found = sorted(
         name
@@ -116,9 +122,7 @@ def credential_exposure(
             except OSError:
                 found.append(path)
                 continue
-            found.extend(
-                f"{path}/{name}" for name in entries if name not in VERIFIER_OWN_SECRET_FILES
-            )
+            found.extend(f"{path}/{name}" for name in entries if name not in own)
         else:
             found.append(path)
     return found
@@ -291,6 +295,29 @@ class _BoundedCapture:
         return self.buffer.decode("utf-8", errors="replace")
 
 
+class _TailCapture:
+    """Drains a pipe fully while keeping only the last N bytes: package managers print
+    the actual error after pages of warnings."""
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self.buffer = bytearray()
+
+    async def drain(self, stream: asyncio.StreamReader | None) -> None:
+        if stream is None:
+            return
+        while True:
+            chunk = await stream.read(65536)
+            if not chunk:
+                return
+            self.buffer += chunk
+            if len(self.buffer) > self.limit:
+                del self.buffer[: len(self.buffer) - self.limit]
+
+    def text(self) -> str:
+        return self.buffer.decode("utf-8", errors="replace")
+
+
 class LocalProbeRunner:
     mode = "local"
 
@@ -303,6 +330,7 @@ class LocalProbeRunner:
         limits: ProbeResourceLimits | None = None,
         proc_root: Path = Path("/proc"),
         cache_root: Path | None = None,
+        extra_env: dict[str, str] | None = None,
     ) -> None:
         if "{repository}" not in clone_url_format:
             raise ValueError("clone_url_format must contain {repository}")
@@ -312,6 +340,8 @@ class LocalProbeRunner:
         self.limits = limits or ProbeResourceLimits()
         self.proc_root = proc_root
         self.cache_root = cache_root
+        # Routing variables (egress proxy) added to every child; never a secret.
+        self.extra_env = dict(extra_env or {})
         self.credential_check = credential_exposure
 
     def clone_url(self, repository: str) -> str:
@@ -353,7 +383,9 @@ class LocalProbeRunner:
             home_dir = workspace / "home"
             repo_dir.mkdir()
             home_dir.mkdir()
-            env = _minimal_env(home_dir)
+            env = {**_minimal_env(home_dir), **self.extra_env}
+            marker = uuid.uuid4().hex
+            env[PROBE_RUN_MARKER] = marker
             versions = await tool_versions(env, ("git", "bash", *spec.required_tools))
             fetch_error = await self._fetch_exact_commit(repo_dir, spec, env)
             if fetch_error is not None:
@@ -364,29 +396,25 @@ class LocalProbeRunner:
             script_path = workspace / "probe.sh"
             script_path.write_text(spec.script_content, encoding="utf-8")
             script_path.chmod(0o500)
-            marker = uuid.uuid4().hex
             env.update(
                 {
                     "PROBE_TARGET": spec.target.value,
                     "PROBE_COMMIT": spec.commit_sha,
                     "PROBE_REPOSITORY": spec.repository,
                     "PROBE_IDENTIFIER": spec.probe_identifier,
-                    PROBE_RUN_MARKER: marker,
                 }
             )
             env.update(self._cache_env(repo_dir, spec, versions))
-            try:
-                setup_error = await self._run_setup(repo_dir, spec, env)
-                if setup_error is not None:
-                    return self._infra(identity, started, setup_error, STAGE_SETUP, versions)
-                return await self._execute(
-                    identity, started, script_path, repo_dir, spec, env, versions
-                )
-            finally:
-                # Nothing spawned by this run may survive it or keep writing into the
-                # workspace we are about to remove.
-                kill_marked_processes(marker, self.proc_root)
+            setup_error = await self._run_setup(repo_dir, spec, env)
+            if setup_error is not None:
+                return self._infra(identity, started, setup_error, STAGE_SETUP, versions)
+            return await self._execute(
+                identity, started, script_path, repo_dir, spec, env, versions
+            )
         finally:
+            # Nothing spawned by this run (fetch, setup or the probe) may survive it or keep
+            # writing into the workspace we are about to remove.
+            kill_marked_processes(marker, self.proc_root)
             shutil.rmtree(workspace, ignore_errors=True)
 
     async def _verify_identity(
@@ -455,7 +483,7 @@ class LocalProbeRunner:
                 )
             except OSError as exc:
                 return f"cannot start setup step {argv[0]}: {exc}"
-            err = _BoundedCapture(_SETUP_STDERR_BYTES)
+            err = _TailCapture(_SETUP_STDERR_BYTES)
             work = asyncio.gather(err.drain(proc.stderr), proc.wait())
             try:
                 await asyncio.wait_for(asyncio.shield(work), timeout=remaining)
@@ -466,7 +494,7 @@ class LocalProbeRunner:
                 work.cancel()
                 return f"setup step {' '.join(argv[:2])} timed out"
             if proc.returncode != 0:
-                detail = err.text().strip()[:500]
+                detail = err.text().strip()[-500:]
                 return f"setup step {' '.join(argv[:2])} exited {proc.returncode}: {detail}"
         return None
 
@@ -489,17 +517,24 @@ class LocalProbeRunner:
                     stdin=asyncio.subprocess.DEVNULL,
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.PIPE,
+                    start_new_session=True,
                 )
-                _, stderr = await asyncio.wait_for(
-                    proc.communicate(), timeout=self.fetch_timeout_seconds
-                )
-            except TimeoutError:
-                proc.kill()
-                return f"timed out running {' '.join(argv[:2])} for {spec.commit_sha}"
             except OSError as exc:
                 return f"cannot run {' '.join(argv[:2])}: {exc}"
+            err = _TailCapture(_SETUP_STDERR_BYTES)
+            work = asyncio.gather(err.drain(proc.stderr), proc.wait())
+            try:
+                await asyncio.wait_for(asyncio.shield(work), timeout=self.fetch_timeout_seconds)
+            except TimeoutError:
+                # `git fetch` forks git-remote-https; kill the whole session and any marked
+                # descendant, not just the front process.
+                _kill_group(proc)
+                kill_marked_processes(env[PROBE_RUN_MARKER], self.proc_root)
+                await proc.wait()
+                work.cancel()
+                return f"timed out running {' '.join(argv[:2])} for {spec.commit_sha}"
             if proc.returncode != 0:
-                detail = stderr.decode("utf-8", errors="replace").strip()[:500]
+                detail = err.text().strip()[-500:]
                 return f"{' '.join(argv[:2])} failed for {spec.commit_sha}: {detail}"
         return None
 

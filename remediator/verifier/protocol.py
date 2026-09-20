@@ -10,7 +10,10 @@ in the service, and the service can import it without any settings/`.env` machin
 * every request is authenticated (HMAC over timestamp + body with a verifier-only key) and
   carries a `request_id` the verifier uses for idempotent replay;
 * responses carry the repository/SHA/probe identity they were computed for, the stage of an
-  infrastructure failure and the tool versions that were used.
+  infrastructure failure and the tool versions that were used;
+* capabilities state *where* probes execute (`execution`): `runner` means a separate
+  credential-free process/container that never holds the HMAC key; `in-process` means the
+  key-holding verifier runs them itself (tests and single-container development only).
 """
 
 import hashlib
@@ -25,6 +28,9 @@ from ..probes.runner import ProbeRunResult
 
 VERIFIER_PROTOCOL_VERSION = "verifier.v2"
 KNOWN_TOOLS = ("git", "bash", "python3", "node", "npm", "yarn")
+
+EXECUTION_RUNNER = "runner"
+EXECUTION_IN_PROCESS = "in-process"
 
 SIGNATURE_HEADER = "X-Verifier-Signature"
 TIMESTAMP_HEADER = "X-Verifier-Timestamp"
@@ -67,7 +73,8 @@ class ProbeRequest(BaseModel):
     protocol_version: str = VERIFIER_PROTOCOL_VERSION
     request_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     repository: str = Field(pattern=r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
-    issue_number: int = Field(ge=1)
+    # 0 is the reserved smoke-probe slot (never a case); GitHub issues start at 1.
+    issue_number: int = Field(ge=0)
     commit_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
     target: ProbeTarget
     probe_identifier: str = Field(min_length=1, max_length=255)
@@ -126,6 +133,10 @@ class Isolation(BaseModel):
     cpu_quota: str | None
     docker_socket_present: bool
     credential_exposure: list[str]
+    # Result of a bounded TCP spot check towards the public internet made *without* the
+    # egress proxy: True means repository code could exfiltrate directly; None = not tested.
+    direct_egress: bool | None = None
+    egress_proxy_configured: bool = False
 
     @property
     def credential_free(self) -> bool:
@@ -148,6 +159,10 @@ class Isolation(BaseModel):
             problems.append("no pids limit visible in the cgroup")
         if self.memory_limit_bytes is None:
             problems.append("no memory limit visible in the cgroup")
+        if self.direct_egress is True:
+            problems.append("direct internet egress is possible from the probe executor")
+        elif self.direct_egress is None:
+            problems.append("egress restriction was not verified")
         return problems
 
 
@@ -163,8 +178,25 @@ class Health(BaseModel):
         return not self.credential_exposure and not self.root_writable and self.uid != 0
 
 
+class RunnerHealth(BaseModel):
+    """Self-report of the process that actually executes probes (`remediator.verifier.runner`).
+    It must hold no secret at all - not even the verifier HMAC key."""
+
+    protocol_version: str = VERIFIER_PROTOCOL_VERSION
+    isolation: Isolation
+    tools: dict[str, bool]
+    tool_versions: dict[str, str]
+    repository_allowlist: list[str]
+    registry_present: bool
+    cache_enabled: bool
+    workspace_writable: bool
+    in_flight: int
+
+
 class Capabilities(BaseModel):
     protocol_version: str = VERIFIER_PROTOCOL_VERSION
+    # `isolation`, `tools` and `tool_versions` describe the process that executes probes:
+    # the runner when `execution == "runner"`, this process when `"in-process"`.
     isolation: Isolation
     tools: dict[str, bool]
     tool_versions: dict[str, str]
@@ -174,3 +206,9 @@ class Capabilities(BaseModel):
     max_timeout_seconds: int
     cache_enabled: bool
     in_flight: int
+    # Absent in older verifiers; the unsafe value is the default so a worker fails closed.
+    execution: str = EXECUTION_IN_PROCESS
+
+    @property
+    def key_isolated_from_probes(self) -> bool:
+        return self.execution == EXECUTION_RUNNER

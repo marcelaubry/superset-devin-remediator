@@ -85,7 +85,11 @@ limit (`TRIAGE (2/2)`, `REMEDIATION:owner/repo (1/1)`, `PROBE (1/1)`,
 - waiting spends zero ACUs (fake Devin create count unchanged);
 - cancel keeps the lease until termination is confirmed;
 - conflicting resource keys serialize while distinct keys run together;
-- the per-repository limit applies independently of the global one.
+- the per-repository limit applies independently of the global one;
+- waiting cases are admitted FIFO: a freed global slot is refused to a newer
+  case while an older live waiter for the same limit exists
+  (`CapacityDenied.queued_behind`), and the worker claims waiting cases by
+  `waiting_since` ascending.
 
 `scripts/simulate.py --scenario concurrency-20` repeats the twenty-case
 queueing against the running compose stack and reads `capacity_limit`,

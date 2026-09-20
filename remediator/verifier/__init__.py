@@ -1,15 +1,23 @@
-"""Credential-free probe verifier service (protocol `verifier.v2`).
+"""Probe verifier front (protocol `verifier.v2`): authentication, binding, idempotency.
 
-This process is the *only* place the local probe runner executes. It is deployed as its own
-container (docker/verifier/Dockerfile, the `verifier` service in docker-compose.yml) that:
+Two processes make up the verifier (docker-compose.yml, docker/verifier/Dockerfile):
 
-* receives no `env_file` and no application secret - it does not even import
-  `remediator.config`, so no `.env` can be loaded by accident. Its only secret is the
-  verifier HMAC key, which authorises nothing but probe requests against this allowlist;
-* runs as a dedicated non-root UID on a read-only root filesystem with `/tmp` on a bounded
-  tmpfs, `cap_drop: ALL`, `no-new-privileges`, PID/memory/CPU limits;
-* refuses to run a probe when `credential_exposure()` sees anything at all, and reports its
-  observable confinement on `GET /capabilities` so the worker can refuse to trust it.
+* this **front** (`verifier` service) holds the one secret of the boundary - the request
+  HMAC key - and executes *no* repository code. It authenticates the worker's requests,
+  binds them to its own read-only probe registry, owns idempotency and hands the bound
+  request to the executor;
+* the **executor** (`verifier-runner` service, `remediator.verifier.executor`) runs the
+  probe. It holds no secret at all, not even the HMAC key, because repository code executed
+  there runs under its UID and can read whatever that process can read. Its only network
+  paths are this front and the egress proxy.
+
+Neither process receives an `env_file` or application secret and neither imports
+`remediator.config`, so no `.env` can be loaded by accident.
+
+`VERIFIER_EXECUTION=in-process` makes the front run probes itself (tests and single-container
+development). Capabilities then report `execution: in-process` and a worker with
+`PROBE_VERIFIER_REQUIRE_ISOLATION=true` (live mode) refuses it: with the key and the probe in
+one process the key is readable by the probe.
 
 Trust model of a request
 ------------------------
@@ -27,9 +35,9 @@ the in-flight run. Results are kept for a bounded time and count.
 
 Concurrency
 -----------
-At most `VERIFIER_MAX_CONCURRENT` probes run at once (default 1); extra requests get `409`
-which the worker treats as transient. After every run the stray-process sweep kills every
-remaining process of the probe UID, so an escapee cannot tamper with the next workspace.
+One probe runs at a time (`VERIFIER_MAX_CONCURRENT` must be 1: the executor's post-run
+sweep kills every process of the probe UID); extra requests get `409`, which the worker
+treats as transient.
 """
 
 import asyncio
@@ -39,26 +47,25 @@ import time
 from collections import OrderedDict
 from pathlib import Path
 
+import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from ..probes.registry import (
-    ProbeRegistryError,
-    load_approved_probe,
-    manifest_cache_inputs,
-    manifest_setup_steps,
-    manifest_setup_timeout,
-)
 from ..probes.runner import (
+    STAGE_PREFLIGHT,
     LocalProbeRunner,
-    ProbeResourceLimits,
+    ProbeRunResult,
     ProbeRunSpec,
     _which,
+    command_identity,
     credential_exposure,
     kill_stray_processes,
     tool_versions,
 )
+from .executor import ExecutorConfig, isolation, parse_probe_request, spec_for
 from .protocol import (
+    EXECUTION_IN_PROCESS,
+    EXECUTION_RUNNER,
     KNOWN_TOOLS,
     MAX_REQUEST_BODY_BYTES,
     SIGNATURE_HEADER,
@@ -66,9 +73,9 @@ from .protocol import (
     VERIFIER_PROTOCOL_VERSION,
     Capabilities,
     Health,
-    Isolation,
     ProbeRequest,
     ProbeResponse,
+    RunnerHealth,
     verify_signature,
 )
 
@@ -78,7 +85,8 @@ HMAC_KEY_ENV = "VERIFIER_HMAC_KEY"
 HMAC_KEY_FILE_ENV = "VERIFIER_HMAC_KEY_FILE"
 _RESULT_TTL_SECONDS = 6 * 3600
 _RESULT_MAX_ENTRIES = 512
-_CGROUP_ROOT = Path("/sys/fs/cgroup")
+_RUNNER_HEALTH_TIMEOUT_SECONDS = 15.0
+_RUNNER_REQUEST_OVERHEAD_SECONDS = 60.0
 
 
 def _read_hmac_key(env: dict[str, str]) -> str:
@@ -108,91 +116,37 @@ class VerifierConfig:
 
     def __init__(self, environ: dict[str, str] | None = None) -> None:
         env = dict(os.environ if environ is None else environ)
-        self.clone_url_format = env.get(
-            "VERIFIER_CLONE_URL_FORMAT", "https://github.com/{repository}.git"
-        )
-        self.workspace_root = Path(env.get("VERIFIER_WORKSPACE_ROOT", "/tmp"))
-        self.probe_root = Path(env.get("VERIFIER_PROBE_ROOT", "/probes"))
-        cache = env.get("VERIFIER_CACHE_ROOT", "")
-        self.cache_root = Path(cache) if cache else None
-        self.max_timeout_seconds = int(env.get("VERIFIER_MAX_TIMEOUT_SECONDS", "3600"))
-        self.max_concurrent = int(env.get("VERIFIER_MAX_CONCURRENT", "1"))
-        allow = env.get("VERIFIER_REPOSITORY_ALLOWLIST", "")
-        self.repository_allowlist = tuple(
-            sorted({item.strip() for item in allow.split(",") if item.strip()})
-        )
-        self.limits = ProbeResourceLimits(
-            max_processes=_int_or_none(env.get("VERIFIER_MAX_PROCESSES", "256")),
-            max_file_size_bytes=_int_or_none(
-                env.get("VERIFIER_MAX_FILE_SIZE_BYTES", str(512 * 1024 * 1024))
-            ),
-            max_memory_bytes=_int_or_none(env.get("VERIFIER_MAX_MEMORY_BYTES", "")),
-        )
+        self.execution = env.get("VERIFIER_EXECUTION", EXECUTION_RUNNER).strip().lower()
+        self.runner_url = env.get("VERIFIER_RUNNER_URL", "").strip().rstrip("/")
         self.hmac_key = _read_hmac_key(env)
-        if not self.clone_url_format.startswith("https://"):
-            raise ValueError("VERIFIER_CLONE_URL_FORMAT must be an https:// URL")
-        if self.max_timeout_seconds <= 0:
-            raise ValueError("VERIFIER_MAX_TIMEOUT_SECONDS must be positive")
-        if self.max_concurrent <= 0:
-            raise ValueError("VERIFIER_MAX_CONCURRENT must be positive")
-        if not self.repository_allowlist:
-            raise ValueError("VERIFIER_REPOSITORY_ALLOWLIST must name at least one owner/repo")
-        for repo in self.repository_allowlist:
-            owner, _, name = repo.partition("/")
-            if not owner or not name or "/" in name:
-                raise ValueError(f"VERIFIER_REPOSITORY_ALLOWLIST entry {repo!r} is not owner/repo")
+        # Registry binding, allowlist and timeouts are enforced here *and* in the executor.
+        self.executor = ExecutorConfig(env)
+        self.probe_root = self.executor.probe_root
+        self.repository_allowlist = self.executor.repository_allowlist
+        self.max_timeout_seconds = self.executor.max_timeout_seconds
+        self.max_concurrent = self.executor.max_concurrent
+        if self.execution not in (EXECUTION_RUNNER, EXECUTION_IN_PROCESS):
+            raise ValueError(
+                f"VERIFIER_EXECUTION must be {EXECUTION_RUNNER!r} or {EXECUTION_IN_PROCESS!r}"
+            )
+        if self.execution == EXECUTION_RUNNER and not self.runner_url.startswith("http://"):
+            raise ValueError(
+                "VERIFIER_RUNNER_URL (http://verifier-runner:8081) is required unless "
+                "VERIFIER_EXECUTION=in-process is set explicitly"
+            )
+
+    @property
+    def clone_url_format(self) -> str:
+        return self.executor.clone_url_format
+
+    @clone_url_format.setter
+    def clone_url_format(self, value: str) -> None:
+        self.executor.clone_url_format = value
 
 
-def _int_or_none(raw: str | None) -> int | None:
-    return int(raw) if raw else None
-
-
-def _read_text(path: Path) -> str | None:
-    try:
-        return path.read_text().strip()
-    except OSError:
-        return None
-
-
-def _cgroup_int(name: str) -> int | None:
-    raw = _read_text(_CGROUP_ROOT / name)
-    if raw is None or raw == "max":
-        return None
-    try:
-        return int(raw.split()[0])
-    except ValueError:
-        return None
-
-
-def _proc_status_field(field: str) -> str | None:
-    status = _read_text(Path("/proc/self/status"))
-    if status is None:
-        return None
-    for line in status.splitlines():
-        if line.startswith(field + ":"):
-            return line.split(":", 1)[1].strip()
-    return None
-
-
-def isolation() -> Isolation:
-    nnp = _proc_status_field("NoNewPrivs")
-    cpu = _read_text(_CGROUP_ROOT / "cpu.max")
-    return Isolation(
-        uid=os.getuid(),
-        root_writable=os.access("/", os.W_OK),
-        no_new_privs=None if nnp is None else nnp == "1",
-        effective_capabilities=_proc_status_field("CapEff"),
-        pids_limit=_cgroup_int("pids.max"),
-        memory_limit_bytes=_cgroup_int("memory.max"),
-        cpu_quota=None if cpu in (None, "max 100000") else cpu,
-        docker_socket_present=Path("/var/run/docker.sock").exists(),
-        credential_exposure=credential_exposure(),
-    )
-
-
-def health() -> Health:
+def health(*, allow_own_secret: bool = True) -> Health:
     return Health(
-        credential_exposure=credential_exposure(),
+        credential_exposure=credential_exposure(allow_own_secret=allow_own_secret),
         uid=os.getuid(),
         root_writable=os.access("/", os.W_OK),
         tools={tool: _which(tool) is not None for tool in KNOWN_TOOLS},
@@ -257,6 +211,147 @@ class _ResultStore:
             fut.set_exception(exc)
 
 
+class ExecutorBusy(Exception):
+    """The executor's single slot is taken; surfaced to the worker as 409."""
+
+
+class _InProcessExecution:
+    """Front and executor in one process (tests, development). Reports itself as such."""
+
+    execution = EXECUTION_IN_PROCESS
+
+    def __init__(self, cfg: ExecutorConfig) -> None:
+        self.cfg = cfg
+        self.runner: LocalProbeRunner = cfg.build_runner()
+        self._slot = asyncio.Semaphore(1)
+        self.in_flight = 0
+
+    async def describe(self) -> RunnerHealth:
+        return RunnerHealth(
+            isolation=isolation(
+                egress_proxy_configured=bool(self.cfg.egress_proxy_url), allow_own_secret=True
+            ),
+            tools={tool: _which(tool) is not None for tool in KNOWN_TOOLS},
+            tool_versions=await tool_versions(),
+            repository_allowlist=list(self.cfg.repository_allowlist),
+            registry_present=self.cfg.probe_root.is_dir(),
+            cache_enabled=self.cfg.cache_root is not None,
+            workspace_writable=os.access(self.cfg.workspace_root, os.W_OK),
+            in_flight=self.in_flight,
+        )
+
+    async def run(self, request: ProbeRequest, spec: ProbeRunSpec) -> ProbeResponse:
+        if self._slot.locked():
+            raise ExecutorBusy
+        async with self._slot:
+            self.in_flight += 1
+            try:
+                result = await self.runner.run(spec)
+            finally:
+                self.in_flight -= 1
+                await asyncio.to_thread(kill_stray_processes)
+        return ProbeResponse.from_result(request, result)
+
+
+class _RemoteExecution:
+    """Forwards bound requests to the credential-free executor over the internal network."""
+
+    execution = EXECUTION_RUNNER
+
+    def __init__(self, runner_url: str, client: httpx.AsyncClient | None = None) -> None:
+        self.runner_url = runner_url
+        self._client = client or httpx.AsyncClient(base_url=runner_url)
+
+    async def describe(self) -> RunnerHealth:
+        try:
+            response = await self._client.get(
+                f"{self.runner_url}/health", timeout=_RUNNER_HEALTH_TIMEOUT_SECONDS
+            )
+        except httpx.HTTPError as exc:
+            raise HTTPException(
+                status_code=503, detail=f"probe executor unreachable: {exc.__class__.__name__}"
+            ) from exc
+        if response.status_code != 200:
+            raise HTTPException(status_code=503, detail="probe executor is not healthy")
+        try:
+            return RunnerHealth.model_validate(response.json())
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=503, detail="probe executor health is malformed"
+            ) from exc
+
+    async def run(self, request: ProbeRequest, spec: ProbeRunSpec) -> ProbeResponse:
+        identity = command_identity(spec)
+        started = time.monotonic()
+        body = request.model_dump_json().encode()
+        try:
+            response = await self._client.post(
+                f"{self.runner_url}/run",
+                content=body,
+                headers={"Content-Type": "application/json"},
+                timeout=spec.timeout_seconds
+                + spec.setup_timeout_seconds
+                + _RUNNER_REQUEST_OVERHEAD_SECONDS,
+            )
+        except httpx.HTTPError as exc:
+            return self._infra(
+                request, identity, started, f"probe executor unreachable: {exc.__class__.__name__}"
+            )
+        if response.status_code == 409 and _detail(response) == "verifier is at capacity":
+            raise ExecutorBusy
+        if response.status_code != 200:
+            return self._infra(
+                request,
+                identity,
+                started,
+                f"probe executor returned HTTP {response.status_code}: {_detail(response)}",
+            )
+        try:
+            result = ProbeResponse.model_validate(response.json())
+        except ValueError as exc:
+            return self._infra(
+                request, identity, started, f"executor response malformed: {exc.__class__.__name__}"
+            )
+        if (
+            result.request_id != request.request_id
+            or result.command_identity != identity
+            or result.repository != request.repository
+            or result.commit_sha != request.commit_sha
+            or result.script_hash != request.script_hash
+        ):
+            return self._infra(
+                request, identity, started, "executor reported a different execution than asked"
+            )
+        return result.model_copy(update={"replayed": False})
+
+    @staticmethod
+    def _infra(request: ProbeRequest, identity: str, started: float, reason: str) -> ProbeResponse:
+        return ProbeResponse.from_result(
+            request,
+            ProbeRunResult(
+                runner_mode="local",
+                command_identity=identity,
+                exit_code=None,
+                stdout="",
+                stderr="",
+                output_truncated=False,
+                timed_out=False,
+                duration_ms=int((time.monotonic() - started) * 1000),
+                infrastructure_error=reason,
+                failure_stage=STAGE_PREFLIGHT,
+            ),
+        )
+
+
+def _detail(response: httpx.Response) -> str:
+    try:
+        payload = response.json()
+    except ValueError:
+        return ""
+    detail = payload.get("detail") if isinstance(payload, dict) else None
+    return str(detail)[:200] if isinstance(detail, str) else ""
+
+
 async def _authenticate(request: Request, key: str) -> bytes:
     body = await request.body()
     if len(body) > MAX_REQUEST_BODY_BYTES:
@@ -269,90 +364,52 @@ async def _authenticate(request: Request, key: str) -> bytes:
     return body
 
 
-def create_app(config: VerifierConfig | None = None) -> FastAPI:
+def create_app(
+    config: VerifierConfig | None = None, *, executor_client: httpx.AsyncClient | None = None
+) -> FastAPI:
     cfg = config or VerifierConfig()
-    runner = LocalProbeRunner(
-        cfg.clone_url_format,
-        workspace_root=cfg.workspace_root,
-        limits=cfg.limits,
-        cache_root=cfg.cache_root,
-    )
+    execution: _InProcessExecution | _RemoteExecution
+    if cfg.execution == EXECUTION_RUNNER:
+        execution = _RemoteExecution(cfg.runner_url, executor_client)
+    else:
+        execution = _InProcessExecution(cfg.executor)
     app = FastAPI(title="remediator probe verifier", docs_url=None, redoc_url=None)
-    slots = asyncio.Semaphore(cfg.max_concurrent)
     store = _ResultStore()
-    in_flight = {"count": 0}
 
     @app.exception_handler(HTTPException)
     async def _http_error(_: Request, exc: HTTPException) -> JSONResponse:
         # Never echo request content back; the detail strings above are constants.
         return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
-    @app.get("/health", response_model=Health)
-    async def get_health() -> Health:
-        return health()
+    @app.get("/health")
+    async def get_health() -> dict[str, str]:
+        # Unauthenticated liveness for Compose only: no uid, toolchain, credential or
+        # boundary detail leaves the process unsigned. /capabilities (signed) has it all.
+        return {"status": "ok", "protocol_version": VERIFIER_PROTOCOL_VERSION}
 
     @app.get("/capabilities", response_model=Capabilities)
     async def get_capabilities(request: Request) -> Capabilities:
         await _authenticate(request, cfg.hmac_key)
+        runner = await execution.describe()
         return Capabilities(
-            isolation=isolation(),
-            tools={tool: _which(tool) is not None for tool in KNOWN_TOOLS},
-            tool_versions=await tool_versions(),
-            repository_allowlist=list(cfg.repository_allowlist),
-            registry_present=cfg.probe_root.is_dir(),
+            isolation=runner.isolation,
+            tools=runner.tools,
+            tool_versions=runner.tool_versions,
+            repository_allowlist=sorted(
+                set(cfg.repository_allowlist) & set(runner.repository_allowlist)
+            ),
+            registry_present=cfg.probe_root.is_dir() and runner.registry_present,
             max_concurrent=cfg.max_concurrent,
             max_timeout_seconds=cfg.max_timeout_seconds,
-            cache_enabled=cfg.cache_root is not None,
-            in_flight=in_flight["count"],
-        )
-
-    async def _spec_for(request: ProbeRequest) -> ProbeRunSpec:
-        if request.repository not in cfg.repository_allowlist:
-            raise HTTPException(status_code=403, detail="repository is not allowlisted")
-        try:
-            probe = await load_approved_probe(
-                cfg.probe_root, request.repository, request.issue_number
-            )
-        except ProbeRegistryError as exc:
-            logger.warning("registry refused %s: %s", request.probe_identifier, exc)
-            raise HTTPException(
-                status_code=422, detail="no approved probe in the verifier registry"
-            ) from exc
-        if probe.script_hash != request.script_hash or probe.manifest_hash != request.manifest_hash:
-            raise HTTPException(
-                status_code=409, detail="registry probe does not match the approved snapshot"
-            )
-        if probe.identifier != request.probe_identifier:
-            raise HTTPException(status_code=409, detail="probe identifier mismatch")
-        return ProbeRunSpec(
-            repository=probe.repository,
-            issue_number=probe.issue_number,
-            commit_sha=request.commit_sha,
-            target=request.target,
-            probe_identifier=probe.identifier,
-            script_hash=probe.script_hash,
-            script_content=probe.script_content,
-            timeout_seconds=min(
-                request.timeout_seconds, probe.timeout_seconds, cfg.max_timeout_seconds
-            ),
-            max_output_bytes=request.max_output_bytes,
-            required_tools=probe.required_tools,
-            setup_steps=manifest_setup_steps(probe.manifest),
-            setup_timeout_seconds=min(
-                manifest_setup_timeout(probe.manifest), cfg.max_timeout_seconds
-            ),
-            cache_inputs=manifest_cache_inputs(probe.manifest),
+            cache_enabled=runner.cache_enabled,
+            in_flight=runner.in_flight,
+            execution=execution.execution,
         )
 
     @app.post("/probe", response_model=ProbeResponse)
     async def run_probe(request: Request) -> ProbeResponse:
         body = await _authenticate(request, cfg.hmac_key)
-        try:
-            parsed = ProbeRequest.model_validate_json(body)
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail="malformed probe request") from exc
-        if parsed.protocol_version != VERIFIER_PROTOCOL_VERSION:
-            raise HTTPException(status_code=400, detail="unsupported protocol_version")
+        parsed = await parse_probe_request(body)
         if not store.bind(parsed.request_id, parsed.fingerprint()):
             raise HTTPException(
                 status_code=409, detail="request_id already used with different parameters"
@@ -363,22 +420,21 @@ def create_app(config: VerifierConfig | None = None) -> FastAPI:
         pending = store.inflight(parsed.request_id)
         if pending is not None:
             return (await asyncio.shield(pending)).model_copy(update={"replayed": True})
-        spec = await _spec_for(parsed)
-        if slots.locked():
-            raise HTTPException(status_code=409, detail="verifier is at capacity")
+        spec = await spec_for(
+            parsed,
+            probe_root=cfg.probe_root,
+            repository_allowlist=cfg.repository_allowlist,
+            max_timeout_seconds=cfg.max_timeout_seconds,
+        )
         store.start(parsed.request_id)
         try:
-            async with slots:
-                in_flight["count"] += 1
-                try:
-                    result = await runner.run(spec)
-                finally:
-                    in_flight["count"] -= 1
-                    await asyncio.to_thread(kill_stray_processes)
+            response = await execution.run(parsed, spec)
+        except ExecutorBusy as exc:
+            store.abort(parsed.request_id, exc)
+            raise HTTPException(status_code=409, detail="verifier is at capacity") from None
         except BaseException as exc:
             store.abort(parsed.request_id, exc)
             raise
-        response = ProbeResponse.from_result(parsed, result)
         store.finish(parsed.request_id, response)
         return response
 

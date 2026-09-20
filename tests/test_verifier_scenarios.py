@@ -25,6 +25,7 @@ from test_probe_runner import (
     _register,
     _request,
     _verifier_client,
+    _verifier_config,
 )
 
 from remediator.probes.registry import ProbeRegistryError, load_approved_probe, write_probe
@@ -235,21 +236,25 @@ async def test_resource_exhaustion_is_contained_and_the_verifier_keeps_serving(
     assert after["exit_code"] == 0 and after["infrastructure_error"] is None
 
 
-async def test_concurrency_limit_allows_exactly_n_parallel_jobs(
+async def test_concurrent_jobs_serialize_on_the_single_slot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """One probe at a time: the post-run UID-wide sweep would kill a concurrent run, so the
+    verifier refuses to be configured for more and answers 409 while the slot is taken."""
     base, _ = fixture_repo(tmp_path)
     probes = [
-        await _register(tmp_path, base, "sleep 1.5\nexit 1\n", issue_number=n) for n in (7, 8, 9)
+        await _register(tmp_path, base, "sleep 1.5\nexit 1\n", issue_number=n) for n in (7, 8)
     ]
-    async with _verifier_client(tmp_path, monkeypatch, VERIFIER_MAX_CONCURRENT="2") as client:
-        tasks = [asyncio.create_task(_post(client, _request(p, base))) for p in probes[:2]]
+    with pytest.raises(ValueError, match="VERIFIER_MAX_CONCURRENT must be 1"):
+        _verifier_config(tmp_path, VERIFIER_MAX_CONCURRENT="2")
+    async with _verifier_client(tmp_path, monkeypatch) as client:
+        first_task = asyncio.create_task(_post(client, _request(probes[0], base)))
         await asyncio.sleep(0.3)
-        third = await _post(client, _request(probes[2], base))
-        assert third.status_code == 409
-        first, second = await asyncio.gather(*tasks)
-        assert first.status_code == second.status_code == 200
-        again = await _post(client, _request(probes[2], base))
+        second = await _post(client, _request(probes[1], base))
+        assert second.status_code == 409
+        first = await first_task
+        assert first.status_code == 200
+        again = await _post(client, _request(probes[1], base))
         assert again.status_code == 200
 
 

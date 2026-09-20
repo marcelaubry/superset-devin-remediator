@@ -100,7 +100,9 @@ def main() -> int:
             yaml.safe_dump(manifest, sort_keys=False), encoding="utf-8"
         )
     try:
-        probe = asyncio.run(load_approved_probe(root, args.repository, args.issue_number))
+        probe = asyncio.run(
+            load_approved_probe(root, args.repository, args.issue_number, allow_smoke=True)
+        )
     except ProbeRegistryError as exc:
         print(f"INVALID: {exc}", file=sys.stderr)
         return 1

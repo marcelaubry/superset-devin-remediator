@@ -5,8 +5,9 @@ Before each probe it asks the verifier for its authenticated `GET /capabilities`
 refuses (as an *infrastructure* failure, never a verdict) when the verifier is unreachable,
 speaks another protocol, runs as root or on a writable root filesystem, can see any
 credential-shaped variable or secret path, or - when `require_isolation` is on, the default
-outside tests - cannot show that `no-new-privileges`, empty capabilities and PID/memory
-limits are actually enforced. Only then is the approved snapshot *named* to `POST /probe`:
+outside tests - executes probes in the process that holds the HMAC key, or cannot show that
+`no-new-privileges`, empty capabilities, PID/memory limits and egress restriction are
+actually enforced. Only then is the approved snapshot *named* to `POST /probe`:
 the request carries hashes and identities, never the script.
 
 Requests are signed with the verifier HMAC key (`PROBE_VERIFIER_SHARED_SECRET`), a secret
@@ -107,6 +108,11 @@ class RemoteProbeRunner:
         if not caps.registry_present:
             return "verifier has no probe registry mounted"
         if self.require_isolation:
+            if not caps.key_isolated_from_probes:
+                return (
+                    f"verifier executes probes {caps.execution}: the HMAC key would be readable "
+                    "by repository code; deploy the separate executor (VERIFIER_EXECUTION=runner)"
+                )
             problems = iso.unenforced()
             if problems:
                 return "verifier isolation not enforced: " + "; ".join(problems)

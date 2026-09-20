@@ -142,6 +142,10 @@ class Settings(BaseSettings):
     # Refuse a verifier that cannot show no-new-privileges, empty capabilities and cgroup
     # PID/memory limits. Only ever off for in-process tests; live mode forces it on.
     probe_verifier_require_isolation: bool = True
+    # Registry probe (`owner/name#issue`) that `readiness --verifier-smoke` executes against
+    # its BASE SHA to prove a real Node/Jest probe runs end to end. Issue 0 is reserved
+    # for smoke probes and is never a remediation case.
+    probe_smoke_probe: str = "apache/superset#0"
     max_concurrent_triage: int = 2
     max_concurrent_remediation: int = 1
     max_concurrent_probes: int = 1

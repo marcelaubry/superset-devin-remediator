@@ -23,6 +23,7 @@ from sqlalchemy import ColumnElement, CursorResult, and_, func, select, text, up
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from remediator.config import Settings
+from remediator.lifecycle import TERMINAL_STATES
 from remediator.models import (
     ACTIVE_ATTEMPT_STATUSES,
     Attempt,
@@ -73,11 +74,14 @@ class CapacityDenied:
     scope: str
     limit: int
     in_use: int
+    # Free slots exist but this many cases have waited longer for the same kind (FIFO).
+    queued_behind: int = 0
 
     @property
     def label(self) -> str:
         scope = f":{self.scope}" if self.scope else ""
-        return f"{self.kind.value}{scope} ({self.in_use}/{self.limit})"
+        base = f"{self.kind.value}{scope} ({self.in_use}/{self.limit})"
+        return f"{base} behind {self.queued_behind}" if self.queued_behind else base
 
 
 def _active_clause(now: datetime) -> ColumnElement[bool]:
@@ -140,6 +144,29 @@ class CapacityManager:
             stmt = stmt.where(CapacityLease.scope == scope)
         return int(await session.scalar(stmt) or 0)
 
+    async def older_waiting(
+        self, session: AsyncSession, kind: CapacityLeaseKind, case_id: uuid.UUID
+    ) -> int:
+        """Live cases parked on the global `kind` limit that started waiting before
+        `case_id` did (a case that is not yet waiting ranks behind every parked one).
+        Cases parked on a per-scope limit are not counted: they are not competing for a
+        global slot. Terminal cases are ignored so a case cancelled while parked can never
+        hold the queue."""
+        mine = await session.scalar(select(Case.waiting_since).where(Case.id == case_id))
+        stmt = (
+            select(func.count())
+            .select_from(Case)
+            .where(
+                Case.id != case_id,
+                Case.waiting_for.like(f"{kind.value} (%"),
+                Case.waiting_since.is_not(None),
+                Case.state.not_in(TERMINAL_STATES),
+            )
+        )
+        if mine is not None:
+            stmt = stmt.where(Case.waiting_since < mine)
+        return int(await session.scalar(stmt) or 0)
+
     async def acquire(
         self,
         session: AsyncSession,
@@ -187,6 +214,9 @@ class CapacityManager:
             total = await self.in_use(session, kind)
             if total >= limit:
                 return CapacityDenied(kind, "", limit, total)
+            ahead = await self.older_waiting(session, kind, case_id)
+            if ahead >= limit - total:
+                return CapacityDenied(kind, "", limit, total, queued_behind=ahead)
         if per_scope_limit is not None and scope and not force:
             scoped = await self.in_use(session, kind, scope)
             if scoped >= per_scope_limit:

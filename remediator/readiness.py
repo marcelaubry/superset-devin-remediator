@@ -1,9 +1,14 @@
-"""Live-readiness report: `python -m remediator.readiness [--json] [--allow-mutations]`.
+"""Live-readiness report: `python -m remediator.readiness [--json] [--verifier-smoke]
+[--allow-mutations --confirm-channel <SLACK_CHANNEL_ID>]`.
 
 Every default check is read-only: no Devin session is created, no GitHub or Slack resource
 is written, no database row is modified. The only mutating check (a Slack test message)
-runs solely behind `--allow-mutations`. All output passes through the settings redactor
-so tokens and signing secrets can never appear, even inside provider error messages.
+runs solely behind `--allow-mutations` *and* `--confirm-channel` naming the exact channel
+it will post to. `--verifier-smoke` executes the registry smoke probe (a real Superset
+Jest test at a pinned SHA) inside the verifier runner: it downloads dependencies through
+the egress proxy but mutates nothing and spends no ACUs. All output passes through the
+settings redactor so tokens and signing secrets can never appear, even inside provider
+error messages.
 """
 
 from __future__ import annotations
@@ -13,6 +18,7 @@ import asyncio
 import json
 import re
 import sys
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -30,7 +36,16 @@ from .config import MIN_LIVE_SECRET_LENGTH, PLACEHOLDER_SECRET, Settings, unsafe
 from .db import build_engine
 from .devin.live import LiveDevinClient
 from .github.client import GitHubApiError, LiveGitHubClient
+from .models import ProbeTarget
+from .probes.registry import (
+    ProbeRegistryError,
+    load_approved_probe,
+    manifest_cache_inputs,
+    manifest_setup_steps,
+    manifest_setup_timeout,
+)
 from .probes.remote import RemoteProbeRunner
+from .probes.runner import ProbeRunSpec
 from .slack.client import LiveSlackClient, SlackApiError
 from .verifier.protocol import Capabilities
 
@@ -516,15 +531,28 @@ async def check_slack_test_message(settings: Settings, probes: Probes) -> list[C
 async def check_verifier(settings: Settings, probes: Probes) -> list[CheckResult]:
     if settings.probe_runner_mode != "remote":
         return [CheckResult("verifier.health", "skip", "PROBE_RUNNER_MODE=fake")]
+    runner = _remote_runner(settings, probes)
+    if isinstance(runner, str):
+        return [CheckResult("verifier.health", "fail", runner)]
+    try:
+        caps = await runner.health()
+    finally:
+        await runner.aclose()
+    if isinstance(caps, str):
+        return [CheckResult("verifier.health", "fail", caps)]
+    return _verifier_results(settings, caps)
+
+
+def _remote_runner(settings: Settings, probes: Probes) -> RemoteProbeRunner | str:
+    if settings.probe_runner_mode != "remote":
+        return "PROBE_RUNNER_MODE=fake"
     secret = settings.probe_verifier_secret_value
     if not settings.probe_verifier_url or not secret or len(secret) < 32:
-        return [
-            CheckResult("verifier.health", "fail", "PROBE_VERIFIER_URL / shared secret unusable")
-        ]
+        return "PROBE_VERIFIER_URL / shared secret unusable"
     problem = unsafe_service_url(settings.probe_verifier_url)
     if problem:
-        return [CheckResult("verifier.url", "fail", f"PROBE_VERIFIER_URL {problem}")]
-    runner = RemoteProbeRunner(
+        return f"PROBE_VERIFIER_URL {problem}"
+    return RemoteProbeRunner(
         settings.probe_verifier_url,
         secret,
         client=httpx.AsyncClient(
@@ -533,13 +561,64 @@ async def check_verifier(settings: Settings, probes: Probes) -> list[CheckResult
         require_isolation=settings.probe_verifier_isolation_required,
         request_timeout_seconds=settings.probe_verifier_request_timeout_seconds,
     )
+
+
+async def check_verifier_smoke(settings: Settings, probes: Probes) -> list[CheckResult]:
+    """OPT-IN (`--verifier-smoke`): run the registry smoke probe against its BASE SHA in the
+    verifier runner. Installs the real frontend dependencies and runs a real Jest test, so
+    it takes minutes and needs the egress proxy; it writes nothing outside the runner."""
+    repository, sep, issue_text = settings.probe_smoke_probe.partition("#")
+    if not sep or not REPOSITORY_RE.match(repository) or not issue_text.isdigit():
+        return [CheckResult("verifier.smoke", "fail", "PROBE_SMOKE_PROBE must be owner/name#issue")]
     try:
-        caps = await runner.health()
+        probe = await load_approved_probe(
+            Path(settings.probe_root), repository, int(issue_text), allow_smoke=True
+        )
+    except ProbeRegistryError as exc:
+        return [CheckResult("verifier.smoke", "fail", f"smoke probe not loadable: {exc}")]
+    runner = _remote_runner(settings, probes)
+    if isinstance(runner, str):
+        return [CheckResult("verifier.smoke", "skip", runner)]
+    request_id = uuid.uuid4().hex
+    spec = ProbeRunSpec(
+        repository=probe.repository,
+        issue_number=probe.issue_number,
+        commit_sha=probe.base_sha,
+        target=ProbeTarget.BASE,
+        probe_identifier=probe.identifier,
+        script_hash=probe.script_hash,
+        script_content=probe.script_content,
+        timeout_seconds=probe.timeout_seconds,
+        max_output_bytes=settings.probe_max_output_bytes,
+        required_tools=probe.required_tools,
+        setup_steps=manifest_setup_steps(probe.manifest),
+        setup_timeout_seconds=manifest_setup_timeout(probe.manifest),
+        cache_inputs=manifest_cache_inputs(probe.manifest),
+        manifest_hash=probe.manifest_hash,
+        request_id=request_id,
+    )
+    try:
+        result = await runner.run(spec)
     finally:
         await runner.aclose()
-    if isinstance(caps, str):
-        return [CheckResult("verifier.health", "fail", caps)]
-    return _verifier_results(settings, caps)
+    summary = (
+        f"{probe.identifier} @ {probe.base_sha[:12]} exit={result.exit_code} "
+        f"expected={probe.expected_base_exit_code} {result.duration_ms / 1000:.0f}s "
+        f"stage={result.failure_stage or 'run'} "
+        + " ".join(f"{k}={v}" for k, v in sorted(result.tool_versions.items()))
+    )
+    if result.infrastructure_failed:
+        return [
+            CheckResult(
+                "verifier.smoke",
+                "fail",
+                f"infrastructure: {result.infrastructure_error} | {summary}",
+            )
+        ]
+    if result.timed_out or result.exit_code != probe.expected_base_exit_code:
+        tail = result.stderr.strip().splitlines()[-3:] or result.stdout.strip().splitlines()[-3:]
+        return [CheckResult("verifier.smoke", "fail", summary + " | " + " / ".join(tail))]
+    return [CheckResult("verifier.smoke", "pass", summary)]
 
 
 def _verifier_results(settings: Settings, caps: Capabilities) -> list[CheckResult]:
@@ -578,6 +657,35 @@ def _verifier_results(settings: Settings, caps: Capabilities) -> list[CheckResul
             "verifier.isolation",
             "fail" if unenforced else "pass",
             "; ".join(unenforced) if unenforced else "non-root, read-only root, limits enforced",
+        )
+    )
+    results.append(
+        CheckResult(
+            "verifier.key_separation",
+            "pass" if caps.key_isolated_from_probes else "fail",
+            f"probes execute {caps.execution}"
+            + (
+                ""
+                if caps.key_isolated_from_probes
+                else " - repository code could read the verifier HMAC key"
+            ),
+        )
+    )
+    egress_ok = iso.direct_egress is False
+    results.append(
+        CheckResult(
+            "verifier.egress",
+            "pass" if egress_ok else "fail",
+            (
+                "no direct egress from the probe executor"
+                if egress_ok
+                else (
+                    "probe executor can reach the internet directly"
+                    if iso.direct_egress
+                    else "egress restriction not verified (VERIFIER_EGRESS_CHECK=off?)"
+                )
+            )
+            + ("; proxy configured" if iso.egress_proxy_configured else "; no egress proxy"),
         )
     )
     verifier_allow = {r.lower() for r in caps.repository_allowlist}
@@ -627,15 +735,37 @@ READ_ONLY_CHECKS: tuple[CheckFn, ...] = (
     check_public_url,
 )
 MUTATING_CHECKS: tuple[CheckFn, ...] = (check_slack_test_message,)
+OPT_IN_CHECKS: tuple[CheckFn, ...] = (check_verifier_smoke,)
+
+
+def mutation_confirmed(settings: Settings, confirm_channel: str | None) -> str | None:
+    """Second gate for mutating checks: the operator must re-type the exact Slack channel
+    id the test message will land in. Returns the reason when the gate is not passed."""
+    if confirm_channel is None:
+        return "--allow-mutations also requires --confirm-channel <SLACK_CHANNEL_ID>"
+    if confirm_channel != settings.slack_channel_id:
+        return "--confirm-channel does not match SLACK_CHANNEL_ID; refusing to post"
+    return None
 
 
 async def run_checks(
-    settings: Settings, *, allow_mutations: bool = False, probes: Probes | None = None
+    settings: Settings,
+    *,
+    allow_mutations: bool = False,
+    confirm_channel: str | None = None,
+    verifier_smoke: bool = False,
+    probes: Probes | None = None,
 ) -> list[CheckResult]:
     probes = probes or Probes()
     redactor = SettingsRedactingFilter(settings.secret_values)
     results: list[CheckResult] = []
-    checks = READ_ONLY_CHECKS + (MUTATING_CHECKS if allow_mutations else ())
+    checks = READ_ONLY_CHECKS + (OPT_IN_CHECKS if verifier_smoke else ())
+    if allow_mutations:
+        refusal = mutation_confirmed(settings, confirm_channel)
+        if refusal is None:
+            checks += MUTATING_CHECKS
+        else:
+            results.append(CheckResult("mutations.confirmation", "fail", refusal, mutating=True))
     for check in checks:
         try:
             batch = await check(settings, probes)
@@ -679,7 +809,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--allow-mutations",
         action="store_true",
-        help="also run checks that write to external systems (posts a Slack test message)",
+        help="also run checks that write to external systems (posts a Slack test message); "
+        "requires --confirm-channel",
+    )
+    parser.add_argument(
+        "--confirm-channel",
+        metavar="SLACK_CHANNEL_ID",
+        help="second confirmation for --allow-mutations: the exact channel id to post into",
+    )
+    parser.add_argument(
+        "--verifier-smoke",
+        action="store_true",
+        help="run the registry smoke probe (PROBE_SMOKE_PROBE) in the verifier runner: real "
+        "dependency install + Jest test at a pinned SHA; minutes, no mutations, no ACUs",
     )
     args = parser.parse_args(argv)
     try:
@@ -689,7 +831,14 @@ def main(argv: list[str] | None = None) -> int:
         for error in exc.errors(include_input=False, include_url=False):
             print(f"[FAIL] config.load  {error['msg']}")
         return 2
-    results = asyncio.run(run_checks(settings, allow_mutations=args.allow_mutations))
+    results = asyncio.run(
+        run_checks(
+            settings,
+            allow_mutations=args.allow_mutations,
+            confirm_channel=args.confirm_channel,
+            verifier_smoke=args.verifier_smoke,
+        )
+    )
     print(render(results, as_json=args.json))
     return 1 if any(r.status == "fail" for r in results) else 0
 

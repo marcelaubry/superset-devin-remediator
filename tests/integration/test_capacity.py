@@ -18,6 +18,8 @@ from remediator.capacity import (
     CapacityDenied,
     CapacityLimits,
     CapacityManager,
+    clear_waiting,
+    mark_waiting,
     waiting_count,
 )
 from remediator.config import Settings
@@ -261,8 +263,14 @@ async def drive_until_settled(
     settings: Settings,
     manager: CapacityManager,
     *,
-    max_rounds: int = 30,
+    stall_rounds: int = 25,
+    time_budget_seconds: float = 120.0,
 ) -> None:
+    """Drive every case until none is in a triage work state. The budget is progress-based
+    (fail only after `stall_rounds` consecutive rounds without a case leaving the work
+    states) with a generous wall-clock ceiling, so a loaded host slows the test down
+    instead of failing it, while a genuine deadlock still fails."""
+
     async def one(case_id: uuid.UUID) -> None:
         async with factory() as session:
             case = await session.get(Case, case_id)
@@ -270,20 +278,32 @@ async def drive_until_settled(
             if case.state in {CaseState.TRIAGE_CREATE_INTENT, CaseState.TRIAGING}:
                 await process_case(session, case, devin, settings, capacity=manager)
 
-    for _ in range(max_rounds):
-        await asyncio.gather(*(one(cid) for cid in case_ids))
+    async def remaining() -> int:
         async with factory() as session:
-            remaining = await session.scalar(
-                select(func.count())
-                .select_from(Case)
-                .where(
-                    Case.id.in_(case_ids),
-                    Case.state.in_([CaseState.TRIAGE_CREATE_INTENT, CaseState.TRIAGING]),
+            return int(
+                await session.scalar(
+                    select(func.count())
+                    .select_from(Case)
+                    .where(
+                        Case.id.in_(case_ids),
+                        Case.state.in_([CaseState.TRIAGE_CREATE_INTENT, CaseState.TRIAGING]),
+                    )
                 )
+                or 0
             )
-        if not remaining:
-            return
-    raise AssertionError("cases did not settle within the round budget")
+
+    deadline = asyncio.get_running_loop().time() + time_budget_seconds
+    best = await remaining()
+    stalled = 0
+    while best:
+        if asyncio.get_running_loop().time() > deadline:
+            raise AssertionError(f"cases did not settle within {time_budget_seconds}s")
+        await asyncio.gather(*(one(cid) for cid in case_ids))
+        left = await remaining()
+        stalled = stalled + 1 if left >= best else 0
+        best = min(best, left)
+        if stalled >= stall_rounds:
+            raise AssertionError(f"no case made progress in {stall_rounds} rounds ({left} left)")
 
 
 @pytest.mark.asyncio
@@ -455,3 +475,50 @@ async def test_reconcile_finished_releases_leases_whose_attempt_is_over(
     async with integration_session_factory() as session:
         lease = await session.scalar(select(CapacityLease).where(CapacityLease.case_id == crashed))
         assert lease is not None and lease.release_reason == "attempt no longer active (reconciled)"
+
+
+@pytest.mark.asyncio
+async def test_waiting_cases_are_admitted_in_fifo_order(
+    integration_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A slot freed while several cases are parked goes to the case that has waited longest,
+    even if a newer case (or a case that never had to wait) asks first."""
+    holder, old, newer, fresh = await make_cases(integration_session_factory, 4, first_issue=7300)
+    manager = CapacityManager(limits(remediation=1), owner="worker-a")
+    kind = CapacityLeaseKind.REMEDIATION
+
+    assert await acquire_once(integration_session_factory, manager, holder)
+    for case_id in (old, newer):
+        async with integration_session_factory() as session, session.begin():
+            case = await session.get(Case, case_id)
+            assert case is not None
+            outcome = await manager.acquire(session, kind=kind, case_id=case_id, scope=REPO)
+            assert isinstance(outcome, CapacityDenied)
+            await mark_waiting(session, case, outcome)
+        await asyncio.sleep(0.01)  # distinct waiting_since
+
+    async with integration_session_factory() as session, session.begin():
+        await manager.release(session, kind=kind, case_id=holder, scope=REPO, reason="done")
+
+    # Newer and never-waited cases are refused although a slot is free ...
+    async with integration_session_factory() as session, session.begin():
+        outcome = await manager.acquire(session, kind=kind, case_id=newer, scope=REPO)
+        assert isinstance(outcome, CapacityDenied) and outcome.queued_behind == 1
+        assert outcome.label == "REMEDIATION (0/1) behind 1"
+    assert not await acquire_once(integration_session_factory, manager, fresh)
+    # ... until the oldest waiter takes it.
+    async with integration_session_factory() as session, session.begin():
+        case = await session.get(Case, old)
+        assert case is not None
+        outcome = await manager.acquire(session, kind=kind, case_id=old, scope=REPO)
+        assert not isinstance(outcome, CapacityDenied)
+        await clear_waiting(session, case)
+        assert await active_leases(session, kind) == 1
+
+    # A waiter that reached a terminal state never holds the queue.
+    async with integration_session_factory() as session, session.begin():
+        await manager.release(session, kind=kind, case_id=old, scope=REPO, reason="done")
+        case = await session.get(Case, newer)
+        assert case is not None
+        case.state = CaseState.REMEDIATION_CANCELLED
+    assert await acquire_once(integration_session_factory, manager, fresh)

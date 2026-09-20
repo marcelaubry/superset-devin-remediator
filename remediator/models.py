@@ -161,8 +161,9 @@ FAILURE_CLASS_SESSION = "session"
 
 class WebhookEvent(Base):
     __tablename__ = "webhook_events"
+    __table_args__ = (UniqueConstraint("delivery_id", name="webhook_events_delivery_id_key"),)
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    delivery_id: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    delivery_id: Mapped[str] = mapped_column(String(255), index=True)
     event_type: Mapped[str] = mapped_column(String(100))
     action: Mapped[str] = mapped_column(String(100))
     repository: Mapped[str] = mapped_column(String(255))
@@ -341,6 +342,7 @@ class ProbeSnapshot(Base):
     """
 
     __tablename__ = "probe_snapshots"
+    __table_args__ = (Index("ix_probe_snapshots_case_id", "case_id"),)
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     case_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("cases.id", ondelete="CASCADE"))
     repository: Mapped[str] = mapped_column(String(255))
@@ -368,6 +370,7 @@ class ProbeSnapshot(Base):
 
 class ProbeExecution(Base):
     __tablename__ = "probe_executions"
+    __table_args__ = (Index("ix_probe_executions_attempt_id", "attempt_id"),)
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     case_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("cases.id", ondelete="CASCADE"))
     # NULL until a Devin attempt is authorised: the BASE run happens before any attempt
@@ -462,6 +465,7 @@ class PullRequestEvidence(Base):
     """What GitHub said about the discovered PR when it was validated."""
 
     __tablename__ = "pull_request_evidence"
+    __table_args__ = (Index("ix_pull_request_evidence_attempt_id", "attempt_id"),)
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     case_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("cases.id", ondelete="CASCADE"))
     attempt_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("attempts.id", ondelete="CASCADE"))
@@ -495,6 +499,7 @@ class PullRequestEvidence(Base):
 
 class CiSnapshot(Base):
     __tablename__ = "ci_snapshots"
+    __table_args__ = (Index("ix_ci_snapshots_attempt_id", "attempt_id"),)
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     case_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("cases.id", ondelete="CASCADE"))
     attempt_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("attempts.id", ondelete="CASCADE"))
@@ -531,6 +536,7 @@ class StateTransition(Base):
 
 class NotificationOutbox(Base):
     __tablename__ = "notification_outbox"
+    __table_args__ = (Index("ix_notification_outbox_pending", "status", "next_attempt_at"),)
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     case_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("cases.id", ondelete="CASCADE"))
     channel: Mapped[OutboxChannel] = mapped_column(
@@ -639,6 +645,7 @@ class ApprovalEvent(Base):
     """Append-only approval timeline (never updated or deleted by application code)."""
 
     __tablename__ = "approval_events"
+    __table_args__ = (Index("ix_approval_events_case_id", "case_id"),)
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     seq: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=False)
     approval_request_id: Mapped[uuid.UUID] = mapped_column(

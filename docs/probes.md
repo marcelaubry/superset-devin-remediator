@@ -137,6 +137,7 @@ uses the snapshot, and the PR validator rejects PRs that touch `probes/`.
 There is deliberately **no worker-side `local` mode**: the worker holds every
 application credential and a scrubbed child environment is not a security
 boundary (see [threat-model.md](threat-model.md)). Inside the verifier the
+Inside the `verifier-runner` container (never the key-holding front),
 `LocalProbeRunner` does `git init` + `fetch --depth 1 origin <sha>` + detached
 checkout in a temp directory, verifies `HEAD` is the requested SHA and the
 remote is the allowlisted clone URL, runs the manifest's `setup` argv steps
@@ -145,10 +146,14 @@ with a minimal environment, `min(manifest.timeout, PROBE_TIMEOUT_SECONDS,
 VERIFIER_MAX_TIMEOUT_SECONDS)` covering process exit (not just output), rlimits
 (`VERIFIER_MAX_PROCESSES`, `VERIFIER_MAX_FILE_SIZE_BYTES`, optional
 `VERIFIER_MAX_MEMORY_BYTES`), per-stream output caps, process-group kill plus a
-marker sweep that also kills `setsid`-detached descendants, a post-run sweep of
-every remaining process of the probe UID (`VERIFIER_MAX_CONCURRENT` probes per
-verifier, default 1; a busy verifier answers `409` and the worker retries),
-and workspace cleanup. Requests are idempotent per request id: an exact
+marker sweep that also kills `setsid`-detached descendants (the fetch and
+setup steps run under the same session/marker/group-kill discipline as the
+script), a post-run sweep of every remaining process of the probe UID (which
+is why `VERIFIER_MAX_CONCURRENT` must be `1` — the runner refuses to start
+otherwise; a busy runner answers `409` and the worker retries), and workspace
+cleanup. Network leaves the runner only through `egress-proxy`
+(`HTTPS_PROXY`/`https_proxy` are set for git and npm/yarn; the allowlist is
+`EGRESS_ALLOWED_HOSTS`). Requests are idempotent per request id: an exact
 repeat is answered from memory (`replayed: true`), the same id with different
 semantics is `409`, and after a verifier restart the id is simply executed
 again, so a worker that lost the answer never gets a stale or fabricated one. Missing `git`/`bash`/declared tools are an infrastructure failure,
@@ -160,6 +165,19 @@ credential-shaped environment variable (`DEVIN_API_KEY`, `GITHUB_TOKEN`,
 `SLACK_*`, `OPERATOR_TOKEN`, `DATABASE_URL`, anything ending in `_TOKEN`,
 `_SECRET`, `_API_KEY`, `_PASSWORD`, `_PRIVATE_KEY`), a `.env` file,
 `/run/secrets` or `/var/run/docker.sock`; that state is also reported on
-`/health` so the worker never trusts such a verifier. Run it locally with
-`docker compose up verifier` or `python -m remediator.verifier` from a shell
-with no secrets exported.
+`/health` so the worker never trusts such a verifier. Run the trio locally
+with `docker compose up verifier` (pulls in `verifier-runner` and
+`egress-proxy`).
+
+## The reserved smoke probe: `apache/superset#0`
+
+Issue number `0` is reserved: `load_approved_probe` refuses it (and any
+non-positive number) for remediation cases, and only the readiness command
+and the runner opt into it. `probes/apache/superset/0/` holds a real Superset
+frontend probe at a pinned SHA: `npm ci --ignore-scripts` under
+`superset-frontend/`, then one Jest file (`src/utils/findPermission.test.ts`)
+with `--runInBand`. Expected exit is `0` at base, so
+`python -m remediator.readiness --verifier-smoke` proves that clone, proxy
+egress, dependency install, the pinned Node/npm toolchain and Jest all work
+end to end in the runner. Re-register it with `scripts/register_probe.py`
+when bumping the SHA.
