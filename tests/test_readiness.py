@@ -117,14 +117,17 @@ def _happy_handler(request: httpx.Request) -> httpx.Response:
         if path.endswith("auth.test"):
             return httpx.Response(200, json={"ok": True, "user": "remediator", "team": "acme"})
         if path.endswith("conversations.info"):
+            assert request.method == "GET" and not request.content
+            assert request.url.params["channel"] == "C0123456789"
             return httpx.Response(
                 200, json={"ok": True, "channel": {"name": "approvals", "is_member": True}}
             )
         if path.endswith("users.info"):
-            body = json.loads(request.content)
-            if body["user"] == "U0000000BAD":
+            assert request.method == "GET" and not request.content
+            user = request.url.params["user"]
+            if user == "U0000000BAD":
                 return httpx.Response(200, json={"ok": False, "error": "user_not_found"})
-            return httpx.Response(200, json={"ok": True, "user": {"id": body["user"]}})
+            return httpx.Response(200, json={"ok": True, "user": {"id": user}})
         if path.endswith("chat.postMessage"):
             return httpx.Response(200, json={"ok": True, "channel": "C0123456789", "ts": "1.2"})
     if host == "verifier":
@@ -149,16 +152,15 @@ async def test_default_run_is_read_only_and_redacted() -> None:
     results = await run_checks(_live_settings(), probes=probes)
     by_name = _by_name(results)
 
-    # Read-only by construction: only GET requests except Slack's POST-only Web API reads.
+    # Read-only by construction: every request, Slack included, is a GET.
     for request in recorder.requests:
+        assert request.method == "GET", request
         if request.url.host == "slack.com":
             assert request.url.path.rsplit("/", 1)[1] in {
                 "auth.test",
                 "conversations.info",
                 "users.info",
             }
-        else:
-            assert request.method == "GET", request
     assert not any(r.mutating for r in results)
 
     assert by_name["devin.identity"].status == "pass"
@@ -240,7 +242,7 @@ async def test_provider_failures_are_reported_not_raised_and_stay_redacted() -> 
     assert "renamed" in by_name["github.repository[acme/superset]"].detail
     assert by_name["github.default_branch[acme/superset]"].status == "fail"
     assert by_name["slack.identity"].status == "fail"
-    assert by_name["slack.identity"].detail == "invalid_auth"
+    assert by_name["slack.identity"].detail == "auth.test returned invalid_auth"
     assert by_name["verifier.health"].status == "fail"
     assert "signature" in by_name["verifier.health"].detail
     assert GH_TOKEN not in render(results, as_json=True)

@@ -100,9 +100,15 @@ approving anything. Record the printed SHA in the canary checklist.
 
 **Slack app** in one workspace:
 
-- Bot scopes: `chat:write`, `channels:read` (or `groups:read` for private
-  channels), `users:read`; interactivity request URL pointing at
-  `/webhooks/slack/actions`; signing secret = `SLACK_SIGNING_SECRET`.
+- Bot scopes: `chat:write`, `users:read`, and `channels:read` for a public
+  channel or `groups:read` for a private one (`conversations.info` needs the
+  scope matching the channel type; approval reconciliation additionally uses
+  `channels:history` / `groups:history`); interactivity request URL pointing
+  at `/webhooks/slack/actions`; signing secret = `SLACK_SIGNING_SECRET`.
+- Readiness only calls `auth.test`, `conversations.info` and `users.info`
+  (all GET, arguments in the query string). A private channel needs no other
+  method — only `groups:read`. A `missing_scope` failure prints Slack's
+  `needed=` / `provided=` so the missing scope is explicit.
 - Invite the bot to `SLACK_APPROVAL_CHANNEL`. No `chat:write.public`, no
   user tokens.
 
@@ -120,4 +126,10 @@ approving anything. Record the printed SHA in the canary checklist.
 | `verifier.smoke fail infrastructure: ...` | Clone or `npm ci` failed: check `EGRESS_ALLOWED_HOSTS`, proxy logs, `/workspace` free space and the runner memory limit |
 | `mutations.confirmation fail` | Pass `--confirm-channel` with the exact `SLACK_CHANNEL_ID` |
 | `webhook.health fail` | tunnel down or `PUBLIC_BASE_URL` stale |
-| `slack.channel fail` | invite the bot to the channel |
+| `slack.channel fail #x is_member=False` | invite the bot to the channel |
+| `slack.channel fail #x is_archived=True` | pick an active channel |
+| `slack.channel fail conversations.info returned missing_scope needed=groups:read` | private channel: add `groups:read`, reinstall the app |
+| `slack.channel fail conversations.info returned invalid_arguments` / `channel_not_found` | the request did not carry `channel` (client bug) or the ID is wrong / another workspace |
+| `slack.approver[U..] fail deactivated` / `is a bot user` | approver must be an active human account |
+| `slack.approver[U..] fail user_not_found` | ID is wrong or belongs to another workspace |
+| `slack.approver[U..] fail users.info returned ...` | Slack API error (not a missing user) — see the error name |
