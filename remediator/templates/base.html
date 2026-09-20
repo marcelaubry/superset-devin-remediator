@@ -90,16 +90,20 @@
       return [d, base + "#" + seen[base]];
     });
   }
-  // Several polling targets settle independently (htmx settles asynchronously), so state is kept per target.
-  document.body.addEventListener("htmx:afterSettle", function (evt) {
-    var settled = evt.detail && evt.detail.target;
+  // Several polling targets swap independently, so state is kept per target. Disclosures are
+  // reopened at afterSwap (before the browser reflows the swapped content) so the page height
+  // never changes and the scroll position stays put.
+  document.body.addEventListener("htmx:afterSwap", function (evt) {
+    var swapped = evt.detail && evt.detail.target;
     openDetails = openDetails.filter(function (entry) {
-      if (entry.target !== settled) { return true; }
+      if (entry.target !== swapped) { return true; }
       detailsKeys(entry.target).forEach(function (pair) {
         if (entry.keys.indexOf(pair[1]) !== -1) { pair[0].open = true; }
       });
       return false;
     });
+  });
+  document.body.addEventListener("htmx:afterSettle", function () {
     if (!focused) { return; }
     var saved = focused;
     focused = null;
