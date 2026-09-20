@@ -62,5 +62,5 @@ class GitHubBaseCommitResolver:
 def build_base_commit_resolver(settings: Settings) -> BaseCommitResolver:
     if not settings.live_mode:
         return FakeBaseCommitResolver()
-    token = settings.github_api_token.get_secret_value() if settings.github_api_token else None
+    token = settings.github_token.get_secret_value() if settings.github_token else None
     return GitHubBaseCommitResolver(settings.github_api_base_url, token)

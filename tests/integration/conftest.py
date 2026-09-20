@@ -34,7 +34,8 @@ async def integration_session_factory(
     async with integration_engine.begin() as connection:
         await connection.execute(
             text(
-                "TRUNCATE notification_outbox, state_transitions, attempts, "
+                "TRUNCATE notification_outbox, approval_events, slack_actions, "
+                "approval_requests, slack_fake_messages, state_transitions, attempts, "
                 "webhook_events, cases CASCADE"
             )
         )
@@ -47,6 +48,11 @@ def test_settings(test_database_url: str) -> Settings:
         database_url=test_database_url,
         github_webhook_secret="secret",
         operator_token="operator",
+        slack_signing_secret="slack-signing-secret-for-tests-only",
+        slack_approver_user_ids="U_APPROVER_ONE,U_APPROVER_TWO",
+        slack_channel_id="C_TEST",
+        outbox_base_backoff_seconds=0,
+        outbox_max_backoff_seconds=0,
         worker_poll_interval_seconds=0.05,
         worker_concurrency=1,
     )

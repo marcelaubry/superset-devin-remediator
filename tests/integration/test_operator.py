@@ -88,22 +88,21 @@ async def test_operator_retry_cancel_and_case_auth(
         assert "CI_PASSED cannot transition to CANCELLED" in hx_terminal_cancel.text
         assert 'role="alert"' in hx_terminal_cancel.text
 
-        approve = await client.post(
-            f"/operator/cases/{approval_id}/approve-remediation", headers=headers
-        )
-        assert approve.status_code == 200
-        assert approve.json()["state"] == CaseState.REMEDIATION_CREATE_INTENT
-
-        reject = await client.post(
-            f"/operator/cases/{reject_id}/reject-remediation", headers=headers
-        )
-        assert reject.status_code == 200
-        assert reject.json()["state"] == CaseState.CANCELLED
-
-        invalid_approve = await client.post(
-            f"/operator/cases/{passed_id}/approve-remediation", headers=headers
-        )
-        assert invalid_approve.status_code == 409
+        # Phase 3: remediation approval is a Slack-only decision; the dashboard has no
+        # approve/reject endpoints and cancel remains the only operator action.
+        for case_id in (approval_id, reject_id):
+            gone = await client.post(
+                f"/operator/cases/{case_id}/approve-remediation", headers=headers
+            )
+            assert gone.status_code == 404
+            gone = await client.post(
+                f"/operator/cases/{case_id}/reject-remediation", headers=headers
+            )
+            assert gone.status_code == 404
+        detail = await client.get(f"/cases/{approval_id}", headers=headers)
+        assert detail.status_code == 200
+        assert "approval happens in Slack" in detail.text
+        assert "approve-remediation" not in detail.text
 
         missing_json_auth = await client.get("/api/cases/apache/superset/5001")
         assert missing_json_auth.status_code == 401

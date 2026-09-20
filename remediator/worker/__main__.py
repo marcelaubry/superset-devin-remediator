@@ -2,6 +2,7 @@ import asyncio
 import logging
 import signal
 
+from ..adapters import install_secret_redaction
 from ..config import get_settings
 from . import Worker
 
@@ -12,6 +13,7 @@ async def main() -> None:
         level=settings.log_level,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    install_secret_redaction(settings)
     worker = Worker(settings)
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):

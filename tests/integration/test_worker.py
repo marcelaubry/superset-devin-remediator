@@ -4,7 +4,6 @@ import pytest
 from sqlalchemy import func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from remediator.approvals import approve_remediation
 from remediator.config import Settings
 from remediator.devin.client import CreateSessionRequest, SessionSnapshot
 from remediator.devin.fake import FakeDevinClient
@@ -93,7 +92,7 @@ async def test_processor_success(integration_session: AsyncSession) -> None:
     await integration_session.commit()
     await process_event(integration_session, event, FakeDevinClient(), Settings())
     case = await integration_session.scalar(select(Case).where(Case.issue_number == 4213))
-    assert case and case.state == CaseState.CI_PASSED
+    assert case and case.state == CaseState.AWAITING_REMEDIATION_APPROVAL
     transitions = list(
         (
             await integration_session.scalars(
@@ -101,7 +100,7 @@ async def test_processor_success(integration_session: AsyncSession) -> None:
             )
         ).all()
     )
-    assert transitions[-1].to_state == CaseState.CI_PASSED
+    assert transitions[-1].to_state == CaseState.AWAITING_REMEDIATION_APPROVAL
     assert event.status == EventStatus.PROCESSED
 
 
@@ -204,7 +203,7 @@ async def test_processor_triage_infeasible(integration_session: AsyncSession) ->
 
 
 @pytest.mark.asyncio
-async def test_manual_remediation_approval_resumes_processing(
+async def test_remediation_candidate_parks_awaiting_slack_approval(
     integration_session: AsyncSession,
 ) -> None:
     event = WebhookEvent(
@@ -224,8 +223,9 @@ async def test_manual_remediation_approval_resumes_processing(
     )
     integration_session.add(event)
     await integration_session.commit()
-    settings = Settings(simulation_auto_approve_remediation=False)
-    await process_event(integration_session, event, FakeDevinClient(), settings)
+    settings = Settings()
+    devin = FakeDevinClient()
+    await process_event(integration_session, event, devin, settings)
     case = await integration_session.scalar(select(Case).where(Case.issue_number == 4213))
     assert case and case.state == CaseState.AWAITING_REMEDIATION_APPROVAL
     outbox = list(
@@ -238,10 +238,17 @@ async def test_manual_remediation_approval_resumes_processing(
     assert len(outbox) == 1
     assert outbox[0].channel == OutboxChannel.SLACK
     assert outbox[0].kind == "remediation_approval_requested"
-    await approve_remediation(integration_session, case, "operator")
-    await integration_session.commit()
-    await process_case(integration_session, case, FakeDevinClient(), settings)
-    assert case.state == CaseState.CI_PASSED
+    assert outbox[0].approval_request_id is not None
+    # Nothing in Phase 3 may pick the case up as Devin work: no remediation session.
+    await process_case(integration_session, case, devin, settings)
+    assert case.state == CaseState.AWAITING_REMEDIATION_APPROVAL
+    kinds = {
+        a.kind
+        for a in (
+            await integration_session.scalars(select(Attempt).where(Attempt.case_id == case.id))
+        ).all()
+    }
+    assert kinds == {AttemptKind.TRIAGE}
 
 
 @pytest.mark.asyncio

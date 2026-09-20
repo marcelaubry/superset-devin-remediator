@@ -152,7 +152,7 @@ async def test_retry_case_is_claimed_and_processed(
             fresh = await session.get(Case, claimed.id)
             assert fresh is not None
             await process_case(session, fresh, FakeDevinClient(), worker.settings)
-            assert fresh.state == CaseState.CI_PASSED
+            assert fresh.state == CaseState.AWAITING_REMEDIATION_APPROVAL
     finally:
         await worker.devin.aclose()
         await worker.engine.dispose()
@@ -246,6 +246,6 @@ async def test_event_processing_releases_case_lease(
     async with integration_session_factory() as session:
         case = await session.scalar(select(Case).where(Case.issue_number == 4213))
     assert case is not None
-    assert case.state == CaseState.CI_PASSED
+    assert case.state == CaseState.AWAITING_REMEDIATION_APPROVAL
     assert case.claimed_by is None
     assert case.lease_expires_at is None

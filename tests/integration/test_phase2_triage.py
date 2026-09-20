@@ -65,7 +65,6 @@ def _event(number: int, delivery: str, **kwargs: object) -> WebhookEvent:
 
 def _settings(**overrides: object) -> Settings:
     base: dict[str, object] = {
-        "simulation_auto_approve_remediation": False,
         "devin_poll_interval_seconds": 0,
         "devin_triage_timeout_seconds": 5,
         "reconcile_retry_delay_seconds": 0,

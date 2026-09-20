@@ -1,5 +1,6 @@
 import hmac
 import time
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
@@ -9,21 +10,29 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from ..approvals import approve_remediation, reject_remediation
+from ..approvals import expire_request, record_event
 from ..config import Settings, get_settings
 from ..db import get_session
 from ..lifecycle import CaseState, InvalidTransition, transition
 from ..models import (
     ACTIVE_ATTEMPT_STATUSES,
+    OUTBOX_KIND_GITHUB_APPLY_LABEL,
+    OUTBOX_KIND_SLACK_APPROVAL_REQUEST,
     UNRESOLVED_CREATE_ACK,
+    ApprovalRequest,
     Attempt,
     AttemptKind,
     AttemptStatus,
     Case,
     CreateState,
+    DeliveryStatus,
+    NotificationOutbox,
+    NotificationStatus,
+    OutboxStatus,
+    SlackFakeMessage,
 )
 from .auth import COOKIE_NAME, _cookie_value, require_operator
-from .dashboard import TEMPLATE_HELPERS, load_case, templates
+from .dashboard import TEMPLATE_HELPERS, approval_json, load_case, templates
 
 router = APIRouter()
 
@@ -62,7 +71,12 @@ async def case_json(
 ) -> dict[str, Any]:
     case = await session.scalar(
         select(Case)
-        .options(selectinload(Case.attempts))
+        .options(
+            selectinload(Case.attempts),
+            selectinload(Case.outbox),
+            selectinload(Case.approval_requests).selectinload(ApprovalRequest.events),
+            selectinload(Case.approval_requests).selectinload(ApprovalRequest.actions),
+        )
         .where(Case.repository == repository, Case.issue_number == issue_number)
     )
     if not case:
@@ -77,6 +91,22 @@ async def case_json(
         "pr_url": case.pr_url,
         "ci_status": case.ci_status,
         "attempts": [_attempt_json(attempt) for attempt in case.attempts],
+        "approval": approval_json(case),
+        "outbox": [_outbox_json(row) for row in case.outbox],
+    }
+
+
+def _outbox_json(row: NotificationOutbox) -> dict[str, Any]:
+    return {
+        "id": str(row.id),
+        "channel": row.channel.value,
+        "kind": row.kind,
+        "status": row.status.value,
+        "attempts_count": row.attempts_count,
+        "next_attempt_at": row.next_attempt_at.isoformat() if row.next_attempt_at else None,
+        "last_attempt_at": row.last_attempt_at.isoformat() if row.last_attempt_at else None,
+        "last_error": row.last_error,
+        "sent_at": row.sent_at.isoformat() if row.sent_at else None,
     }
 
 
@@ -250,64 +280,114 @@ async def cancel_case(
     return await _case_action(case_id, CaseState.CANCELLED, request, session)
 
 
-async def _remediation_approval_action(
-    case_id: UUID,
-    request: Request,
-    session: AsyncSession,
-    approve: bool,
-) -> Any:
-    case = await session.get(Case, case_id)
-    if not case:
-        raise HTTPException(status_code=404, detail="case not found")
-    try:
-        if approve:
-            await approve_remediation(session, case, "operator")
-        else:
-            await reject_remediation(session, case, "operator")
-        await session.commit()
-    except InvalidTransition as exc:
-        await session.rollback()
-        if request.headers.get("HX-Request") == "true":
-            refreshed = await load_case(session, case_id)
-            if not refreshed:
-                raise HTTPException(status_code=404, detail="case not found") from exc
-            return templates.TemplateResponse(
-                request,
-                "partials/case_detail.html",
-                {"request": request, "case": refreshed, **TEMPLATE_HELPERS, "error": str(exc)},
-                status_code=200,
-            )
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+def _render_case(request: Request, case: Case, error: str | None = None) -> Any:
     if request.headers.get("HX-Request") == "true":
-        refreshed = await load_case(session, case_id)
-        if not refreshed:
-            raise HTTPException(status_code=404, detail="case not found")
         return templates.TemplateResponse(
             request,
             "partials/case_detail.html",
-            {"request": request, "case": refreshed, **TEMPLATE_HELPERS, "error": None},
+            {"request": request, "case": case, **TEMPLATE_HELPERS, "error": error},
         )
-    refreshed = await load_case(session, case_id)
-    if not refreshed:
+    if error is not None:
+        raise HTTPException(status_code=409, detail=error)
+    return {"id": str(case.id), "state": case.state}
+
+
+@router.post("/operator/outbox/{outbox_id}/retry")
+async def retry_outbox(
+    outbox_id: UUID,
+    request: Request,
+    _: str = Depends(require_operator),
+    session: AsyncSession = Depends(get_session),
+) -> Any:
+    """Re-queue a terminally failed outbox row without asking anyone to approve again."""
+    row = await session.get(NotificationOutbox, outbox_id, with_for_update=True)
+    if row is None:
+        raise HTTPException(status_code=404, detail="outbox row not found")
+    error: str | None = None
+    if row.status != OutboxStatus.FAILED:
+        error = f"outbox row is {row.status.value}, only FAILED rows can be retried"
+        if request.headers.get("HX-Request") != "true":
+            raise HTTPException(status_code=409, detail=error)
+    else:
+        row.status = OutboxStatus.PENDING
+        row.attempts_count = 0
+        row.next_attempt_at = datetime.now(UTC)
+        row.claimed_by = None
+        row.lease_expires_at = None
+        if row.approval_request_id is not None:
+            approval = await session.get(ApprovalRequest, row.approval_request_id)
+            if approval is not None:
+                if (
+                    row.kind == OUTBOX_KIND_GITHUB_APPLY_LABEL
+                    and approval.delivery_status == DeliveryStatus.FAILED
+                ):
+                    approval.delivery_status = DeliveryStatus.PENDING
+                if (
+                    row.kind == OUTBOX_KIND_SLACK_APPROVAL_REQUEST
+                    and approval.notification_status == NotificationStatus.FAILED
+                ):
+                    approval.notification_status = NotificationStatus.PENDING
+                record_event(
+                    session,
+                    approval,
+                    "operator_retry",
+                    "operator",
+                    f"outbox {row.id} ({row.channel.value}/{row.kind}) re-queued",
+                )
+        await session.commit()
+    case = await load_case(session, row.case_id)
+    if not case:
         raise HTTPException(status_code=404, detail="case not found")
-    return {"id": str(refreshed.id), "state": refreshed.state}
+    return _render_case(request, case, error)
 
 
-@router.post("/operator/cases/{case_id}/approve-remediation")
-async def approve_case(
-    case_id: UUID,
+@router.post("/operator/approvals/{approval_id}/expire")
+async def expire_approval(
+    approval_id: UUID,
     request: Request,
     _: str = Depends(require_operator),
     session: AsyncSession = Depends(get_session),
 ) -> Any:
-    return await _remediation_approval_action(case_id, request, session, True)
+    """Invalidate a pending Slack action token. The case stays AWAITING_REMEDIATION_APPROVAL
+    so an operator can cancel or re-trigger triage; the Slack buttons stop working."""
+    approval = await session.get(ApprovalRequest, approval_id, with_for_update=True)
+    if approval is None:
+        raise HTTPException(status_code=404, detail="approval request not found")
+    error: str | None = None
+    if not await expire_request(session, approval, "operator"):
+        error = f"approval request already {approval.decision.value.lower()}"
+    else:
+        await session.commit()
+    case = await load_case(session, approval.case_id)
+    if not case:
+        raise HTTPException(status_code=404, detail="case not found")
+    return _render_case(request, case, error)
 
 
-@router.post("/operator/cases/{case_id}/reject-remediation")
-async def reject_case(
-    case_id: UUID,
-    request: Request,
+@router.get("/api/slack/fake/messages")
+async def fake_slack_messages(
     _: str = Depends(require_operator),
+    settings: Settings = Depends(get_settings),
     session: AsyncSession = Depends(get_session),
-) -> Any:
-    return await _remediation_approval_action(case_id, request, session, False)
+    channel: str | None = None,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """Fake-adapter channel contents (operator only). Not served in live Slack mode."""
+    if settings.slack_live:
+        raise HTTPException(status_code=404, detail="fake Slack adapter is not active")
+    stmt = select(SlackFakeMessage).order_by(SlackFakeMessage.created_at.desc())
+    if channel:
+        stmt = stmt.where(SlackFakeMessage.channel == channel)
+    rows = (await session.scalars(stmt.limit(max(1, min(limit, 200))))).all()
+    return [
+        {
+            "channel": row.channel,
+            "ts": row.ts,
+            "text": row.text,
+            "blocks": row.blocks,
+            "update_count": row.update_count,
+            "created_at": row.created_at.isoformat(),
+            "updated_at": row.updated_at.isoformat(),
+        }
+        for row in rows
+    ]

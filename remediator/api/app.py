@@ -10,11 +10,13 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from ..adapters import install_secret_redaction
 from ..config import get_settings
 from ..db import build_engine, build_session_factory
 from .auth import OperatorAuthRequired
 from .dashboard import router as dashboard_router
 from .operator import router as operator_router
+from .slack_actions import router as slack_actions_router
 from .webhooks import router as webhook_router
 
 engine: AsyncEngine | None = None
@@ -35,6 +37,7 @@ def create_app() -> FastAPI:
     logging.basicConfig(
         level=settings.log_level, format="%(asctime)s %(levelname)s %(name)s %(message)s"
     )
+    install_secret_redaction(settings)
     app = FastAPI(title="Superset Devin Remediator", lifespan=lifespan)
     app.mount(
         "/static",
@@ -47,6 +50,7 @@ def create_app() -> FastAPI:
         return RedirectResponse("/login", status_code=303)
 
     app.include_router(webhook_router)
+    app.include_router(slack_actions_router)
     app.include_router(dashboard_router)
     app.include_router(operator_router)
 
