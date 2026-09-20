@@ -495,6 +495,31 @@ async def test_verifier_replays_identical_request_ids(
     assert counter.read_text().strip() == "2", "the probe must run once per request id"
 
 
+async def test_verifier_restart_forgets_replays_but_reruns_deterministically(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Idempotency is process-local by design: after a verifier crash/restart the same
+    request id is executed again (never answered from stale memory) and the verdict is
+    derived from the registry and the exact commit, so it is identical."""
+    _, sha = _git_repo(tmp_path)
+    counter = tmp_path / "count"
+    counter.write_text("0")
+    probe = await _register(
+        tmp_path, sha, f"n=$(cat {counter}); echo $((n + 1)) > {counter}; exit 1\n"
+    )
+    body = _request(probe, sha)
+    async with _verifier_client(tmp_path, monkeypatch) as first_process:
+        first = await _post(first_process, body)
+        assert first.status_code == 200, first.text
+    async with _verifier_client(tmp_path, monkeypatch) as restarted:
+        again = await _post(restarted, body)
+    assert again.status_code == 200
+    assert again.json()["replayed"] is False
+    assert again.json()["exit_code"] == first.json()["exit_code"] == 1
+    assert again.json()["script_hash"] == first.json()["script_hash"]
+    assert counter.read_text().strip() == "2"
+
+
 async def test_verifier_concurrent_duplicate_waits_for_the_inflight_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

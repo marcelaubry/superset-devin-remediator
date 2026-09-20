@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import logging
 import os
 import socket
@@ -30,6 +31,7 @@ from ..models import (
     WebhookEvent,
 )
 from ..probes.remote import RemoteProbeRunner
+from .metrics_server import build_server as build_metrics_server
 from .outbox import OutboxDispatcher
 from .processor import (
     fail_case,
@@ -67,6 +69,8 @@ TRANSIENT_SQLSTATES = frozenset(
         "08006",
     }
 )
+DB_OUTAGE_MAX_BACKOFF_SECONDS = 30.0
+_loop_slot: contextvars.ContextVar[int | None] = contextvars.ContextVar("loop_slot", default=None)
 
 
 def is_transient_db_error(exc: BaseException) -> bool:
@@ -87,12 +91,12 @@ class Worker:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         metrics.configure(settings.metrics_mode)
-        self.engine = build_engine(settings)
+        self.worker_id = f"{socket.gethostname()}:{os.getpid()}:{uuid4().hex[:6]}"
+        self.engine = build_engine(settings, application_name=f"remediator-worker {self.worker_id}")
         self.session_factory = build_session_factory(self.engine)
         self.devin = build_devin_client(settings)
         self.base_commits = build_base_commit_resolver(settings)
         self.stop_event = asyncio.Event()
-        self.worker_id = f"{socket.gethostname()}:{os.getpid()}:{uuid4().hex[:6]}"
         self.slack = build_slack_client(settings, self.session_factory)
         self.github = build_github_client(settings)
         self.probes = probe_runner_from_settings(settings)
@@ -100,6 +104,14 @@ class Worker:
         self.outbox = OutboxDispatcher(
             settings, self.session_factory, self.slack, self.github, self.worker_id
         )
+
+    @property
+    def claim_id(self) -> str:
+        """Identity written to `claimed_by`. Loops in one process must not share it: a lease
+        release or heartbeat keyed only on the process id would act on a sibling loop's
+        claim and let two loops run the same case."""
+        slot = _loop_slot.get()
+        return self.worker_id if slot is None else f"{self.worker_id}/{slot}"
 
     async def _claim_event(self) -> WebhookEvent | None:
         while True:
@@ -137,7 +149,7 @@ class Worker:
                         continue
                     event.status = EventStatus.PROCESSING
                     event.claimed_at = now
-                    event.claimed_by = self.worker_id
+                    event.claimed_by = self.claim_id
                     event.lease_expires_at = now + timedelta(
                         seconds=self.settings.worker_lease_seconds
                     )
@@ -175,7 +187,7 @@ class Worker:
                     .limit(1)
                 )
                 if case:
-                    case.claimed_by = self.worker_id
+                    case.claimed_by = self.claim_id
                     case.lease_expires_at = now + timedelta(
                         seconds=self.settings.worker_lease_seconds
                     )
@@ -186,7 +198,7 @@ class Worker:
         async with self.session_factory() as session:
             await session.execute(
                 update(WebhookEvent)
-                .where(WebhookEvent.id == event_id, WebhookEvent.claimed_by == self.worker_id)
+                .where(WebhookEvent.id == event_id, WebhookEvent.claimed_by == self.claim_id)
                 .values(claimed_by=None, lease_expires_at=None)
             )
             await session.commit()
@@ -219,7 +231,7 @@ class Worker:
                 )
             await session.execute(
                 update(Case)
-                .where(Case.id == case_id, Case.claimed_by == self.worker_id)
+                .where(Case.id == case_id, Case.claimed_by == self.claim_id)
                 .values(claimed_by=None, lease_expires_at=backoff)
             )
             await session.commit()
@@ -242,7 +254,7 @@ class Worker:
                     Any,
                     await session.execute(
                         update(Case)
-                        .where(Case.id == case_id, Case.claimed_by == self.worker_id)
+                        .where(Case.id == case_id, Case.claimed_by == self.claim_id)
                         .values(lease_expires_at=expires)
                     ),
                 )
@@ -256,7 +268,7 @@ class Worker:
                     await session.execute(
                         update(WebhookEvent)
                         .where(
-                            WebhookEvent.id == event_id, WebhookEvent.claimed_by == self.worker_id
+                            WebhookEvent.id == event_id, WebhookEvent.claimed_by == self.claim_id
                         )
                         .values(lease_expires_at=expires)
                     ),
@@ -286,7 +298,7 @@ class Worker:
                             fresh,
                             self.devin,
                             self.settings,
-                            self.worker_id,
+                            self.claim_id,
                             self.base_commits,
                             capacity=self.capacity,
                         )
@@ -299,7 +311,7 @@ class Worker:
                             fresh_case,
                             self.devin,
                             self.settings,
-                            self.worker_id,
+                            self.claim_id,
                             self.base_commits,
                             github=self.github,
                             probes=self.probes,
@@ -366,87 +378,115 @@ class Worker:
         except InvalidTransition as exc:
             logger.warning("could not record failure for case %s: %s", case_id, exc)
 
-    async def _run_loop(self) -> None:
+    async def _run_loop(self, slot: int = 0) -> None:
+        _loop_slot.set(slot)
+        outage_backoff = self.settings.worker_poll_interval_seconds
         while not self.stop_event.is_set():
-            event = await self._claim_event()
-            case = None if event else await self._claim_case()
-            if not event and not case:
-                outbox_row = await self.outbox.claim()
-                if outbox_row is not None:
-                    await self.outbox.dispatch(outbox_row.id, outbox_row.case_id)
-                    continue
-                await self._reap_capacity()
-                await asyncio.sleep(self.settings.worker_poll_interval_seconds)
-                continue
             try:
-                await self._run_job(event, case)
-            except InvalidTransition as exc:
-                logger.info("case changed concurrently, abandoning job: %s", exc)
-                if event:
-                    async with self.session_factory() as session:
-                        fresh = await session.get(WebhookEvent, event.id)
-                        if fresh:
-                            fresh.status = EventStatus.PROCESSED
-                            fresh.last_error = str(exc)
-                            fresh.processed_at = datetime.now(UTC)
-                            if fresh.case_id:
-                                await self._cancel_unsent_attempts(session, fresh.case_id)
-                            await session.commit()
-                elif case:
-                    async with self.session_factory() as session:
-                        await self._cancel_unsent_attempts(session, case.id)
-                        await session.commit()
-                    await self._release_case(case.id)
-            except DBAPIError as exc:
-                if not is_transient_db_error(exc):
+                await self._iterate()
+            except (DBAPIError, OSError, asyncpg.PostgresConnectionError) as exc:
+                if isinstance(exc, DBAPIError) and not is_transient_db_error(exc):
                     raise
-                # Deadlock / serialization / connection loss: the job's transaction is
-                # already rolled back by the session context manager, nothing was
-                # committed half-way, and the failure says nothing about the case. Release
-                # the lease so another (or this) worker retries; attempts_count on webhook
-                # events still bounds the retries.
-                logger.warning(
-                    "job hit a transient database error, releasing for retry: %s",
-                    str(exc.orig or exc).splitlines()[0],
-                )
+                # Database unreachable (restart, failover, network partition) while claiming
+                # or releasing work. Leases expire on their own, nothing outside a committed
+                # transaction happened, so wait and try again rather than dying.
                 worker_transient_db_errors_total.inc()
-                if event:
-                    async with self.session_factory() as session:
-                        await session.execute(
-                            update(WebhookEvent)
-                            .where(WebhookEvent.id == event.id)
-                            .values(last_error=f"transient database error: {exc.orig!s}"[:2000])
-                        )
+                logger.warning(
+                    "database unavailable, retrying in %.1fs: %s",
+                    outage_backoff,
+                    str(exc).splitlines()[0],
+                )
+                await asyncio.sleep(outage_backoff)
+                outage_backoff = min(outage_backoff * 2, DB_OUTAGE_MAX_BACKOFF_SECONDS)
+            else:
+                outage_backoff = self.settings.worker_poll_interval_seconds
+
+    async def _iterate(self) -> None:
+        """One scheduling decision: claim an event, a case or an outbox row, run it, release."""
+        event = await self._claim_event()
+        case = None if event else await self._claim_case()
+        if not event and not case:
+            outbox_row = await self.outbox.claim()
+            if outbox_row is not None:
+                await self.outbox.dispatch(outbox_row.id, outbox_row.case_id)
+                return
+            await self._reap_capacity()
+            await asyncio.sleep(self.settings.worker_poll_interval_seconds)
+            return
+        try:
+            await self._run_job(event, case)
+        except InvalidTransition as exc:
+            logger.info("case changed concurrently, abandoning job: %s", exc)
+            if event:
+                async with self.session_factory() as session:
+                    fresh = await session.get(WebhookEvent, event.id)
+                    if fresh:
+                        fresh.status = EventStatus.PROCESSED
+                        fresh.last_error = str(exc)
+                        fresh.processed_at = datetime.now(UTC)
+                        if fresh.case_id:
+                            await self._cancel_unsent_attempts(session, fresh.case_id)
                         await session.commit()
-            except Exception as exc:
-                logger.exception("job failed")
-                if event:
-                    async with self.session_factory() as session:
-                        failed = await session.get(WebhookEvent, event.id)
-                        if failed:
-                            failed.status = EventStatus.FAILED
-                            failed.last_error = str(exc)
-                            failed.processed_at = datetime.now(UTC)
-                            if failed.case_id:
-                                await self._mark_failed(
-                                    session, failed.case_id, str(exc), self.worker_id
-                                )
-                            await session.commit()
-                elif case:
-                    async with self.session_factory() as session:
-                        await self._mark_failed(session, case.id, str(exc), self.worker_id)
+            elif case:
+                async with self.session_factory() as session:
+                    await self._cancel_unsent_attempts(session, case.id)
+                    await session.commit()
+                await self._release_case(case.id)
+        except DBAPIError as exc:
+            if not is_transient_db_error(exc):
+                raise
+            # Deadlock / serialization / connection loss: the job's transaction is
+            # already rolled back by the session context manager, nothing was
+            # committed half-way, and the failure says nothing about the case. Release
+            # the lease so another (or this) worker retries; attempts_count on webhook
+            # events still bounds the retries.
+            logger.warning(
+                "job hit a transient database error, releasing for retry: %s",
+                str(exc.orig or exc).splitlines()[0],
+            )
+            worker_transient_db_errors_total.inc()
+            if event:
+                async with self.session_factory() as session:
+                    await session.execute(
+                        update(WebhookEvent)
+                        .where(WebhookEvent.id == event.id)
+                        .values(last_error=f"transient database error: {exc.orig!s}"[:2000])
+                    )
+                    await session.commit()
+        except Exception as exc:
+            logger.exception("job failed")
+            if event:
+                async with self.session_factory() as session:
+                    failed = await session.get(WebhookEvent, event.id)
+                    if failed:
+                        failed.status = EventStatus.FAILED
+                        failed.last_error = str(exc)
+                        failed.processed_at = datetime.now(UTC)
+                        if failed.case_id:
+                            await self._mark_failed(
+                                session, failed.case_id, str(exc), self.claim_id
+                            )
                         await session.commit()
-            finally:
-                if event:
-                    await self._release_event_case(event.id)
-                    await self._release_event(event.id)
-                if case:
-                    await self._release_case(case.id)
+            elif case:
+                async with self.session_factory() as session:
+                    await self._mark_failed(session, case.id, str(exc), self.claim_id)
+                    await session.commit()
+        finally:
+            if event:
+                await self._release_event_case(event.id)
+                await self._release_event(event.id)
+            if case:
+                await self._release_case(case.id)
 
     async def run(self) -> None:
         tasks = [
-            asyncio.create_task(self._run_loop()) for _ in range(self.settings.worker_concurrency)
+            asyncio.create_task(self._run_loop(slot))
+            for slot in range(self.settings.worker_concurrency)
         ]
+        metrics_server = build_metrics_server(self.settings)
+        metrics_task = (
+            asyncio.create_task(metrics_server.serve()) if metrics_server is not None else None
+        )
         try:
             await self.stop_event.wait()
             try:
@@ -458,6 +498,9 @@ class Worker:
                     task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
         finally:
+            if metrics_server is not None and metrics_task is not None:
+                metrics_server.should_exit = True
+                await asyncio.gather(metrics_task, return_exceptions=True)
             await self.devin.aclose()
             await self.base_commits.aclose()
             await self.slack.aclose()

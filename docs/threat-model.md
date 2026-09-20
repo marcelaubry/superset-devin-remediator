@@ -1,4 +1,4 @@
-# Threat model (Phase 4: bounded triage, human-gated dispatch, verified remediation)
+# Threat model (Phase 5: bounded triage, human-gated dispatch, isolated verification)
 
 Assets: the Devin service-user API key, the Slack bot token and signing secret,
 the GitHub token, the database credentials, ACU spend, the operator dashboard,
@@ -15,9 +15,42 @@ Slack  ──signed action ──▶ API                     Worker ──▶ Sl
                                                    Worker ──▶ GitHub (label/comment, read pulls/
                                                              files/compare/timeline/check-runs)
 GitHub ──signed labeled webhook──▶ API  ⇒ REMEDIATION_APPROVED
-probes/ (git-tracked, reviewed) ──▶ Worker snapshot ──▶ ProbeRunner ──▶ isolated checkout
-                                                             of exact base/head SHA
+probes/ (git-tracked, reviewed) ──▶ Worker snapshot (hashes only)
+                                        │ HMAC-signed verifier.v2 request:
+                                        │ repo, 40-hex SHA, probe id, script+manifest hash
+                                        ▼
+                                   Verifier container (no credentials, ro root, no caps)
+                                        │ loads probe from its own ro registry mount,
+                                        │ refuses on hash mismatch
+                                        ▼
+                                   anonymous clone of the allowlisted repo @ exact SHA
 ```
+
+The verifier boundary (Phase 5):
+
+| Side | Holds | Never sees |
+| --- | --- | --- |
+| API / worker | every provider credential, database URL, operator token, the verifier HMAC key | repository code; there is no local probe runner |
+| verifier | the HMAC key (via Docker secret file), the read-only probe registry, anonymous network egress for `git clone` and package downloads | `.env`, the Docker socket, any `*_TOKEN`/`*_SECRET`/`*_API_KEY`/`DATABASE_URL`, the database network |
+
+The HMAC key is the single shared value. It authenticates *who may ask* the
+verifier to run an already-registered probe; it grants nothing else, and a
+verifier compromised by a malicious commit can only lie about verdicts for
+the repository it was already asked to run. The worker treats the verifier's
+answer as evidence, not authority: it checks the request id, repository, SHA,
+script hash and command identity of the response and refuses (infrastructure
+failure, never a pass) a verifier whose signed `/capabilities` show a
+credential, UID 0, writable root, missing tool or — with
+`PROBE_VERIFIER_REQUIRE_ISOLATION` (forced in live mode) — missing
+`no-new-privileges`, non-empty capability sets or absent cgroup PID/memory
+limits. Docker Desktop hosts that cannot present those cgroup facts therefore
+fail closed rather than being trusted with a weaker sandbox.
+
+Network egress from the verifier is required (dependencies are installed from
+registries by declared `setup` steps) and is *not* credential-bearing.
+Package lifecycle scripts execute as the verifier UID with the same access a
+malicious commit already has; the registry's `--ignore-scripts` guidance in
+[probes.md](probes.md) reduces, but does not remove, that surface.
 
 Slack has no path to Devin. The API never performs outbound HTTP for Slack or
 GitHub; the worker does, through the transactional outbox, and only to the
@@ -25,11 +58,10 @@ allowlisted repository / configured channel. Devin never talks to the
 remediator: its session output is read back and treated as a claim to be
 corroborated by GitHub and by the probe.
 
-The probe runner is a new boundary. It executes repository code (the probe
-script plus whatever the checked-out commit's test suite does), so the process
-that hosts it must hold no credentials. Phase 4 ships the runner and fails
-closed when that condition is not met; the credential-free verifier container
-is the Phase 5 production path (see [known-limitations.md](known-limitations.md)).
+The probe runner executes repository code (the probe script plus whatever the
+checked-out commit's test suite does), so the process that hosts it must hold
+no credentials. It lives only in the verifier container; remaining gaps are in
+[known-limitations.md](known-limitations.md).
 
 | Threat | Vector | Mitigation |
 | --- | --- | --- |
@@ -75,6 +107,16 @@ is the Phase 5 production path (see [known-limitations.md](known-limitations.md)
 | Untrusted content in Slack/GitHub | issue title, triage fields, rejection reason | Block Kit text is escaped (`&`, `<`, `>`) and truncated to Slack limits; raw issue body is never sent; rejection reasons come from a fixed select and are stripped of markup before rendering into Slack/GitHub. |
 | Delivery failure loses a decision | Slack/GitHub outage | Human decisions are stored before any HTTP. Slack failures never touch the triage result; GitHub failures move the case to `APPROVAL_DELIVERY_FAILED` with the approval intact, and `POST /operator/outbox/{id}/retry` re-queues without re-approval. Retries are bounded (`OUTBOX_MAX_ATTEMPTS`, exponential backoff) and terminal failures are visible with `last_error`. |
 | Fake-adapter data exposure | fake Slack messages contain tokens | `slack_fake_messages` is served only via the authenticated `/api/slack/fake/messages`; unauthenticated routes expose no Slack user ids, tokens, or case details. |
+| Forged verifier request or verdict | attacker on the internal network posts to `/probe`, or replays/mutates a captured request | Every `/probe` and `/capabilities` request is signed `HMAC-SHA256(key, timestamp.body)` with a ±300 s window; unsigned/mis-signed/stale requests are `401` before the body is parsed. `ProbeRequest` forbids unknown fields, requires an exact allowlisted `owner/name`, a 40-hex SHA and 64-hex hashes. A reused request id with different semantics is `409`; an exact repeat is answered from memory (`replayed`). The worker verifies the response echoes its request id, repository, SHA, script hash and command identity. |
+| Verifier asked to run attacker-chosen code | request carries a script body, a URL, or a path | The protocol has no field for script content or clone URL: the verifier resolves `<probe root>/<owner>/<repo>/<issue>/` from its own read-only mount, rejects symlinks and traversal, recomputes both hashes and refuses on mismatch; the clone URL is `VERIFIER_CLONE_URL_FORMAT` applied to the allowlisted repository, and `git remote get-url` plus `rev-parse HEAD` are re-checked after checkout. |
+| Unbounded concurrency / spend | webhook burst, two workers, retried claims | Capacity is a PostgreSQL lease table taken under an advisory transaction lock before any create intent: `MAX_CONCURRENT_TRIAGE`/`REMEDIATION`/`PROBES`, a per-repository remediation limit, resource-key mutexes, and the partial unique index for one unfinished attempt per (case, kind). Denied cases stay in their current state with `cases.waiting_for` set ("waiting for capacity" in the dashboard), no attempt row and no HTTP call. Leases are heartbeaten and expire after `CAPACITY_LEASE_GRACE_SECONDS`; a cancel keeps the lease until remote termination is confirmed. |
+| Oversized or malformed request bodies | multi-megabyte webhook, chunked flood | Raw ASGI `BodySizeLimitMiddleware` rejects declared or streamed bodies above `MAX_REQUEST_BODY_BYTES` with `413` before FastAPI parses anything; the verifier applies its own 64 KiB limit. |
+| CSRF against the operator session | hostile page posts to `/operator/...` with the cookie | Cookie-authenticated mutations must present a same-origin `Sec-Fetch-Site` or an `Origin`/`Referer` matching the request host or `OPERATOR_CSRF_TRUSTED_ORIGINS`; bearer-token requests are exempt. Session cookies are `HttpOnly`, `SameSite=Strict`, `Secure` behind TLS. |
+| Operator-action abuse | scripted retry/cancel storm with a valid token | Token-bucket limiter (`OPERATOR_RATE_LIMIT_PER_MINUTE`) on mutation routes returns `429` + `Retry-After`; rejections are counted in `operator_requests_rejected_total{reason}`. |
+| SSRF via configuration | provider base URL pointing at loopback, private ranges or cloud metadata | `non_public_service_host` rejects loopback/private/link-local/metadata hosts for Devin/GitHub/Slack bases in live mode; `unsafe_service_url` rejects non-http(s), embedded credentials, query/fragment for every service base; repository names are validated `owner/name` and never used to build URLs from request input. |
+| Secret leakage through errors | nested exceptions, HTTP error bodies, `str(exc)` in logs or the dashboard | `Settings.secret_values` includes every configured secret plus the database password and `user:password`; `SettingsRedactingFilter` scrubs every log record (message, args and `%r` of chained causes) and provider clients scrub HTTP error text; tests raise a nested `HTTPStatusError` carrying the secret and assert only `[REDACTED]` reaches the log. |
+| Unsafe links in Slack/dashboard | `javascript:`/`data:` URLs from Devin output or PR metadata | `safe_href` allows only absolute http(s) URLs without whitespace/control characters; everything else renders as text. |
+| Metric label cardinality / data exposure | issue numbers, session ids, PR URLs as labels | Labels are fixed enums (`mode`, `kind`, `state`, `outcome`, `provider`, `reason`); no identifier is ever a label and `/metrics` requires the operator token. |
 
 ## Residual risks
 
@@ -98,8 +140,15 @@ is the Phase 5 production path (see [known-limitations.md](known-limitations.md)
   protection on the default branch and a review requirement remain necessary.
 - Probe scripts run whatever the checked-out commit's tooling does. A
   malicious PR head can therefore execute code inside the verifier. This is
-  acceptable only in the credential-free, network-restricted verifier
-  container; it is the reason the in-worker local runner fails closed.
+  acceptable only in the credential-free verifier container; it is the reason
+  the in-worker local runner fails closed. Egress from the verifier is open
+  (see known limitations): the blast radius is the verifier's own workspace
+  and outbound bandwidth, never a credential.
+- The verifier HMAC key lives in a git-ignored file on the host and in the
+  worker's `.env`; rotate both together and restart both services.
+- Verifier idempotency is process-local. A restart re-executes an unknown
+  request id (deterministically) rather than answering from disk, so the
+  cost of a lost answer is one extra probe run, never a fabricated verdict.
 - `compare` ancestry and timeline cross-references depend on GitHub's
   eventual consistency; transient errors are retried with the case lease, and
   a persistent disagreement is a verification failure rather than a pass.

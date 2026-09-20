@@ -107,6 +107,7 @@ async def case_json(
         "devin_session_url": case.devin_session_url,
         "pr_url": case.pr_url,
         "ci_status": case.ci_status,
+        "waiting_for": case.waiting_for,
         "attempts": [_attempt_json(attempt) for attempt in case.attempts],
         "approval": approval_json(case),
         "remediation": remediation_json(case),

@@ -86,6 +86,9 @@ class Settings(BaseSettings):
     worker_concurrency: int = 2
     worker_lease_seconds: int = 300
     worker_shutdown_timeout_seconds: int = 30
+    # Worker-process counters/histograms are served here (operator token); 0 disables.
+    worker_metrics_port: int = 8001
+    worker_metrics_host: str = "0.0.0.0"
     event_max_attempts: int = 3
     reconcile_retry_delay_seconds: float = 1.0
     reconcile_max_attempts: int = 3

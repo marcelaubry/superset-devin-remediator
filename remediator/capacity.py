@@ -64,7 +64,7 @@ class CapacityLimits:
             return self.remediation
         if kind is CapacityLeaseKind.PROBE:
             return self.probes
-        return 1  # RESOURCE keys are mutual-exclusion locks
+        return 0  # RESOURCE keys have no global limit; each key is a per-scope mutex
 
 
 @dataclass(frozen=True)
@@ -180,10 +180,13 @@ class CapacityManager:
             existing.released_at = now
             existing.release_reason = "lease expired before renewal"
             await session.flush()
+        if kind is CapacityLeaseKind.RESOURCE:
+            per_scope_limit = 1
         limit = self.limits.for_kind(kind)
-        total = await self.in_use(session, kind)
-        if total >= limit and not force:
-            return CapacityDenied(kind, "", limit, total)
+        if limit and not force:
+            total = await self.in_use(session, kind)
+            if total >= limit:
+                return CapacityDenied(kind, "", limit, total)
         if per_scope_limit is not None and scope and not force:
             scoped = await self.in_use(session, kind, scope)
             if scoped >= per_scope_limit:

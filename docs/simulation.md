@@ -23,7 +23,14 @@ uv run python scripts/simulate.py --scenario phase3
 uv run python scripts/simulate.py --scenario phase4
 uv run python scripts/simulate.py --scenario remediate       # any single Phase 4 scenario
 uv run python scripts/simulate.py --scenario good --bad-signature
+uv run python scripts/simulate.py --scenario phase5              # Phase 5 concurrency
+uv run python scripts/simulate.py --scenario concurrency-20
 ```
+
+`all` now includes `phase5`. Every scenario talks only to the compose stack's
+fake Devin/GitHub/Slack adapters (or the real-Slack/fake-GitHub/fake-Devin
+mix if `.env` says so); nothing creates a paid session or mutates a real
+repository.
 
 Phase 4 scenario names: `remediate`, `remediate-base-passes`,
 `remediate-probe-infra`, `remediate-head-fails`, `remediate-forbidden-files`,
@@ -95,6 +102,28 @@ delivery, missing approval and stale triage hash, missing/altered probe
 manifest or script, manual retry and concurrent retries producing one
 attempt, and a worker restart (re-claim) in every remediation state.
 
+## Phase 5 walkthrough (`concurrency-20`, issues 5200–5219)
+
+1. Reads `capacity_limit{kind="triage"}` from `/metrics` (default 2).
+2. Posts twenty eligible `issues/opened` deliveries at once.
+3. Polls `active_jobs{kind="triage"}` and `cases_waiting_for_capacity` every
+   0.5 s while the cases drain, recording the peaks.
+4. Asserts: all twenty left `RECEIVED`/`TRIAGING`; peak active triage never
+   exceeded the limit; at least one case was parked; no issue has more than
+   one triage attempt (i.e. no duplicate fake sessions). Prints the number of
+   triage sessions and `capacity_denied_total`.
+
+The limit is only contended when the worker has more loops than triage slots:
+run with `WORKER_CONCURRENCY=4` (or raise `MAX_CONCURRENT_TRIAGE` to see
+bounded parallelism at the new limit), `docker compose up -d worker`, reset the
+database and re-run. With `WORKER_CONCURRENCY <= MAX_CONCURRENT_TRIAGE` the
+parking check is reported as not exercised rather than passed. The
+remaining Phase 5 fault exercises (provider 429/5xx, database restart,
+worker crash mid-create and mid-probe, verifier restart, outbox backlog, CI
+timeout, concurrent operator retry/cancel, stale leases) run against real
+PostgreSQL in `tests/integration/test_phase5_faults.py`,
+`test_capacity.py`, `test_worker_loop.py` and `tests/test_probe_runner.py`.
+
 ## Running the checks the PR ran
 
 ```bash
@@ -104,4 +133,5 @@ uv run pytest -q                                   # needs the compose Postgres
 DATABASE_URL=... uv run alembic downgrade base && uv run alembic upgrade head
 docker compose down -v && docker compose build && docker compose up -d
 uv run python scripts/simulate.py --scenario all --wait
+make audit                                         # pip-audit, trivy, gitleaks
 ```

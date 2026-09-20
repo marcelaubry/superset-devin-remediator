@@ -44,6 +44,8 @@ services:
       # Same key the verifier reads from its secret file; the worker gets it via .env.
       # PROBE_VERIFIER_SHARED_SECRET is the only value shared across the trust boundary.
     command: python -m remediator.worker
+    ports:
+      - "8001:8001"  # worker-process metrics (operator token), see docs/metrics.md
     stop_grace_period: 40s
     depends_on:
       migrate:

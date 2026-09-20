@@ -150,6 +150,26 @@ async def test_get_retries_transient_failures_with_backoff() -> None:
 
 
 @pytest.mark.asyncio
+async def test_get_honours_retry_after_on_429_and_caps_it() -> None:
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(429, headers={"Retry-After": "7"}, text="slow down")
+        if attempts == 2:
+            return httpx.Response(429, headers={"Retry-After": "86400"}, text="slow down")
+        return httpx.Response(200, json=_session_payload(status="running", status_detail="working"))
+
+    client = _client(handler, max_retries=3)
+    await client.get_session("devin-abc")
+    await client.aclose()
+    assert attempts == 3
+    assert client.sleeps == [7.0, 60.0]  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
 async def test_get_gives_up_after_bounded_retries() -> None:
     attempts = 0
 

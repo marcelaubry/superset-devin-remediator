@@ -30,8 +30,12 @@ GitHub issue opened
 → ready for human review (never auto-merged, issue never auto-closed)
 ```
 
-Phase 4 (this release) adds the remediation session and the independent
-evidence chain behind it. Structured output, a PR URL, or session exit are
+Phase 5 (this release) moves probe execution out of every credential-bearing
+process into an HMAC-authenticated, isolated verifier service, adds
+database-backed concurrency and spend limits, authenticated low-cardinality
+metrics, optional official ACU reporting, a read-only live-readiness command
+and request-level hardening. Phase 4 added the remediation session and the
+independent evidence chain behind it. Structured output, a PR URL, or session exit are
 evidence, never authority: the case reaches `PR_VALIDATED` only after GitHub
 corroborates the PR and the immutable probe passes at the exact head SHA, and
 `CI_PASSED` only after GitHub's check runs for that SHA succeed. Every failed
@@ -123,21 +127,62 @@ spend zero ACUs.
   checks never pass, `GITHUB_REQUIRED_CHECKS` names the required ones.
   `CI_PASSED` still requires human PR review; nothing merges or closes.
 - Repository code executes in exactly one place: the **verifier container**
-  (`docker/verifier/Dockerfile`, `remediator.verifier`). It holds no
-  application credential (no `env_file`, never imports `remediator.config`),
-  runs as a dedicated non-root UID on a read-only root filesystem with a bounded
-  `/tmp`, `cap_drop: ALL`, `no-new-privileges`, PID/memory limits and its own
-  network, and ships git/bash/python3/node/npm/yarn for probe runtimes. The
-  worker only ever uses `PROBE_RUNNER_MODE=fake` (simulation) or `remote`, and
-  before each probe checks the verifier's `/health`: any visible credential,
-  UID 0 or a writable root makes the run an *infrastructure* failure, never a
-  verdict. There is no worker-side `local` mode. Inside the verifier the runner
-  clones the exact commit, runs the snapshotted script with
-  `create_subprocess_exec` (no shell), a minimal environment, rlimits, a deadline
-  that covers process exit (not just output), and kills every descendant carrying
-  the run marker (including `setsid` escapees) before removing the workspace.
-  See [docs/probes.md](docs/probes.md), [docs/threat-model.md](docs/threat-model.md)
+  (`docker/verifier/Dockerfile`, `remediator.verifier`).
+
+  ```text
+  API / worker (Devin, GitHub, Slack, operator, DB credentials)
+      │  HMAC-SHA256 signed verifier.v2 request:
+      │  repository, exact 40-hex SHA, probe id, script + manifest hashes
+      │  (never the script, never a URL, never a credential)
+      ▼
+  verifier (only secret: the HMAC key; read-only probe registry mount)
+      │  allowlist + hash check → anonymous clone of the exact SHA →
+      │  manifest setup argv (npm ci …) → probe.sh, no shell
+      ▼
+  bounded evidence: exit code, duration, stdout/stderr, tool versions,
+  infrastructure-vs-product class
+  ```
+
+  The verifier has no `.env`, no Docker socket, no provider or database
+  credential and never imports `remediator.config`; it runs as a dedicated
+  non-root UID on a read-only root filesystem with a bounded `/tmp`,
+  `cap_drop: ALL`, `no-new-privileges`, PID/memory/CPU limits and its own
+  network, and ships pinned Git, Bash, Python 3, Node 24, npm and Yarn for the
+  Superset frontend probes. The worker only ever uses `PROBE_RUNNER_MODE=fake`
+  (simulation) or `remote`; before each probe it reads `/capabilities` and any
+  visible credential, UID 0, writable root, missing tool or (in live mode)
+  unproven isolation property makes the run an *infrastructure* failure, never
+  a verdict. Requests carry a request id and are idempotent per verifier
+  process. Dependency installs may reach the network (the verifier holds no
+  customer secret); cache keys include the lockfile hash, runtime versions and
+  repository identity, and cache contents can never decide a verdict. See
+  [docs/probes.md](docs/probes.md), [docs/threat-model.md](docs/threat-model.md)
   and [docs/known-limitations.md](docs/known-limitations.md).
+- **Concurrency and spend:** `MAX_CONCURRENT_TRIAGE`,
+  `MAX_CONCURRENT_REMEDIATION`, `MAX_CONCURRENT_PROBES`, a per-repository
+  remediation limit, one active remediation per case and manifest
+  `resource_keys` are PostgreSQL leases shared by every worker. A case that
+  finds a limit full is parked at zero ACUs and retried; leases heartbeat,
+  expire and reconcile after crashes; cancel keeps the slot until Devin
+  confirms termination. See [docs/concurrency.md](docs/concurrency.md).
+- **Metrics:** `GET /metrics` (operator token) exposes low-cardinality
+  Prometheus series labelled `mode="live"` or `mode="simulated"`; session
+  completion, accepted output, PR discovered, PR validated, probe passed and
+  CI passed are separate milestones. See [docs/metrics.md](docs/metrics.md).
+- **ACU reporting:** optional (`DEVIN_ACU_REPORTING_ENABLED`) read of the
+  official consumption endpoint; 401/403/404, unsupported plans or transport
+  errors show `Unavailable`, never an estimate, and never fail a remediation.
+- **Readiness:** `make readiness` runs a read-only redacted pass/fail report
+  (config placeholders, database/migrations, Devin identity and session-list
+  permission, GitHub identity/default branch/labels/permissions, Slack
+  identity/channel/approvers, verifier isolation and Node capability, webhook
+  base URL, allowlists, limits). `make readiness-mutating` additionally posts a
+  Slack test message. See [docs/readiness.md](docs/readiness.md).
+- **Request hardening:** body-size limit (`413`), Origin/CSRF checks and a
+  rate limit on operator mutations, security headers, SSRF validation of
+  provider/verifier URLs, secret redaction in nested errors, allowlisted-host
+  URL rendering in Slack and the dashboard. `make audit` runs pip-audit, Trivy
+  and gitleaks.
 - Slack updates for every milestone (queued/running, session link, PR found,
   probe base/head, CI state, failure/blocked reason, "Ready for human review")
   go through the same outbox and never change remediation state.
@@ -263,7 +308,19 @@ failed termination, concurrent retries, and worker restart in every state.
 | `DEVIN_REMEDIATION_TIMEOUT_SECONDS` | `5400` | Absolute remediation deadline; final GET then `DELETE`; live mode enforces `>= 600` |
 | `DEVIN_REMEDIATION_BRANCH_PREFIX` | `devin/` | Required prefix of the PR head branch |
 | `PROBE_RUNNER_MODE` | `fake` | `fake` (deterministic by issue number) or `remote` (credential-free verifier container); the worker has no `local` mode |
-| `PROBE_VERIFIER_URL` | *(unset)* | Verifier base URL, required with `remote`; the worker refuses a verifier whose `/health` shows credentials, UID 0 or a writable root. One probe runs at a time per verifier (`409` while busy → retried) |
+| `PROBE_VERIFIER_URL` | *(unset)* | Verifier base URL, required with `remote`; the worker refuses a verifier whose `/capabilities` shows credentials, UID 0, a writable root or a missing tool. One probe runs at a time per verifier (`409` while busy → retried) |
+| `PROBE_VERIFIER_SHARED_SECRET` | unset | HMAC key (>= 32 chars) shared only with the verifier; required with `remote`. Mounted into the verifier as a Docker secret from `docker/secrets/verifier_hmac_key` |
+| `PROBE_VERIFIER_REQUEST_TIMEOUT_SECONDS` | `30` | HTTP timeout for capability checks (probe requests use the probe timeout) |
+| `PROBE_VERIFIER_REQUIRE_ISOLATION` | `true` | Refuse a verifier that cannot prove `no-new-privileges`, empty capability sets and cgroup limits; forced on in live mode |
+| `MAX_CONCURRENT_TRIAGE` / `MAX_CONCURRENT_REMEDIATION` / `MAX_CONCURRENT_PROBES` | `2` / `1` / `1` | Global lease limits shared by all workers |
+| `MAX_CONCURRENT_REMEDIATION_PER_REPOSITORY` | `1` | Remediation leases per repository |
+| `CAPACITY_WAIT_BACKOFF_SECONDS` | `5` | Re-check delay for a case parked on a full limit |
+| `CAPACITY_LEASE_GRACE_SECONDS` | `600` | Lease expiry without heartbeat (crashed worker) |
+| `MAX_REQUEST_BODY_BYTES` | `1048576` | Requests larger than this get `413` before parsing |
+| `OPERATOR_RATE_LIMIT_PER_MINUTE` | `60` | Per-client limit on operator mutations |
+| `OPERATOR_CSRF_TRUSTED_ORIGINS` | *(empty)* | Extra Origins allowed for cookie-authenticated mutations |
+| `PUBLIC_BASE_URL` | *(empty)* | Externally reachable API base (webhook/tunnel), checked by readiness |
+| `DEVIN_ACU_REPORTING_ENABLED` | `false` | Read official per-session ACU consumption; `Unavailable` on any failure |
 | `PROBE_ROOT` | `probes` | Immutable probe registry root; must exist in live mode |
 | `PROBE_TIMEOUT_SECONDS` | `900` | Upper bound for one probe run (manifest may be shorter) |
 | `PROBE_MAX_OUTPUT_BYTES` | `65536` | Per-stream stdout/stderr capture cap |
@@ -307,8 +364,9 @@ additionally requires `GITHUB_CLIENT_MODE=live`, `PROBE_RUNNER_MODE=remote`
 with a `PROBE_VERIFIER_URL`, an existing `PROBE_ROOT`, a remediation timeout
 `>= 600`, and a CI poll interval `>= 30`, so a real session can never be
 verified by fake evidence or by a probe running next to the credentials. The
-setting alone is not trusted: the worker re-checks the verifier's `/health`
-before every single probe.
+setting alone is not trusted: the worker re-checks the verifier's
+`/capabilities` before every single probe. Run `make readiness` before
+switching any mode to live; it never creates a session or mutates a repository.
 
 A live session is never left without a local owner: worker errors, operator
 cancel (including mid-poll), and retries all go through `TERMINATION_PENDING`
@@ -423,7 +481,13 @@ remediator/
                    mapping, Draft 7 triage + remediation schemas, versioned
                    prompts (triage_v1, remediation_v1), tags, pull_requests[]
   probes/          Immutable probe registry loader/validator, ProbeRunner
-                   protocol, fake + local (isolated clone) runners
+                   protocol, fake + remote (signed verifier request) runners
+  verifier/        Credential-free verifier service: verifier.v2 protocol,
+                   capabilities, isolated clone/setup/probe execution
+  capacity.py      PostgreSQL capacity leases (concurrency + resource keys)
+  metrics.py       Low-cardinality Prometheus metrics
+  readiness.py     Read-only live-readiness command
+  safe_urls.py     Allowlisted URL rendering and SSRF validators
   fixtures.py      Deterministic fake scenario selection by issue number
   github_refs.py   Base commit SHA resolution (GitHub API or fake)
   github/          Webhook signature verification; fake + live issues client
@@ -442,7 +506,8 @@ remediator/
   rubric.py        Pure deterministic issue evaluation
 alembic/            0001 schema, 0002 Phase 2 attempts, 0003 Phase 3 approvals/outbox,
                     0004 Phase 4 remediation states, probe snapshots/executions,
-                    PR evidence, CI snapshots
+                    PR evidence, CI snapshots, 0005 attempt ordinal,
+                    0006 Phase 5 capacity leases
 fixtures/github/    Simulation webhook payloads
 probes/             Immutable probe registry (probe.yaml + probe.sh per issue)
 scripts/            Endpoint-only simulator, register_probe.py
@@ -451,6 +516,9 @@ docs/architecture.md
 docs/threat-model.md
 docs/probes.md           Probe authoring guide
 docs/simulation.md       Simulation guide
+docs/concurrency.md      Capacity leases and queueing behaviour
+docs/metrics.md          Metric definitions
+docs/readiness.md        Live-readiness runbook and minimal permissions
 docs/known-limitations.md
 ```
 
@@ -471,12 +539,14 @@ retries produce exactly one new attempt.
 
 ## Scope
 
-Phase 4 stops at `CI_PASSED` / "Ready for human review". It never merges,
+The pipeline stops at `CI_PASSED` / "Ready for human review". It never merges,
 never closes the issue, never asks Devin to fix a failing probe or CI, and
 never trusts Devin-reported probe results. See
 [docs/architecture.md](docs/architecture.md) for component boundaries,
 lifecycle semantics, and status mapping;
 [docs/threat-model.md](docs/threat-model.md) for the spend, secret, and probe
 isolation boundaries; and [docs/known-limitations.md](docs/known-limitations.md)
-for what remains for Phase 5 (notably enforced egress control and
-authentication for the verifier link).
+for what remains (notably enforced verifier egress, TLS on the internal
+verifier link, and unresolved Debian base-image CVEs). `MERGED` and
+`MERGE_VERIFIED` stay documented future states; nothing files regression
+issues automatically.
