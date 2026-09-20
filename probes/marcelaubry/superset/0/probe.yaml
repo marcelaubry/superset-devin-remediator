@@ -1,0 +1,30 @@
+schema_version: probe.v1
+repository: marcelaubry/superset
+issue_number: 0
+base_sha: 7b6dd7597c4af49f7f0571b7b33dd247f382218b
+script: probe.sh
+script_sha256: 11e09114e0a71ea28e2db1a92ba78233b4c9f769b0d746a8839cbadc57c7c0d0
+expected_exit_codes:
+  base: 0
+  head: 1
+timeout_seconds: 1800
+runtime:
+  tools:
+  - bash
+  - node
+  - npm
+description: 'Verifier smoke probe for the controlled-canary fork: install superset-frontend
+  with npm ci --ignore-scripts and run one real Jest test at the pinned SHA (the master
+  tip verified before the canary). Never a remediation case; readiness --verifier-smoke
+  runs it against BASE only.'
+setup:
+- - npm
+  - ci
+  - --ignore-scripts
+  - --no-audit
+  - --no-fund
+  - --prefix
+  - superset-frontend
+setup_timeout_seconds: 2400
+cache_inputs:
+- superset-frontend/package-lock.json

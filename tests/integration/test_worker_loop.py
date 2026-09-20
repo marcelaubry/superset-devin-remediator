@@ -5,7 +5,7 @@ import asyncpg
 import pytest
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql.asyncpg import AsyncAdapt_asyncpg_dbapi
-from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import remediator.worker as worker_module
@@ -450,3 +450,57 @@ async def test_sibling_loops_in_one_process_cannot_release_each_others_case_leas
     finally:
         worker_module._loop_slot.set(None)
         await worker.engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_run_exits_with_the_error_when_a_loop_dies_on_a_non_transient_failure(
+    test_database_url: str,
+) -> None:
+    """A loop that raises something `_run_loop` does not retry (schema drift, programming
+    error) must take the process down so the supervisor restarts it, instead of leaving a
+    live-looking container with no loop claiming work."""
+    worker = Worker(
+        Settings(
+            database_url=test_database_url,
+            worker_poll_interval_seconds=0.01,
+            worker_concurrency=2,
+            worker_shutdown_timeout_seconds=2,
+            worker_metrics_port=0,
+        )
+    )
+    iterations = 0
+
+    async def failing_iterate() -> None:
+        nonlocal iterations
+        iterations += 1
+        if iterations == 1:
+            raise ProgrammingError("SELECT 1", {}, Exception('relation "cases" does not exist'))
+        await asyncio.sleep(0.01)
+
+    worker._iterate = failing_iterate  # type: ignore[method-assign]
+    with pytest.raises(ProgrammingError):
+        await asyncio.wait_for(worker.run(), timeout=5)
+    assert worker.stop_event.is_set()
+
+
+@pytest.mark.asyncio
+async def test_run_returns_cleanly_on_stop(test_database_url: str) -> None:
+    worker = Worker(
+        Settings(
+            database_url=test_database_url,
+            worker_poll_interval_seconds=0.01,
+            worker_concurrency=1,
+            worker_metrics_port=0,
+        )
+    )
+
+    async def idle_iterate() -> None:
+        await asyncio.sleep(0.01)
+
+    worker._iterate = idle_iterate  # type: ignore[method-assign]
+
+    async def stop_soon() -> None:
+        await asyncio.sleep(0.05)
+        worker.stop()
+
+    await asyncio.wait_for(asyncio.gather(worker.run(), stop_soon()), timeout=5)

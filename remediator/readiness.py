@@ -32,7 +32,16 @@ from pydantic import SecretStr, ValidationError
 from sqlalchemy import text
 
 from .adapters import SettingsRedactingFilter
-from .config import MIN_LIVE_SECRET_LENGTH, PLACEHOLDER_SECRET, Settings, unsafe_service_url
+from .config import (
+    CANARY_CONCURRENCY_LIMIT,
+    DEFAULT_DEVIN_REPOS_FORMAT,
+    MIN_LIVE_SECRET_LENGTH,
+    PLACEHOLDER_SECRET,
+    Settings,
+    format_devin_repo,
+    repos_format_problem,
+    unsafe_service_url,
+)
 from .db import build_engine
 from .devin.live import LiveDevinClient
 from .github.client import GitHubApiError, LiveGitHubClient
@@ -174,7 +183,25 @@ async def check_repository_allowlist(settings: Settings, probes: Probes) -> list
     if bad:
         return [CheckResult("allowlist.repositories", "fail", f"not owner/name: {bad}")]
     results = [CheckResult("allowlist.repositories", "pass", ", ".join(repos))]
-    if not settings.github_required_label and settings.github_live:
+    label = settings.github_required_label.strip()
+    if label:
+        results.append(
+            CheckResult(
+                "allowlist.required_label",
+                "pass",
+                f"intake label {label!r}; remediation label {settings.github_remediation_label!r}",
+            )
+        )
+    elif settings.live_mode:
+        results.append(
+            CheckResult(
+                "allowlist.required_label",
+                "fail",
+                "GITHUB_REQUIRED_LABEL is empty while Devin is live: every opened issue would "
+                "spend ACUs on triage",
+            )
+        )
+    elif settings.github_live:
         results.append(
             CheckResult(
                 "allowlist.required_label",
@@ -183,6 +210,37 @@ async def check_repository_allowlist(settings: Settings, probes: Probes) -> list
             )
         )
     return results
+
+
+async def check_canary(settings: Settings, probes: Probes) -> list[CheckResult]:
+    """The controlled-canary envelope (`LIVE_CANARY=true`): reported here so an operator sees
+    every deviation at once; `Settings` refuses to start on the same list."""
+    violations = settings.canary_violations
+    if not settings.live_canary:
+        if settings.live_mode:
+            return [
+                CheckResult(
+                    "canary.envelope",
+                    "warn",
+                    "LIVE_CANARY is off while Devin is live"
+                    + (f"; would fail: {'; '.join(violations)}" if violations else ""),
+                )
+            ]
+        return [CheckResult("canary.envelope", "skip", "LIVE_CANARY=false")]
+    if violations:
+        return [CheckResult("canary.envelope", "fail", "; ".join(violations))]
+    (repository,) = settings.allowed_repositories
+    return [
+        CheckResult(
+            "canary.envelope",
+            "pass",
+            f"repository={repository} intake={settings.github_required_label} "
+            f"remediation={settings.github_remediation_label} "
+            f"concurrency={CANARY_CONCURRENCY_LIMIT} modes="
+            f"devin:{settings.devin_client_mode}/github:{settings.github_client_mode}/"
+            f"slack:{settings.slack_client_mode}/probes:{settings.probe_runner_mode}",
+        )
+    ]
 
 
 async def check_limits(settings: Settings, probes: Probes) -> list[CheckResult]:
@@ -221,6 +279,14 @@ async def check_limits(settings: Settings, probes: Probes) -> list[CheckResult]:
         status = "warn"
         acu += "; remediation ACU cap above 50"
     results.append(CheckResult("limits.acu", status, acu))
+    if settings.live_mode and any(v > CANARY_CONCURRENCY_LIMIT for v in limits.values()):
+        results.append(
+            CheckResult(
+                "limits.canary",
+                "warn",
+                f"a first live run should keep every limit at {CANARY_CONCURRENCY_LIMIT}",
+            )
+        )
     return results
 
 
@@ -241,6 +307,17 @@ async def check_public_url(settings: Settings, probes: Probes) -> list[CheckResu
     if any_live and parsed.hostname in {"localhost", "127.0.0.1", "::1"}:
         return [CheckResult("webhook.base_url", "fail", f"{source} points at loopback")]
     results = [CheckResult("webhook.base_url", "pass", f"{source}={url}")]
+    if any_live and not settings.cookie_secure:
+        results.append(
+            CheckResult(
+                "dashboard.cookie_secure",
+                "fail",
+                "COOKIE_SECURE=false with live providers: operator cookies would travel "
+                "without the Secure flag",
+            )
+        )
+    elif any_live:
+        results.append(CheckResult("dashboard.cookie_secure", "pass", "COOKIE_SECURE=true"))
     try:
         async with httpx.AsyncClient(timeout=10.0, transport=probes.public) as client:
             response = await client.get(f"{url.rstrip('/')}/health")
@@ -302,7 +379,10 @@ async def check_database(settings: Settings, probes: Probes) -> list[CheckResult
 
 async def check_devin(settings: Settings, probes: Probes) -> list[CheckResult]:
     if not settings.live_mode:
-        return [CheckResult("devin.identity", "skip", "DEVIN_CLIENT_MODE=fake")]
+        return [
+            CheckResult("devin.identity", "skip", "DEVIN_CLIENT_MODE=fake"),
+            _repos_format_result(settings),
+        ]
     if settings.devin_api_key is None or not settings.devin_org_id:
         return [CheckResult("devin.identity", "fail", "DEVIN_API_KEY / DEVIN_ORG_ID missing")]
     problem = unsafe_service_url(settings.devin_api_base_url)
@@ -344,6 +424,7 @@ async def check_devin(settings: Settings, probes: Probes) -> list[CheckResult]:
             )
         else:
             results.append(CheckResult("devin.list_sessions", "pass", f"listed {count} session(s)"))
+        results.extend(await _devin_repository_results(settings, client))
         if settings.devin_acu_reporting_enabled:
             results.append(
                 CheckResult(
@@ -355,6 +436,62 @@ async def check_devin(settings: Settings, probes: Probes) -> list[CheckResult]:
             )
     finally:
         await client.aclose()
+    return results
+
+
+def _repos_format_result(settings: Settings) -> CheckResult:
+    fmt = settings.devin_repos_format
+    if problem := repos_format_problem(fmt):
+        return CheckResult("devin.repos_format", "fail", f"DEVIN_REPOS_FORMAT {problem}")
+    if fmt != DEFAULT_DEVIN_REPOS_FORMAT:
+        return CheckResult(
+            "devin.repos_format",
+            "warn",
+            f"{fmt!r} differs from the owner/repo path default {DEFAULT_DEVIN_REPOS_FORMAT!r}",
+        )
+    return CheckResult("devin.repos_format", "pass", f"{fmt!r} (owner/repo path)")
+
+
+def _repo_path_matches(candidate: str, repository: str) -> bool:
+    tail = candidate.strip().lower().removesuffix(".git")
+    return tail == repository or tail.endswith("/" + repository)
+
+
+async def _devin_repository_results(
+    settings: Settings, client: LiveDevinClient
+) -> list[CheckResult]:
+    """Read-only contract evidence for `repos[]`: the organization's repository listing must
+    know every allowlisted repository under the exact path the worker will send."""
+    results = [_repos_format_result(settings)]
+    for repository in sorted(settings.allowed_repositories):
+        sent = format_devin_repo(settings.devin_repos_format, repository)
+        name = f"devin.repository_access[{repository}]"
+        try:
+            paths = await client.list_repositories_probe(repository)
+        except Exception as exc:  # noqa: BLE001 - beta endpoint, permission-dependent
+            results.append(
+                CheckResult(
+                    name,
+                    "warn",
+                    f"repository listing unavailable ({exc.__class__.__name__}); "
+                    f"repos[] will carry {sent!r} unverified",
+                )
+            )
+            continue
+        matches = sorted({p for p in paths if _repo_path_matches(p, repository)})
+        if matches:
+            results.append(
+                CheckResult(name, "pass", f"listed as {', '.join(matches)}; repos[] sends {sent!r}")
+            )
+        else:
+            results.append(
+                CheckResult(
+                    name,
+                    "fail",
+                    f"not in the organization's repository listing; a session with "
+                    f"repos=[{sent!r}] would not have the fork attached",
+                )
+            )
     return results
 
 
@@ -400,6 +537,7 @@ async def check_github(settings: Settings, probes: Probes) -> list[CheckResult]:
                     f"default={default_branch or '?'} configured={settings.github_base_ref}",
                 )
             )
+            results.append(await _base_sha_result(settings, client, repo))
             if perms:
                 can_read = bool(perms.get("pull"))
                 can_write = bool(perms.get("push"))
@@ -436,6 +574,28 @@ async def check_github(settings: Settings, probes: Probes) -> list[CheckResult]:
     finally:
         await client.aclose()
     return results
+
+
+async def _base_sha_result(settings: Settings, client: LiveGitHubClient, repo: str) -> CheckResult:
+    """Resolve the live tip of GITHUB_BASE_REF (what a session would pin right now) and, when
+    GITHUB_BASE_SHA_REFERENCE is set, say whether it still equals the last verified SHA."""
+    name = f"github.base_sha[{repo}]"
+    try:
+        sha = await client.resolve_ref(repo, settings.github_base_ref)
+    except GitHubApiError as exc:
+        return CheckResult(name, "fail", f"cannot resolve {settings.github_base_ref}: {exc}")
+    reference = settings.github_base_sha_reference.strip().lower()
+    detail = f"{settings.github_base_ref}={sha}"
+    if not reference:
+        return CheckResult(name, "pass", detail + " (no GITHUB_BASE_SHA_REFERENCE to compare)")
+    if sha == reference:
+        return CheckResult(name, "pass", detail + " equals GITHUB_BASE_SHA_REFERENCE")
+    return CheckResult(
+        name,
+        "warn",
+        detail + f" differs from verified {reference[:12]}: re-check probe manifests and "
+        "the smoke result before approving",
+    )
 
 
 async def check_slack(settings: Settings, probes: Probes) -> list[CheckResult]:
@@ -727,6 +887,7 @@ READ_ONLY_CHECKS: tuple[CheckFn, ...] = (
     check_configuration,
     check_repository_allowlist,
     check_limits,
+    check_canary,
     check_database,
     check_devin,
     check_github,

@@ -147,8 +147,10 @@ activemq-data/
 # SageMath parsed files
 *.sage.py
 
-# Environments
+# Environments (any .env variant such as .env.canary carries live credentials)
 .env
+.env.*
+!.env.example
 .envrc
 .venv
 env/

@@ -88,7 +88,9 @@ async def test_create_session_sends_documented_v3_body() -> None:
     assert request.url.path == f"/v3/organizations/{ORG}/sessions"
     assert request.headers["Authorization"] == f"Bearer {API_KEY}"
     body = json.loads(request.content)
-    assert body["repos"] == ["https://github.com/apache/superset"]
+    # Default repos[] entry is the owner/repo path, the identifier every other v3 repository
+    # surface (repository listing, `repo_names` filter) uses.
+    assert body["repos"] == ["apache/superset"]
     assert body["max_acu_limit"] == 5
     assert body["structured_output_required"] is True
     assert body["structured_output_schema"]["$schema"].startswith("http://json-schema.org/draft-07")

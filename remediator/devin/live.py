@@ -19,6 +19,7 @@ from typing import Any
 
 import httpx
 
+from ..config import DEFAULT_DEVIN_REPOS_FORMAT, format_devin_repo, repos_format_problem
 from ..metrics import instrument_http_client, retries_total
 from ..metrics import mode as metrics_mode
 from .client import (
@@ -120,7 +121,7 @@ class LiveDevinClient:
         api_key: str,
         org_id: str,
         base_url: str,
-        repos_format: str = "https://github.com/{repository}",
+        repos_format: str = DEFAULT_DEVIN_REPOS_FORMAT,
         request_timeout_seconds: float = 30.0,
         max_retries: int = 3,
         backoff_base_seconds: float = 0.5,
@@ -130,6 +131,8 @@ class LiveDevinClient:
     ) -> None:
         if not api_key or not org_id:
             raise ValueError("live Devin client requires api_key and org_id")
+        if problem := repos_format_problem(repos_format):
+            raise ValueError(f"repos_format {problem}")
         self._org_id = org_id
         self._repos_format = repos_format
         self._max_retries = max(0, max_retries)
@@ -201,7 +204,7 @@ class LiveDevinClient:
             or f"triage {request.repository}@{request.base_sha[:12]} [{request.operation_key}]",
             "tags": request.all_tags(),
             "max_acu_limit": request.max_acu_limit,
-            "repos": [self._repos_format.format(repository=request.repository)],
+            "repos": [format_devin_repo(self._repos_format, request.repository)],
             "structured_output_schema": request.structured_output_schema,
             "structured_output_required": True,
             "resumable": False,
@@ -302,6 +305,33 @@ class LiveDevinClient:
         payload = await self._get_with_retries(self._sessions_path(), params={"first": 1})
         items = payload.get("items", []) if isinstance(payload, dict) else []
         return len(items) if isinstance(items, list) else 0
+
+    async def list_repositories_probe(self, repository: str) -> list[str]:
+        """Read-only: repository paths the organization can hand to a session that match
+        `repository` (`GET /v3beta1/organizations/{org}/repositories?only_repo_paths=`).
+        Lives beside `/v3`, hence the base-path swap; never creates anything."""
+        base = str(self._http.base_url).rstrip("/")
+        if not base.endswith("/v3"):
+            raise DevinTransportError("repository listing needs a /v3 API base")
+        url = f"{base}beta1/organizations/{self._org_id}/repositories"
+        payload = await self._get_with_retries(
+            url,
+            params={
+                "only_repo_paths": [repository],
+                "load_indexing_status": "false",
+                "first": 100,
+            },
+        )
+        items = payload.get("items", []) if isinstance(payload, dict) else []
+        paths: list[str] = []
+        for item in items if isinstance(items, list) else []:
+            if not isinstance(item, dict):
+                continue
+            for key in ("repo_path", "repo_name"):
+                value = item.get(key)
+                if isinstance(value, str) and value:
+                    paths.append(value)
+        return paths
 
     async def aclose(self) -> None:
         for handler in logging.getLogger().handlers:

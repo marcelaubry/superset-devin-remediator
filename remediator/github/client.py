@@ -561,6 +561,16 @@ class LiveGitHubClient:
         payload = await self._request("GET", f"/repos/{repo}")
         return payload if isinstance(payload, dict) else {}
 
+    async def resolve_ref(self, repository: str, ref: str) -> str:
+        """GET /repos/{repo}/commits/{ref}: the full SHA at the tip of `ref` (readiness only,
+        read-only; the worker pins through `github_refs.GitHubBaseCommitResolver`)."""
+        repo = _check_allowed(self._allowed, repository)
+        payload = await self._request("GET", f"/repos/{repo}/commits/{ref}")
+        sha = payload.get("sha") if isinstance(payload, dict) else None
+        if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
+            raise GitHubApiError(f"{repo}@{ref} returned no full SHA", retryable=False)
+        return sha
+
     async def label_exists(self, repository: str, label: str) -> bool:
         """GET /repos/{repo}/labels/{name} (readiness only, read-only)."""
         repo = _check_allowed(self._allowed, repository)

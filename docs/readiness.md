@@ -37,10 +37,13 @@ production), `fail`, `skip` (not applicable in this mode).
 | `devin.api_base_url` | HTTPS, public host, no embedded credentials |
 | `devin.identity` | `GET /v3/self` — service user and organization match `DEVIN_ORG_ID` |
 | `devin.list_sessions` | Read-only session list on the organization succeeds (needed for create reconciliation) |
+| `devin.repos_format` | `DEVIN_REPOS_FORMAT` contains `{repository}` exactly once (`fail` otherwise); `warn` when it deviates from the `owner/repo` path default. Reported in fake mode too |
+| `devin.repository_access[owner/name]` | Read-only `GET /v3beta1/organizations/{org}/repositories?only_repo_paths=` lists the allowlisted repository (the exact string `repos[]` will carry is shown); `fail` when the organization does not know it, `warn` when the beta endpoint is unavailable to the service user |
 | `devin.acu_reporting` | Reminder (`warn`) that consumption is fetched lazily and shows `Unavailable` when the plan/service user lacks the permission — no consumption call is made here |
 | `github.api_base_url` | HTTPS, public host |
 | `github.repository[owner/name]` | Repository exists and resolves to the configured name |
 | `github.default_branch[...]` | Equals `GITHUB_BASE_REF` |
+| `github.base_sha[...]` | Resolves the current tip of `GITHUB_BASE_REF` (`GET /repos/{repo}/commits/{ref}`, the same call the worker pins with) and prints the full SHA; with `GITHUB_BASE_SHA_REFERENCE` set, `pass` when equal and `warn` when the branch moved since the last human verification |
 | `github.permissions[...]` | Token reports `pull` (read); `push` is shown for information (labels/comments need `issues:write`); fine-grained tokens that omit `permissions` are `warn` |
 | `github.label[...]` | `GITHUB_REQUIRED_LABEL` / `GITHUB_REMEDIATION_LABEL` exist |
 | `slack.api_base_url` | HTTPS, public host |
@@ -60,8 +63,21 @@ production), `fail`, `skip` (not applicable in this mode).
 | `verifier.timeout` / `verifier.cache` | `PROBE_TIMEOUT_SECONDS` ≤ verifier max; whether the dependency download cache is enabled |
 | `verifier.smoke` | Only with `--verifier-smoke`: `PROBE_SMOKE_PROBE` (default `apache/superset#0`, a reserved slot that can never be a case) runs against its BASE SHA; `pass` when the exit code matches the manifest, `fail` with `infrastructure:` prefix when clone/install/tooling failed, otherwise `fail` with the Jest tail |
 | `webhook.base_url` / `webhook.health` | `PUBLIC_BASE_URL` is HTTPS and its `/health` answers from the outside |
-| `allowlist.repositories` / `allowlist.required_label` | Non-empty exact `owner/name` allowlist; a required label is configured for live GitHub |
-| `limits.concurrency` / `limits.per_repository` / `limits.acu` | `MAX_CONCURRENT_*` ≥ 1; per-repository limit ≤ global (otherwise `warn`, global wins); ACU caps set and positive |
+| `dashboard.cookie_secure` | With any live provider: `COOKIE_SECURE=true` (`fail` otherwise — the dashboard must sit behind HTTPS) |
+| `allowlist.repositories` / `allowlist.required_label` | Non-empty exact `owner/name` allowlist; the intake label is shown when set, `warn` when empty with live GitHub and `fail` when empty with live Devin (every opened issue would spend ACUs) |
+| `limits.concurrency` / `limits.per_repository` / `limits.acu` / `limits.canary` | `MAX_CONCURRENT_*` ≥ 1; per-repository limit ≤ global (otherwise `warn`, global wins); ACU caps set and positive; `warn` when Devin is live and any limit exceeds 1 |
+| `canary.envelope` | `LIVE_CANARY=true`: every envelope rule holds (`Settings` refuses to start otherwise, this line lists all deviations at once); `skip` when off in fake mode, `warn` when off while Devin is live |
+
+### Comparing the base SHA with the last verified one
+
+The pipeline never takes a SHA from configuration: every live triage session pins
+the tip of `GITHUB_BASE_REF` resolved at dispatch time. To know whether the
+branch moved since probes and the verifier smoke were last checked, set
+`GITHUB_BASE_SHA_REFERENCE=<40-hex SHA>` in the deployment `.env` and read
+`github.base_sha[...]`: `pass ... equals GITHUB_BASE_SHA_REFERENCE` means the
+smoke result still describes the code a session would see; `warn ... differs`
+means re-run `make readiness-smoke` (and re-check the probe manifest) before
+approving anything. Record the printed SHA in the canary checklist.
 
 ## Minimal provider permissions
 

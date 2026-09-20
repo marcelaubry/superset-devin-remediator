@@ -187,6 +187,11 @@ spend zero ACUs.
   `make readiness-smoke` adds the real Superset probe run;
   `make readiness-mutating CONFIRM_CHANNEL=<SLACK_CHANNEL_ID>` additionally
   posts a Slack test message. See [docs/readiness.md](docs/readiness.md).
+- **Controlled live canary:** `LIVE_CANARY=true` is a fail-closed envelope
+  for the first human-authorized live run (one repository, opt-in intake
+  label, every concurrency limit at 1, remote verifier, secure cookies, no fake
+  evidence next to a live session). Activation order, emergency stop and the
+  evidence checklist are in [docs/canary-runbook.md](docs/canary-runbook.md).
 - **Request hardening:** body-size limit (`413`), Origin/CSRF checks and a
   rate limit on operator mutations, security headers, SSRF validation of
   provider/verifier URLs, secret redaction in nested errors, allowlisted-host
@@ -204,6 +209,27 @@ docker compose up --build
 ```
 
 Open <http://localhost:8000> and sign in with `OPERATOR_TOKEN`.
+
+### Host compatibility
+
+Every Compose image builds natively for `linux/amd64` and `linux/arm64`
+(Apple Silicon, Graviton). The verifier image picks the pinned Node tarball
+from BuildKit's `TARGETARCH` (`amd64` → Node `x64`, `arm64` → Node `arm64`),
+verifies it against the SHA-256 digests pinned in `docker/verifier/Dockerfile`,
+and fails the build for any other architecture rather than producing an image
+whose `node` cannot exec. Never set `DOCKER_DEFAULT_PLATFORM=linux/amd64` or a
+`platform:` on the stack: the emulated verifier would run Superset's Jest suite
+under Rosetta/QEMU. `tests/test_phase6_canary.py` guards the Dockerfiles against
+reintroducing a single-architecture download. The `linux/arm64` image has so far
+been built and exercised under QEMU emulation on an x86_64 host; run
+`docker compose up --build -d` and `make readiness-smoke` once on a native arm64
+host (Apple Silicon Docker Desktop, Graviton) before relying on it there.
+Cross-building for review:
+
+```bash
+docker buildx build --platform linux/arm64 -f docker/verifier/Dockerfile .
+docker buildx build --platform linux/amd64 -f docker/verifier/Dockerfile .
+```
 
 ## Scenarios
 
@@ -294,7 +320,10 @@ failed termination, concurrent retries, and worker restart in every state.
 | `GITHUB_REPOSITORY` | `apache/superset` | Accepted repository |
 | `GITHUB_ALLOWED_EVENTS` | `issues` | Comma-separated event allowlist |
 | `GITHUB_ALLOWED_ACTIONS` | `opened,labeled` | Comma-separated action allowlist |
-| `GITHUB_REQUIRED_LABEL` | *(empty)* | Optional opt-in intake label; empty (default) evaluates every opened issue |
+| `GITHUB_REQUIRED_LABEL` | *(empty)* | Optional opt-in intake label; empty (default) evaluates every opened issue. Readiness fails without one once Devin is live; `LIVE_CANARY` requires it |
+| `GITHUB_BASE_REF` | `master` | Branch whose current tip is resolved and pinned as the base SHA of every live session; no SHA is ever configured |
+| `GITHUB_BASE_SHA_REFERENCE` | *(empty)* | Readiness-only: last human-verified base SHA; `make readiness` warns when the live tip differs. Never used by the pipeline |
+| `LIVE_CANARY` | `false` | Opt-in fail-closed envelope for the first live run: one allowlisted repository, intake label set and distinct from the remediation label, every `MAX_CONCURRENT_*` = 1, remote verifier, secure cookies with live providers, GitHub + Slack live whenever Devin is (see `docs/canary-runbook.md`) |
 | `WORKER_POLL_INTERVAL_SECONDS` | `1.0` | Worker idle poll interval |
 | `WORKER_CONCURRENCY` | `2` | Concurrent worker loops. Safe at 2+: case processor and outbox dispatcher share one lock order (case → approval request → outbox row, all `FOR NO KEY UPDATE`), and a deadlock/serialization failure releases the lease for retry instead of failing the case |
 | `WORKER_LEASE_SECONDS` | `300` | Case and webhook ownership lease |
@@ -309,7 +338,7 @@ failed termination, concurrent retries, and worker restart in every state.
 | `DEVIN_POLL_INTERVAL_SECONDS` | `15` | Poll interval; live mode enforces `>= 10` (10–30 recommended) |
 | `DEVIN_HTTP_TIMEOUT_SECONDS` | `30` | Per-request HTTP timeout |
 | `DEVIN_HTTP_MAX_RETRIES` | `3` | Bounded retries with backoff and jitter for GET/list only |
-| `DEVIN_REPOS_FORMAT` | `https://github.com/{repository}` | How the allowlisted repository is passed in `repos`. **Unverified against the live API** — the v3 spec types `repos` as `array[string]` without documenting the entry format; confirm with one minimal live session (or Devin support) before enabling live mode |
+| `DEVIN_REPOS_FORMAT` | `{repository}` | Template for the single `repos[]` entry on `POST /v3/organizations/{org}/sessions`: the `owner/repo` repository path. The create schema types `repos` as `array[string]` without stating the format; `owner/repo` is inferred from the other v3 repository surfaces (repository listing `repo_path`, the `repo_names` session filter) and confirmed per deployment by the readiness check `devin.repository_access`. Must contain `{repository}` exactly once; the URL form stays configurable. Readiness reports the value and, with live Devin, checks the organization's repository listing for the allowlisted path |
 | `GITHUB_BASE_REF` | `master` | Ref resolved to the exact base SHA pinned in each session |
 | `RECONCILE_MAX_ATTEMPTS` | `3` | Bounded list-by-tag lookups after an uncertain create |
 | `MAX_ATTEMPTS_PER_KIND` | `3` | Per-case triage/remediation spend cap |
@@ -528,7 +557,8 @@ docs/probes.md           Probe authoring guide
 docs/simulation.md       Simulation guide
 docs/concurrency.md      Capacity leases and queueing behaviour
 docs/metrics.md          Metric definitions
-docs/readiness.md        Live-readiness runbook and minimal permissions
+docs/readiness.md        Live-readiness checks and minimal permissions
+docs/canary-runbook.md   Controlled live canary: activation order, emergency stop, checklist
 docs/known-limitations.md
 ```
 
