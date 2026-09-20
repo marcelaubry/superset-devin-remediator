@@ -1,0 +1,39 @@
+# Reproducible visual / accessibility verification of the operator dashboard.
+#
+#   make visual
+#   # == docker compose -f docker-compose.yml -f docker-compose.visual.yml run --rm --build visual
+#
+# Seeds the running fake-mode stack through its real HTTP endpoints (scripts/simulate.py),
+# then captures desktop + mobile screenshots and runs in-browser structural accessibility
+# checks (tests/visual/capture.py). Output lands in ./artifacts/visual (git-ignored).
+# `make visual` resets the compose database volume first (simulate.py is not idempotent).
+# Screenshots are artifacts for review, not committed baselines: pixel diffs are only run
+# when VISUAL_BASELINE_DIR points at a directory produced by this same image.
+services:
+  visual:
+    build:
+      context: .
+      dockerfile: docker/visual/Dockerfile
+    env_file: .env
+    environment:
+      BASE_URL: http://api:8000
+      WORKER_METRICS_URL: http://worker:8001
+      VISUAL_OUT_DIR: /app/artifacts/visual
+      VISUAL_BASELINE_DIR: ${VISUAL_BASELINE_DIR:-}
+    volumes:
+      - ./scripts:/app/scripts:ro
+      - ./fixtures:/app/fixtures:ro
+      - ./tests/visual:/app/tests/visual:ro
+      - ./artifacts/visual:/app/artifacts/visual
+    command:
+      - sh
+      - -c
+      - >-
+        python tests/visual/capture.py --wait-for-api
+        && python scripts/simulate.py --scenario all --wait
+        && python tests/visual/capture.py
+    depends_on:
+      api:
+        condition: service_started
+      worker:
+        condition: service_started

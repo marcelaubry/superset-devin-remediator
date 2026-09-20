@@ -40,6 +40,14 @@ async def require_operator(request: Request, settings: Settings = Depends(get_se
         valid = False
     if valid:
         return settings.operator_token
+    if request.headers.get("HX-Request") == "true":
+        # An expired cookie on a polling partial must not swap the login page into the
+        # panel: tell HTMX to navigate the whole window instead.
+        raise HTTPException(
+            status_code=401,
+            detail="operator authentication required",
+            headers={"HX-Redirect": "/login"},
+        )
     if (
         _is_json_request(request)
         or request.url.path.startswith("/api/")

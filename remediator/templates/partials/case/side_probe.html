@@ -1,0 +1,22 @@
+{% import "macros/badges.html" as b %}
+{% import "macros/ui.html" as ui %}
+{% if remediation %}
+{% set snap = remediation.probe_snapshots[-1] if remediation.probe_snapshots else None %}
+{% set ns = namespace(head=None, base=None) %}
+{% if latest_rem %}{% for run in latest_rem.probe_executions %}{% if run.target == "HEAD" %}{% set ns.head = run %}{% elif run.target == "BASE" %}{% set ns.base = run %}{% endif %}{% endfor %}{% endif %}
+{% if not ns.base and snap and snap.pre_session_executions %}{% set ns.base = snap.pre_session_executions[-1] %}{% endif %}
+<section id="side-probe" class="panel side-card" aria-labelledby="side-probe-title">
+  <header class="panel-head"><h2 id="side-probe-title">Probe</h2>{% if ns.head %}{{ b.enum("verdict", ns.head.verdict) }}{% elif ns.base %}{{ b.enum("verdict", ns.base.verdict) }}{% endif %}</header>
+  {% if snap %}
+  <dl class="facts">
+    <dt>Probe</dt><dd>{{ ui.ident(snap.probe_identifier, 28) }}</dd>
+    <dt>Script</dt><dd>{{ ui.sha(snap.script_hash) }}</dd>
+    <dt>Pinned base</dt><dd>{{ ui.sha(snap.base_sha) }}</dd>
+    <dt>BASE run</dt><dd>{% if ns.base %}{{ b.enum("verdict", ns.base.verdict) }} <span class="muted">exit {{ ns.base.exit_code if ns.base.exit_code is not none else "none" }} (expected {{ ns.base.expected_exit_code }})</span>{% else %}<span class="muted">not run</span>{% endif %}</dd>
+    <dt>HEAD run</dt><dd>{% if ns.head %}{{ b.enum("verdict", ns.head.verdict) }} <span class="muted">exit {{ ns.head.exit_code if ns.head.exit_code is not none else "none" }} (expected {{ ns.head.expected_exit_code }})</span>{% else %}<span class="muted">not run</span>{% endif %}</dd>
+  </dl>
+  {% else %}
+  <p class="empty">No probe snapshot pinned yet.</p>
+  {% endif %}
+</section>
+{% endif %}

@@ -1,1 +1,13 @@
-<!doctype html><html><head><title>Case {{case.issue_number}}</title><link rel="stylesheet" href="/static/style.css"><script src="/static/htmx.min.js"></script></head><body><main><a href="/">Dashboard</a><h1>#{{case.issue_number}} {{case.issue_title}}</h1><div id="case-detail" hx-get="/partials/case/{{case.id}}" hx-trigger="every 3s" hx-swap="innerHTML">{% include "partials/case_detail.html" %}</div></main></body></html>
+{% extends "base.html" %}
+{% set show_logout = true %}
+{% block title %}#{{ case.issue_number }} {{ case.state }} · {{ case.repository }}{% endblock %}
+{% block content %}
+<nav class="breadcrumb" aria-label="Breadcrumb">
+  <ol>
+    <li><a href="/">Dashboard</a></li>
+    <li>{{ case.repository }}</li>
+    <li aria-current="page">#{{ case.issue_number }}</li>
+  </ol>
+</nav>
+<div id="case-detail" hx-get="/partials/case/{{ case.id }}" hx-trigger="every 3s" hx-swap="innerHTML focus-scroll:false">{% include "partials/case_detail.html" %}</div>
+{% endblock %}

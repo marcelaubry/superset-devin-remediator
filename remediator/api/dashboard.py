@@ -10,6 +10,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from ..config import Settings, get_settings
 from ..db import get_session
 from ..lifecycle import (
     REMEDIATION_PHASE,
@@ -32,11 +33,22 @@ from ..models import (
     ProbeExecution,
     ProbeSnapshot,
     PullRequestEvidence,
+    Recommendation,
     StateTransition,
     WebhookEvent,
 )
 from .auth import require_operator
 from .hardening import safe_href
+from .presentation import (
+    FUNNEL_LABELS,
+    FUNNEL_STAGES,
+    STATE_PRESENTATION,
+    build_funnel,
+    mode_tone,
+    present,
+    present_state,
+    stage_for_state,
+)
 
 router = APIRouter()
 templates = Jinja2Templates(directory=str(Path(__file__).parents[1] / "templates"))
@@ -60,6 +72,28 @@ def _until(value: datetime | None) -> str:
     if seconds <= 0:
         return "expired"
     return f"in {_humanize(datetime.now(UTC) - timedelta(seconds=seconds))}"
+
+
+def _iso_z(value: datetime | None) -> str:
+    if not value:
+        return ""
+    return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _clock(value: datetime | None) -> str:
+    if not value:
+        return "-"
+    return value.astimezone(UTC).strftime("%H:%M:%SZ")
+
+
+def _short(value: str | None, length: int = 12) -> str:
+    if not value:
+        return "-"
+    return value[:length]
+
+
+def _issue_ref(case: Case) -> str:
+    return f"{case.repository} #{case.issue_number}"
 
 
 def _attempt_elapsed(attempt: Attempt) -> str:
@@ -355,7 +389,94 @@ TEMPLATE_HELPERS: dict[str, object] = {
     "remediation_actions": remediation_actions,
     "remediation_json": remediation_json,
     "AttemptKind": AttemptKind,
+    "iso": _iso_z,
+    "clock": _clock,
+    "short": _short,
+    "issue_ref": _issue_ref,
+    "present": present,
+    "present_state": present_state,
+    "mode_tone": mode_tone,
+    "stage_for_state": stage_for_state,
+    "FUNNEL_STAGES": FUNNEL_STAGES,
+    "FUNNEL_LABELS": FUNNEL_LABELS,
+    "STATE_PRESENTATION": STATE_PRESENTATION,
 }
+# Globals so imported macros (which do not receive the render context) can use them too.
+templates.env.globals.update(TEMPLATE_HELPERS)
+
+
+def provider_modes(settings: Settings) -> dict[str, str]:
+    """Provider modes surfaced in the top bar. Values only; never secrets."""
+    return {
+        "Devin": settings.devin_client_mode,
+        "Slack": settings.slack_client_mode,
+        "GitHub": settings.github_client_mode,
+        "Probe": settings.probe_runner_mode,
+    }
+
+
+def page_context(request: Request, settings: Settings) -> dict[str, object]:
+    """Context every full page (dashboard, case, login) needs for the top bar."""
+    return {
+        "request": request,
+        "modes": provider_modes(settings),
+        "rendered_at": datetime.now(UTC),
+        **TEMPLATE_HELPERS,
+    }
+
+
+ATTENTION_ORDER = {
+    CaseState.HUMAN_BLOCKED: 0,
+    CaseState.REMEDIATION_HUMAN_BLOCKED: 0,
+    CaseState.PROBE_INFRASTRUCTURE_BLOCKED: 0,
+    CaseState.CI_FAILED: 1,
+    CaseState.FAILED: 1,
+    CaseState.REMEDIATION_FAILED: 1,
+    CaseState.TIMED_OUT: 1,
+    CaseState.REMEDIATION_TIMED_OUT: 1,
+}
+
+
+def _attention_rank(item: object) -> tuple[int, float]:
+    if isinstance(item, Case):
+        return (
+            ATTENTION_ORDER.get(CaseState(item.state), 1),
+            -item.state_entered_at.timestamp(),
+        )
+    if isinstance(item, WebhookEvent):
+        return (2, -item.received_at.timestamp())
+    return (3, 0.0)  # pragma: no cover
+
+
+def filter_cases(cases: list[Case], params: dict[str, str]) -> list[Case]:
+    """Filter the already-loaded case rows in Python. Unknown values match nothing."""
+    query = params.get("q", "").strip().lower()
+    state = params.get("state", "").strip()
+    phase = params.get("phase", "").strip().lower()
+    recommendation = params.get("recommendation", "").strip()
+    result = []
+    for case in cases:
+        if query and not (
+            query in str(case.issue_number)
+            or query in case.issue_title.lower()
+            or query in case.repository.lower()
+        ):
+            continue
+        if state and CaseState(case.state).value != state:
+            continue
+        if phase:
+            current = CaseState(case.state)
+            if phase == "terminal":
+                if current not in TERMINAL_STATES:
+                    continue
+            elif stage_for_state(current) != phase:
+                continue
+        if recommendation:
+            current_rec = case.recommendation
+            if current_rec is None or Recommendation(current_rec).value != recommendation:
+                continue
+        result.append(case)
+    return result
 
 
 ATTEMPT_EVIDENCE_OPTIONS = (
@@ -415,7 +536,7 @@ async def _context(session: AsyncSession) -> dict[str, object]:
     ).all():
         state_counts[CaseState(state).value] = count
     recommendation_counts = {
-        str(recommendation): count
+        Recommendation(recommendation).value: count
         for recommendation, count in (
             await session.execute(
                 select(Case.recommendation, func.count())
@@ -453,7 +574,17 @@ async def _context(session: AsyncSession) -> dict[str, object]:
         }
     ]
     failures.extend(event for event in events if event.status == EventStatus.FAILED)
+    failures.sort(key=_attention_rank)
     now = datetime.now(UTC)
+    active_session_count = sum(
+        1
+        for case in cases
+        for attempt in case.attempts
+        if attempt.status in ACTIVE_ATTEMPT_STATUSES and attempt.devin_session_id
+    )
+    active_remediation = sum(
+        1 for case in active if CaseState(case.state) in REMEDIATION_PHASE_STATES
+    )
     received_1h = await session.scalar(
         select(func.count()).select_from(Case).where(Case.created_at >= now - timedelta(hours=1))
     )
@@ -507,16 +638,38 @@ async def _context(session: AsyncSession) -> dict[str, object]:
             "count": count,
             "mean_time": f"{float(mean):.1f}s" if mean is not None else "-",
         }
+    completed.sort(key=lambda c: c.completed_at or c.state_entered_at, reverse=True)
     return {
         "cases": cases,
+        "case_by_id": {case.id: case for case in cases},
         "events": events,
         "transitions": transitions,
         "state_counts": state_counts,
         "recommendation_counts": recommendation_counts,
+        "funnel": build_funnel(state_counts),
         "active": active,
+        "active_remediation": active_remediation,
+        "active_triage": len(active) - active_remediation,
+        "active_session_count": active_session_count,
         "processing_events": processing_events,
+        "processing_count": len(processing_events),
+        "failed_event_count": sum(1 for e in events if e.status == EventStatus.FAILED),
         "completed": completed,
         "failures": failures,
+        "attention_blocked": sum(
+            1
+            for item in failures
+            if isinstance(item, Case) and ATTENTION_ORDER.get(CaseState(item.state)) == 0
+        ),
+        "attention_failed": sum(
+            1
+            for item in failures
+            if isinstance(item, Case) and ATTENTION_ORDER.get(CaseState(item.state)) == 1
+        ),
+        "ready_for_review": state_counts[CaseState.CI_PASSED.value],
+        "rendered_at": now,
+        "filters": {"q": "", "state": "", "phase": "", "recommendation": ""},
+        "filtered_cases": cases,
         "throughput": {
             "received_1h": received_1h,
             "received_24h": received_24h,
@@ -533,15 +686,20 @@ async def dashboard(
     request: Request,
     _: str = Depends(require_operator),
     session: AsyncSession = Depends(get_session),
+    settings: Settings = Depends(get_settings),
 ) -> HTMLResponse:
     return templates.TemplateResponse(
-        request, "dashboard.html", {"request": request, **await _context(session)}
+        request,
+        "dashboard.html",
+        {**page_context(request, settings), **await _context(session)},
     )
 
 
 @router.get("/login", response_class=HTMLResponse)
-async def login_page(request: Request) -> HTMLResponse:
-    return templates.TemplateResponse(request, "login.html", {"request": request})
+async def login_page(request: Request, settings: Settings = Depends(get_settings)) -> HTMLResponse:
+    return templates.TemplateResponse(
+        request, "login.html", {**page_context(request, settings), "error": None}
+    )
 
 
 @router.get("/cases/{case_id}", response_class=HTMLResponse)
@@ -550,12 +708,15 @@ async def case_detail(
     request: Request,
     _: str = Depends(require_operator),
     session: AsyncSession = Depends(get_session),
+    settings: Settings = Depends(get_settings),
 ) -> HTMLResponse:
     case = await load_case(session, case_id)
     if not case:
         raise HTTPException(status_code=404, detail="case not found")
     return templates.TemplateResponse(
-        request, "case.html", {"request": request, "case": case, **TEMPLATE_HELPERS}
+        request,
+        "case.html",
+        {**page_context(request, settings), "case": case, "error": None, **TEMPLATE_HELPERS},
     )
 
 
@@ -565,6 +726,7 @@ async def case_detail_partial(
     request: Request,
     _: str = Depends(require_operator),
     session: AsyncSession = Depends(get_session),
+    settings: Settings = Depends(get_settings),
 ) -> HTMLResponse:
     case = await load_case(session, case_id)
     if not case:
@@ -572,8 +734,25 @@ async def case_detail_partial(
     return templates.TemplateResponse(
         request,
         "partials/case_detail.html",
-        {"request": request, "case": case, **TEMPLATE_HELPERS, "error": None},
+        {**page_context(request, settings), "case": case, **TEMPLATE_HELPERS, "error": None},
     )
+
+
+PARTIALS = frozenset(
+    {
+        "active",
+        "completed",
+        "failures",
+        "timeline",
+        "overview",
+        "throughput",
+        "cases",
+        "kpis",
+        "funnel",
+        "topbar_status",
+    }
+)
+CASE_FILTER_PARAMS = ("q", "state", "phase", "recommendation")
 
 
 @router.get("/partials/{name}", response_class=HTMLResponse)
@@ -582,18 +761,13 @@ async def partial(
     request: Request,
     _: str = Depends(require_operator),
     session: AsyncSession = Depends(get_session),
+    settings: Settings = Depends(get_settings),
 ) -> HTMLResponse:
-    context = await _context(session)
-    if name not in {
-        "active",
-        "completed",
-        "failures",
-        "timeline",
-        "overview",
-        "throughput",
-        "cases",
-    }:
+    if name not in PARTIALS:
         raise HTTPException(status_code=404, detail="partial not found")
-    return templates.TemplateResponse(
-        request, f"partials/{name}.html", {"request": request, **context}
-    )
+    context = {**page_context(request, settings), **await _context(session)}
+    if name == "cases":
+        filters = {key: request.query_params.get(key, "") for key in CASE_FILTER_PARAMS}
+        context["filters"] = filters
+        context["filtered_cases"] = filter_cases(cast(list[Case], context["cases"]), filters)
+    return templates.TemplateResponse(request, f"partials/{name}.html", context)

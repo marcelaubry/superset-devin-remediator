@@ -1,0 +1,22 @@
+{% import "macros/badges.html" as b %}
+<section class="panel" aria-labelledby="funnel-title">
+  <header class="panel-head"><h2 id="funnel-title">Workflow funnel</h2><span class="count">{{ funnel.in_flight }} in flight · {{ funnel.terminal }} terminal</span></header>
+  <ol class="funnel" aria-label="Cases per workflow stage">
+    {% for stage in funnel.stages %}
+    <li class="funnel-row" data-stage="{{ stage.key }}" data-count="{{ stage.count }}">
+      <span class="funnel-label">{{ stage.label }}</span>
+      <span class="funnel-track" aria-hidden="true"><span class="funnel-bar" style="width: {{ stage.width }}%"></span></span>
+      <span class="funnel-count">{{ stage.count }}<span class="sr-only"> cases in {{ stage.label }}</span></span>
+      {% if stage.count %}
+      <span class="funnel-states">{% for name, n in stage.states.items() if n %}<span><code>{{ name }}</code> {{ n }}</span>{% endfor %}</span>
+      {% endif %}
+    </li>
+    {% endfor %}
+  </ol>
+  <h3 class="subsection">Terminal outcomes</h3>
+  <ul class="outcomes">
+    {% for outcome in funnel.outcomes %}
+    <li>{{ b.badge(outcome.presentation) }} <span class="n">{{ outcome.count }}</span></li>
+    {% endfor %}
+  </ul>
+</section>

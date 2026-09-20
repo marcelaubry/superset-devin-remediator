@@ -1,0 +1,34 @@
+{% import "macros/badges.html" as b %}
+{% import "macros/ui.html" as ui %}
+{% if approval %}
+<section id="approval" class="panel" aria-labelledby="approval-title">
+  <header class="panel-head"><h2 id="approval-title">Remediation approval</h2>{{ b.enum("decision", approval.decision) }}</header>
+  <dl class="facts">
+    <dt>Slack notification</dt><dd>{{ b.enum("notification", approval.notification_status) }}{% if approval.slack_message_ts %} · channel <code>{{ approval.slack_channel }}</code> · ts <code>{{ approval.slack_message_ts }}</code>{% endif %}</dd>
+    <dt>Decision</dt><dd>{{ b.enum("decision", approval.decision) }}{% if approval.decided_by_slack_user_id %} by Slack user <code>{{ approval.decided_by_slack_user_id }}</code> at {{ ui.at(approval.decided_at) }}{% endif %}{% if approval.decision_reason %} — “{{ approval.decision_reason }}”{% endif %}</dd>
+    <dt>Action token</dt><dd>{% if approval.decision.value == "PENDING" %}valid until {{ ui.at(approval.token_expires_at) }} ({{ until(approval.token_expires_at) }}){% else %}closed{% endif %}</dd>
+    <dt>GitHub label delivery</dt><dd>{{ b.enum("delivery", approval.delivery_status) }}{% if approval.label_operation %} · <code>{{ approval.label_operation }}</code>{% endif %}{% if approval.label_applied_at %} · applied {{ ui.at(approval.label_applied_at) }}{% endif %}{% if approval.label_confirmed_at %} · confirmed by webhook {{ ui.at(approval.label_confirmed_at) }}{% endif %}</dd>
+    <dt>GitHub comment</dt><dd>{% if approval.github_comment_id %}<code>{{ approval.github_comment_id }}</code>{% else %}<span class="muted">-</span>{% endif %}</dd>
+    <dt>Triage result</dt><dd><code title="sha256:{{ approval.triage_result_hash }}">sha256:{{ approval.triage_result_hash[:16] }}…</code> (schema {{ approval.triage_schema_version }})</dd>
+  </dl>
+  {% if approval.decision.value == "PENDING" %}
+  <div class="actions">
+    <form method="post" action="/operator/approvals/{{ approval.id }}/expire" hx-post="/operator/approvals/{{ approval.id }}/expire" hx-target="#case-detail" hx-swap="innerHTML" hx-disabled-elt="this" hx-confirm="Expire the Slack action token? The approve/reject buttons stop working and a new approval must be requested."><button type="submit" class="btn-danger">Expire action token</button></form>
+  </div>
+  {% endif %}
+  <h3 class="subsection">Approval timeline</h3>
+  {% set events = approval.events|sort(attribute="created_at", reverse=true) %}
+  {% if events %}
+  <ol class="timeline">
+    {% for item in events[:5] %}<li>{{ ui.at(item.created_at) }}<span><strong>{{ item.kind }}</strong> <span class="muted small">{{ item.actor }}</span>{% if item.detail %} — {{ item.detail }}{% endif %}</span></li>{% endfor %}
+  </ol>
+  {% if events|length > 5 %}
+  <details><summary>Show all {{ events|length }} events</summary>
+    <ol class="timeline">{% for item in events[5:] %}<li>{{ ui.at(item.created_at) }}<span><strong>{{ item.kind }}</strong> <span class="muted small">{{ item.actor }}</span>{% if item.detail %} — {{ item.detail }}{% endif %}</span></li>{% endfor %}</ol>
+  </details>
+  {% endif %}
+  {% else %}
+  {{ ui.empty("No approval events.") }}
+  {% endif %}
+</section>
+{% endif %}

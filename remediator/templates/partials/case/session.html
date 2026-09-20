@@ -1,0 +1,60 @@
+{% import "macros/badges.html" as b %}
+{% import "macros/ui.html" as ui %}
+<section id="devin-session" class="panel side-card" aria-labelledby="session-title">
+  <header class="panel-head"><h2 id="session-title">Session</h2>{% if attempt %}{{ b.enum("attempt", attempt.status) }}{% endif %}</header>
+  {% if attempt %}
+  <div class="metric-pair">
+    <div class="metric">
+      <span class="eyebrow">Budget</span>
+      <span class="metric-value">{{ ui.acu(attempt) }}</span>
+      {% if attempt.max_acu_limit and attempt.devin_acus_consumed is not none %}{% set pct = (100 * attempt.devin_acus_consumed / attempt.max_acu_limit)|round|int %}<span class="metric-sub">{{ pct }}% of limit</span>{% endif %}
+      {% set report = ui.acu_report(attempt) %}{% if report|trim %}<span class="metric-sub">{{ report }}</span>{% endif %}
+    </div>
+    <div class="metric">
+      <span class="eyebrow">Elapsed</span>
+      <span class="metric-value">{{ attempt_elapsed(attempt) }}</span>
+      <span class="metric-sub">{{ attempt.poll_count }} polls{% if attempt.last_polled_at %}, last {{ ui.ago(attempt.last_polled_at) }} ago{% endif %}</span>
+    </div>
+  </div>
+  <dl class="facts">
+    <dt>Kind</dt><dd>{{ attempt.kind.value }}</dd>
+    <dt>Create</dt><dd>{% if attempt.create_state %}{{ b.enum("create", attempt.create_state) }}{% else %}<span class="muted">-</span>{% endif %}</dd>
+    <dt>Session</dt><dd>{% if attempt.devin_session_id %}{{ ui.ident(attempt.devin_session_id, 28, attempt.devin_session_url) }}{% else %}not created{% endif %}</dd>
+    <dt>Remote status</dt><dd>{% if attempt.devin_status %}<code>{{ attempt.devin_status }}</code>{% if attempt.devin_status_detail %} <span class="muted">/ {{ attempt.devin_status_detail }}</span>{% endif %}{% else %}<span class="muted">-</span>{% endif %}</dd>
+    <dt>Deadline</dt><dd>{% if attempt.timeout_at %}{{ ui.at(attempt.timeout_at) }} <span class="muted">({{ until(attempt.timeout_at) }})</span>{% else %}<span class="muted">-</span>{% endif %}</dd>
+    <dt>Base SHA</dt><dd>{{ ui.sha(attempt.base_sha) }}</dd>
+    {% if attempt.prompt_version %}<dt>Prompt</dt><dd><code>{{ attempt.prompt_version }}</code></dd>{% endif %}
+    <dt>Tags</dt><dd>{{ ui.tags(attempt.devin_tags) }}</dd>
+    {% if attempt.reconciliation_reason %}<dt>Reconciliation</dt><dd>{{ attempt.reconciliation_reason }}</dd>{% endif %}
+    {% if attempt.error %}<dt>Error</dt><dd class="tone-err-text">{{ attempt.error }}</dd>{% endif %}
+  </dl>
+  {% if attempt.devin_session_url %}<div class="actions"><a class="button" href="{{ attempt.devin_session_url }}" rel="noopener">Open Devin session</a></div>{% endif %}
+  <details class="quiet">
+    <summary>Identifiers</summary>
+    <dl class="ident-list">
+      <dt>Operation key</dt><dd><code>{{ attempt.operation_key }}</code></dd>
+      <dt>Attempt id</dt><dd><code>{{ attempt.id }}</code></dd>
+      {% if attempt.devin_session_id %}<dt>Session id</dt><dd><code>{{ attempt.devin_session_id }}</code></dd>{% endif %}
+      {% if attempt.devin_tags %}<dt>Tags</dt><dd><code>{{ attempt.devin_tags|join(" ") }}</code></dd>{% endif %}
+    </dl>
+  </details>
+  {% if attempt.kind != "TRIAGE" and attempt.structured_output %}
+  {% set out = attempt.structured_output %}
+  <h3 class="subsection">{{ attempt.kind.value|capitalize }} output</h3>
+  {% if out.get("summary") %}<p>{{ out["summary"] }}</p>{% endif %}
+  <dl class="facts">
+    {% if "outcome" in out %}<dt>Outcome</dt><dd><code>{{ out["outcome"] }}</code></dd>{% endif %}
+    {% if out.get("pr_url") %}<dt>PR</dt><dd>{{ ui.ident(out["pr_url"], 34, out["pr_url"]) }}</dd>{% endif %}
+    {% if out.get("branch") %}<dt>Branch</dt><dd>{{ ui.ident(out["branch"], 32) }}</dd>{% endif %}
+    {% if out.get("head_sha") %}<dt>Head</dt><dd>{{ ui.sha(out["head_sha"]) }}</dd>{% endif %}
+    {% if out.get("changed_files") %}<dt>Changed files</dt><dd><ul class="plain">{% for f in out["changed_files"] %}<li><code>{{ f }}</code></li>{% endfor %}</ul></dd>{% endif %}
+    {% if out.get("tests_run") %}<dt>Tests run</dt><dd><ul class="plain">{% for t in out["tests_run"] %}<li><code>{{ t }}</code></li>{% endfor %}</ul></dd>{% endif %}
+    {% if out.get("risks") %}<dt>Risks</dt><dd><ul class="plain">{% for r in out["risks"] %}<li>{{ r }}</li>{% endfor %}</ul></dd>{% endif %}
+    {% if out.get("blocking_questions") %}<dt>Blocking questions</dt><dd><ul class="plain">{% for q in out["blocking_questions"] %}<li>{{ q }}</li>{% endfor %}</ul></dd>{% endif %}
+  </dl>
+  <details><summary>Raw JSON</summary><pre>{{ out|tojson(indent=2) }}</pre></details>
+  {% endif %}
+  {% else %}
+  <p class="empty">No Devin attempt has been dispatched for this case.</p>
+  {% endif %}
+</section>

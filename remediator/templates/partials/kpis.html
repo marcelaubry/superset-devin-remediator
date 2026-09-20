@@ -1,0 +1,37 @@
+{% set attention_total = attention_blocked + attention_failed %}
+{% set succeeded = throughput.buckets["succeeded"] %}
+<section aria-labelledby="kpis-title">
+  <h2 id="kpis-title" class="sr-only">Key indicators</h2>
+  <ul class="kpis">
+    <li class="kpi {{ 'kpi-err' if attention_total else '' }}" data-kpi="attention" data-value="{{ attention_total }}">
+      <span class="kpi-label">Requires attention</span>
+      <span class="kpi-value">{{ attention_total }}</span>
+      <span class="kpi-sub">{{ attention_blocked }} blocked · {{ attention_failed }} failed{% if failed_event_count %} · {{ failed_event_count }} webhook{{ '' if failed_event_count == 1 else 's' }}{% endif %}</span>
+    </li>
+    <li class="kpi {{ 'kpi-info' if active_session_count else '' }}" data-kpi="active" data-value="{{ active|length }}">
+      <span class="kpi-label">Active jobs</span>
+      <span class="kpi-value">{{ active|length }}</span>
+      <span class="kpi-sub" data-kpi="sessions" data-value="{{ active_session_count }}">{{ active_session_count }} Devin session{{ '' if active_session_count == 1 else 's' }} · {{ active_triage }} triage · {{ active_remediation }} remediation</span>
+    </li>
+    <li class="kpi" data-kpi="received" data-value="{{ throughput.received_1h }}">
+      <span class="kpi-label">Received</span>
+      <span class="kpi-value">{{ throughput.received_1h }}</span>
+      <span class="kpi-sub">cases opened in 1h · {{ throughput.received_24h }} in 24h</span>
+    </li>
+    <li class="kpi" data-kpi="accepted" data-value="{{ throughput.accepted_1h }}">
+      <span class="kpi-label">Accepted</span>
+      <span class="kpi-value">{{ throughput.accepted_1h }}</span>
+      <span class="kpi-sub">webhooks in 1h · {{ throughput.accepted_24h }} in 24h{% if processing_count %} · {{ processing_count }} processing{% endif %}</span>
+    </li>
+    <li class="kpi {{ 'kpi-ok' if ready_for_review else '' }}" data-kpi="ready" data-value="{{ ready_for_review }}">
+      <span class="kpi-label">Ready for review</span>
+      <span class="kpi-value">{{ ready_for_review }}</span>
+      <span class="kpi-sub">CI passed on verified PR{% if state_counts['AWAITING_REMEDIATION_APPROVAL'] %} · {{ state_counts['AWAITING_REMEDIATION_APPROVAL'] }} awaiting approval{% endif %}</span>
+    </li>
+    <li class="kpi" data-kpi="time-to-validated" data-value="{{ succeeded.mean_time }}">
+      <span class="kpi-label">Time to validated PR</span>
+      <span class="kpi-value">{{ succeeded.mean_time }}</span>
+      <span class="kpi-sub">mean, case opened → CI passed · {{ succeeded.count }} case{{ '' if succeeded.count == 1 else 's' }}</span>
+    </li>
+  </ul>
+</section>

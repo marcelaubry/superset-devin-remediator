@@ -1,1 +1,51 @@
-<section><h2>All cases</h2><table><tr><th>Issue</th><th>State</th><th>Session</th><th>PR</th><th>CI</th><th>Elapsed</th></tr>{% for case in cases %}<tr><td><a href="/cases/{{case.id}}">#{{case.issue_number}} {{case.issue_title}}</a></td><td>{{case.state}}</td><td>{{case.devin_session_id or "-"}}</td><td>{{case.pr_url or "-"}}</td><td>{{case.ci_status or "-"}}</td><td>{{humanize(case.state_entered_at)}}</td></tr>{% else %}<tr><td colspan="6">None</td></tr>{% endfor %}</table>{% if cases|length == 100 %}<p>showing latest 100</p>{% endif %}</section>
+{% import "macros/badges.html" as b %}
+{% import "macros/ui.html" as ui %}
+<section class="panel" aria-labelledby="cases-title">
+  <header class="panel-head"><h2 id="cases-title">All cases</h2><span class="count">{{ filtered_cases|length }} of {{ cases|length }}{% if cases|length == 100 %} (latest 100){% endif %}</span></header>
+  <form id="case-filters" class="filters" hx-preserve method="get" action="/partials/cases" hx-get="/partials/cases" hx-target="#poll-cases" hx-swap="innerHTML" hx-trigger="input changed delay:300ms from:find input, change from:find select" role="search" aria-label="Filter cases">
+    <div class="field"><label for="filter-q">Search</label><input id="filter-q" type="search" name="q" value="{{ filters.q }}" placeholder="issue #, title, repository" autocomplete="off"></div>
+    <div class="field"><label for="filter-phase">Phase</label>
+      <select id="filter-phase" name="phase">
+        <option value="" {% if not filters.phase %}selected{% endif %}>Any</option>
+        {% for key in FUNNEL_STAGES %}<option value="{{ key }}" {% if filters.phase == key %}selected{% endif %}>{{ FUNNEL_LABELS[key] }}</option>{% endfor %}
+        <option value="terminal" {% if filters.phase == "terminal" %}selected{% endif %}>Terminal</option>
+      </select>
+    </div>
+    <div class="field"><label for="filter-state">State</label>
+      <select id="filter-state" name="state">
+        <option value="" {% if not filters.state %}selected{% endif %}>Any</option>
+        {% for state in STATE_PRESENTATION %}<option value="{{ state }}" {% if filters.state == state %}selected{% endif %}>{{ state }}</option>{% endfor %}
+      </select>
+    </div>
+    <div class="field"><label for="filter-recommendation">Recommendation</label>
+      <select id="filter-recommendation" name="recommendation">
+        <option value="" {% if not filters.recommendation %}selected{% endif %}>Any</option>
+        {% for name in ["ELIGIBLE_FOR_DEVIN_TRIAGE", "NEEDS_SCOPING", "USE_DETERMINISTIC_AUTOMATION", "HUMAN_LED"] %}<option value="{{ name }}" {% if filters.recommendation == name %}selected{% endif %}>{{ name }}</option>{% endfor %}
+      </select>
+    </div>
+    <noscript><button type="submit">Filter</button></noscript>
+  </form>
+  <div class="table-wrap" tabindex="0" role="region" aria-labelledby="cases-title">
+    <table>
+      <caption class="sr-only">Ledger of the latest cases, filtered by the controls above</caption>
+      <thead><tr><th scope="col">Issue</th><th scope="col">State</th><th scope="col">Phase</th><th scope="col">Recommendation</th><th scope="col">Session</th><th scope="col">PR</th><th scope="col">CI</th><th scope="col">In stage</th></tr></thead>
+      <tbody>
+        {% for case in filtered_cases %}
+        {% set stage = stage_for_state(case.state) %}
+        <tr>
+          <th scope="row">{{ ui.case_link(case) }}<span class="muted small">{{ case.repository }}</span></th>
+          <td>{{ b.state(case.state) }}</td>
+          <td>{% if stage %}{{ FUNNEL_LABELS[stage] }}{% else %}<span class="muted">Terminal</span>{% endif %}</td>
+          <td>{% if case.recommendation %}<code>{{ case.recommendation.value }}</code>{% else %}<span class="muted">-</span>{% endif %}</td>
+          <td>{% if case.devin_session_id %}{% if case.devin_session_url %}<a href="{{ case.devin_session_url }}" rel="noopener" class="ext" class="mono">{{ short(case.devin_session_id, 18) }}</a>{% else %}<span class="mono">{{ short(case.devin_session_id, 18) }}</span>{% endif %}{% else %}<span class="muted">-</span>{% endif %}</td>
+          <td>{% if case.pr_url %}{{ ui.ext(case.pr_url, "PR") }}{% else %}<span class="muted">-</span>{% endif %}</td>
+          <td>{% if case.ci_status %}{{ b.enum("ci", case.ci_status) }}{% else %}<span class="muted">-</span>{% endif %}</td>
+          <td>{{ ui.ago(case.state_entered_at) }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="8" class="empty">{% if cases %}No cases match the current filters.{% else %}No cases yet.{% endif %}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>

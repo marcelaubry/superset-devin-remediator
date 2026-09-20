@@ -1,0 +1,11 @@
+{% import "macros/badges.html" as b %}
+<ul class="mode-chips" aria-label="Provider modes">
+  {% for name, mode in modes.items() %}{{ b.mode_chip(name, mode) }}{% endfor %}
+</ul>
+{% if active_session_count is defined %}
+<span id="active-sessions" class="badge tone-{{ 'info' if active_session_count else 'neutral' }}" data-value="{{ active_session_count }}" title="Devin sessions currently owned by running attempts"><span class="badge-glyph" aria-hidden="true">●</span>{{ active_session_count }} active session{{ '' if active_session_count == 1 else 's' }}</span>
+{% endif %}
+{% if attention_blocked is defined and (attention_blocked or attention_failed) %}
+<a class="badge tone-{{ 'warn' if attention_blocked else 'err' }}" href="#attention" title="Cases requiring attention"><span class="badge-glyph" aria-hidden="true">⛔</span>{{ attention_blocked + attention_failed }} need attention</a>
+{% endif %}
+<span class="refresh-stamp">Refreshed <time id="rendered-at" datetime="{{ iso(rendered_at) }}" title="{{ iso(rendered_at) }}">{{ clock(rendered_at) }}</time></span>

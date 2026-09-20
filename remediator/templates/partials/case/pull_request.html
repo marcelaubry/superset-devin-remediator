@@ -1,0 +1,47 @@
+{% import "macros/badges.html" as b %}
+{% import "macros/ui.html" as ui %}
+{% if remediation and remediation.attempts %}
+<section id="pull-request" class="panel" aria-labelledby="pr-title">
+  <header class="panel-head"><h2 id="pr-title">Pull request verification</h2><span class="count">{{ remediation.attempts|length }} remediation attempt{{ '' if remediation.attempts|length == 1 else 's' }}</span></header>
+  {% for item in remediation.attempts %}
+  <details {% if loop.last %}open{% endif %}>
+    <summary>Attempt {{ loop.index }} <span class="muted">of {{ loop.length }}</span> · {{ ui.ident(item.operation_key, 22) }} · {{ b.enum("attempt", item.status) }}{% if item.duration_seconds is not none %} · {{ item.duration_seconds }}s{% endif %}{% if item.failure_stage %} · failed at <code>{{ item.failure_stage }}</code> ({{ item.failure_class }}){% endif %}</summary>
+    <dl class="facts">
+      <dt>Devin session</dt><dd>{% if item.devin_session_id %}{{ ui.ident(item.devin_session_id, 28, item.devin_session_url) }}{% else %}not created{% endif %}{% if item.devin_status %} · <code>{{ item.devin_status }}</code>{% endif %} · {{ ui.acu(item) }}</dd>
+      <dt>Authorised against</dt><dd>approval {{ ui.ident(item.approval_request_id, 12) }} · triage {{ ui.sha(item.triage_result_hash, 12) }} · base {{ ui.sha(item.base_sha) }}</dd>
+      <dt>Devin-reported PRs</dt><dd>{% for pr in item.devin_pull_requests %}{{ ui.ext(pr.pr_url) }} {% if pr.pr_state %}{{ b.enum("pr", pr.pr_state) }}{% else %}<span class="muted">(?)</span>{% endif %}{% if not loop.last %}, {% endif %}{% else %}<span class="muted">none</span>{% endfor %}</dd>
+      <dt>Verified PR</dt><dd>{% if item.pr_url %}{{ ui.ext(item.pr_url, "#" ~ item.pr_number) }} · branch {{ ui.ident(item.branch, 32) }} · head {{ ui.sha(item.head_sha) }}{% else %}<span class="muted">not verified</span>{% endif %}</dd>
+      {% if item.error %}<dt>Error</dt><dd>{{ item.error }}</dd>{% endif %}
+    </dl>
+    {% if item.pull_request_evidence %}
+    <h3>GitHub PR corroboration</h3>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="GitHub PR corroboration for attempt {{ item.operation_key }}">
+      <table>
+        <caption class="sr-only">Pull request facts fetched from GitHub and the verifier verdict</caption>
+        <thead><tr><th scope="col">PR</th><th scope="col">State</th><th scope="col">Base</th><th scope="col">Head</th><th scope="col">Author</th><th scope="col">Compare</th><th scope="col">Closing refs</th><th scope="col">Verdict</th></tr></thead>
+        <tbody>
+          {% for ev in item.pull_request_evidence %}
+          <tr>
+            <th scope="row">{{ ui.ext(ev.pr_url, ev.repository ~ "#" ~ ev.pr_number) }}</th>
+            <td>{{ b.enum("pr", "merged" if ev.merged else ev.state) }}{% if ev.draft %} <span class="muted small">draft</span>{% endif %}</td>
+            <td><code>{{ ev.base_ref }}</code> @ {{ ui.sha(ev.base_sha) }}</td>
+            <td><code>{{ ev.head_ref }}</code> @ {{ ui.sha(ev.head_sha) }}</td>
+            <td>{{ ev.author_login or "?" }} <span class="muted small">({{ ev.author_type or "?" }})</span></td>
+            <td>{{ ev.compare_status or "-" }} <span class="nowrap">+{{ ev.ahead_by if ev.ahead_by is not none else "?" }} / −{{ ev.behind_by if ev.behind_by is not none else "?" }}</span></td>
+            <td>{{ ev.closing_issue_numbers|join(", ") or "-" }} <span class="muted small">({{ ev.closing_reference_source or "-" }})</span></td>
+            <td>{{ b.check(ev.valid, "valid", "invalid") }} <span class="small">{{ ev.verdict }}</span></td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% endif %}
+  </details>
+  {% endfor %}
+</section>
+{% elif remediation %}
+<section id="pull-request" class="panel" aria-labelledby="pr-title">
+  <header class="panel-head"><h2 id="pr-title">Pull request verification</h2></header>
+  <p class="empty">No remediation attempt has been dispatched yet.</p>
+</section>
+{% endif %}
