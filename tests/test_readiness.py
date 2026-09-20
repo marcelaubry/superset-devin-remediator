@@ -56,7 +56,7 @@ def _live_settings(**overrides: object) -> Settings:
         "ci_poll_interval_seconds": 60,
     }
     base.update(overrides)
-    return Settings(**base)  # type: ignore[arg-type]
+    return Settings(_env_file=None, **base)  # type: ignore[arg-type,call-arg]
 
 
 def _capabilities() -> dict[str, object]:
@@ -94,7 +94,14 @@ def _happy_handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(200, json={"email": "svc@acme.test", "org_id": "org_42"})
         if "/sessions" in path:
             return httpx.Response(200, json={"items": [{"session_id": "x"}]})
+        if path == "/v3beta1/organizations/org_42/repositories":
+            assert request.url.params["only_repo_paths"] == "acme/superset"
+            return httpx.Response(
+                200, json={"items": [{"repo_path": "acme/superset", "repo_name": "superset"}]}
+            )
     if host == "api.github.com":
+        if path == "/repos/acme/superset/commits/master":
+            return httpx.Response(200, json={"sha": "7" * 40})
         if path == "/repos/acme/superset":
             return httpx.Response(
                 200,
@@ -156,8 +163,12 @@ async def test_default_run_is_read_only_and_redacted() -> None:
 
     assert by_name["devin.identity"].status == "pass"
     assert by_name["devin.list_sessions"].status == "pass"
+    assert by_name["devin.repos_format"].status == "pass"
+    assert by_name["devin.repository_access[acme/superset]"].status == "pass"
     assert by_name["github.repository[acme/superset]"].status == "pass"
     assert by_name["github.default_branch[acme/superset]"].status == "pass"
+    assert by_name["github.base_sha[acme/superset]"].status == "pass"
+    assert "7" * 40 in by_name["github.base_sha[acme/superset]"].detail
     assert by_name["github.label[acme/superset:devin:remediate]"].status == "pass"
     assert by_name["slack.identity"].status == "pass"
     assert by_name["slack.channel"].status == "pass"

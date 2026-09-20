@@ -8,23 +8,42 @@
 # Toolchain pinned to the Superset checkout this deployment verifies
 # (superset-frontend/package.json engines: node ^24.16.0, npm ^11.13.0; .nvmrc v24.16.0);
 # npm follows the newest 11.x so its bundled node-tar/undici carry the current CVE fixes.
+#
+# Multi-architecture: the Node tarball is chosen from BuildKit's TARGETARCH (amd64 -> Node
+# "x64", arm64 -> Node "arm64") so the binary always matches the python:3.11-slim base of
+# the same platform. Any other architecture fails the build instead of producing an image
+# whose node cannot exec. Each tarball is verified against the SHA-256 pinned below, copied
+# from https://nodejs.org/dist/v24.16.0/SHASUMS256.txt; bumping NODE_VERSION requires
+# updating both digests (tests/test_phase6_canary.py pins the version and both digests).
 ARG NODE_VERSION=24.16.0
+ARG NODE_SHA256_X64=d804845d34eddc21dc1092b519d643ef40b1f58ec5dec5c22b1f4bd8fabde6c9
+ARG NODE_SHA256_ARM64=524659219d6a207a7400f2bde15d19ba060ffbe0d32a8643319ad67e3bb64c78
 ARG NPM_VERSION=11.19.1
 ARG YARN_VERSION=1.22.22
 
 FROM python:3.11-slim AS node-fetch
+ARG TARGETARCH
 ARG NODE_VERSION
+ARG NODE_SHA256_X64
+ARG NODE_SHA256_ARM64
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl xz-utils \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /node
-# The tarball is checked against the release SHASUMS published for that exact version.
-RUN curl -fsSLO "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" \
- && curl -fsSLO "https://nodejs.org/dist/v${NODE_VERSION}/SHASUMS256.txt" \
- && grep " node-v${NODE_VERSION}-linux-x64.tar.xz\$" SHASUMS256.txt | sha256sum -c - \
- && mkdir -p /opt/node \
- && tar -xJf "node-v${NODE_VERSION}-linux-x64.tar.xz" -C /opt/node --strip-components=1 \
- && rm -f "node-v${NODE_VERSION}-linux-x64.tar.xz" SHASUMS256.txt
+RUN set -eu; \
+    arch="${TARGETARCH:-$(dpkg --print-architecture)}"; \
+    case "${arch}" in \
+      amd64) node_arch=x64;   node_sha256="${NODE_SHA256_X64}" ;; \
+      arm64) node_arch=arm64; node_sha256="${NODE_SHA256_ARM64}" ;; \
+      *) echo "unsupported architecture '${arch}': only amd64 and arm64 have a pinned Node ${NODE_VERSION} artifact" >&2; exit 1 ;; \
+    esac; \
+    tarball="node-v${NODE_VERSION}-linux-${node_arch}.tar.xz"; \
+    curl -fsSLO "https://nodejs.org/dist/v${NODE_VERSION}/${tarball}"; \
+    echo "${node_sha256}  ${tarball}" | sha256sum -c -; \
+    mkdir -p /opt/node; \
+    tar -xJf "${tarball}" -C /opt/node --strip-components=1; \
+    rm -f "${tarball}"; \
+    /opt/node/bin/node --version | grep -qx "v${NODE_VERSION}"
 
 FROM python:3.11-slim
 ARG NPM_VERSION

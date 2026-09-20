@@ -1,4 +1,5 @@
 import ipaddress
+import re
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
@@ -15,6 +16,27 @@ MIN_LIVE_CI_POLL_INTERVAL_SECONDS = 30.0
 DEFAULT_PR_AUTHOR_LOGINS = "devin-ai-integration[bot]"
 MIN_LIVE_SECRET_LENGTH = 16
 PLACEHOLDER_SECRET = "change-me"
+# `repos[]` entries on POST /sessions are repository paths (`owner/repo`), the identifier
+# every other v3 repository surface uses (`repo_names` filter, repository listing).
+DEFAULT_DEVIN_REPOS_FORMAT = "{repository}"
+REPOS_FORMAT_PLACEHOLDER = "{repository}"
+CANARY_CONCURRENCY_LIMIT = 1
+_FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def format_devin_repo(repos_format: str, repository: str) -> str:
+    return repos_format.replace(REPOS_FORMAT_PLACEHOLDER, repository)
+
+
+def repos_format_problem(repos_format: str) -> str | None:
+    """Why `repos_format` cannot produce a `repos[]` entry, or None."""
+    if REPOS_FORMAT_PLACEHOLDER not in repos_format:
+        return f"must contain the literal {REPOS_FORMAT_PLACEHOLDER}"
+    if repos_format.count(REPOS_FORMAT_PLACEHOLDER) > 1:
+        return f"must contain {REPOS_FORMAT_PLACEHOLDER} exactly once"
+    if any(ch.isspace() for ch in repos_format):
+        return "must not contain whitespace"
+    return None
 
 
 def unsafe_service_url(url: str) -> str | None:
@@ -72,6 +94,10 @@ class Settings(BaseSettings):
     operator_token: str = "change-me"
     github_repository: str = "apache/superset"
     github_base_ref: str = "master"
+    # Optional, readiness-only: the last base SHA a human verified probes/tooling against.
+    # Readiness resolves the live tip of GITHUB_BASE_REF and reports whether it still matches;
+    # the pipeline always pins the resolved tip, never this value.
+    github_base_sha_reference: str = ""
     github_api_base_url: str = "https://api.github.com"
     github_token: SecretStr | None = None
     github_client_mode: Literal["fake", "live"] = "fake"
@@ -96,7 +122,10 @@ class Settings(BaseSettings):
     devin_api_key: SecretStr | None = None
     devin_org_id: str | None = None
     devin_api_base_url: str = "https://api.devin.ai/v3"
-    devin_repos_format: str = "https://github.com/{repository}"
+    devin_repos_format: str = DEFAULT_DEVIN_REPOS_FORMAT
+    # Opt-in fail-closed envelope for the first live end-to-end run: exactly one allowlisted
+    # repository, a mandatory intake label and every concurrency limit at 1.
+    live_canary: bool = False
     devin_triage_max_acu: int = 5
     devin_triage_timeout_seconds: float = 1800.0
     devin_poll_interval_seconds: float = 15.0
@@ -310,6 +339,11 @@ class Settings(BaseSettings):
             raise ValueError("PROBE_RUNNER_MODE=remote requires PROBE_VERIFIER_URL (http(s) URL)")
         if not self.allowed_repositories:
             raise ValueError("GITHUB_REPOSITORY must name at least one allowlisted repository")
+        if problem := repos_format_problem(self.devin_repos_format):
+            raise ValueError(f"DEVIN_REPOS_FORMAT {problem}")
+        reference = self.github_base_sha_reference.strip()
+        if reference and not _FULL_SHA_RE.match(reference):
+            raise ValueError("GITHUB_BASE_SHA_REFERENCE must be a full 40-hex commit SHA")
         for name, value in (
             ("MAX_CONCURRENT_TRIAGE", self.max_concurrent_triage),
             ("MAX_CONCURRENT_REMEDIATION", self.max_concurrent_remediation),
@@ -430,6 +464,47 @@ class Settings(BaseSettings):
                 f"{MIN_LIVE_CI_POLL_INTERVAL_SECONDS:g}s in live mode"
             )
         return self
+
+    @model_validator(mode="after")
+    def _validate_live_canary(self) -> "Settings":
+        if self.live_canary:
+            for problem in self.canary_violations:
+                raise ValueError(f"LIVE_CANARY=true: {problem}")
+        return self
+
+    @property
+    def canary_violations(self) -> list[str]:
+        """Controlled-canary envelope violations (empty when the configuration fits)."""
+        problems: list[str] = []
+        if len(self.allowed_repositories) != 1:
+            problems.append(
+                "GITHUB_REPOSITORY must name exactly one repository, "
+                f"got {len(self.allowed_repositories)}"
+            )
+        if not self.github_required_label.strip():
+            problems.append("GITHUB_REQUIRED_LABEL must name the intake label")
+        if self.github_required_label.strip().lower() == self.github_remediation_label.lower():
+            problems.append("GITHUB_REQUIRED_LABEL must differ from GITHUB_REMEDIATION_LABEL")
+        for name, value in (
+            ("MAX_CONCURRENT_TRIAGE", self.max_concurrent_triage),
+            ("MAX_CONCURRENT_REMEDIATION", self.max_concurrent_remediation),
+            ("MAX_CONCURRENT_PROBES", self.max_concurrent_probes),
+            (
+                "MAX_CONCURRENT_REMEDIATION_PER_REPOSITORY",
+                self.max_concurrent_remediation_per_repository,
+            ),
+        ):
+            if value != CANARY_CONCURRENCY_LIMIT:
+                problems.append(f"{name} must be {CANARY_CONCURRENCY_LIMIT}, got {value}")
+        if self.live_mode and not (self.github_live and self.slack_live):
+            problems.append(
+                "GITHUB_CLIENT_MODE and SLACK_CLIENT_MODE must be live once Devin is live"
+            )
+        if (self.github_live or self.slack_live) and not self.cookie_secure:
+            problems.append("COOKIE_SECURE must be true (dashboard behind HTTPS)")
+        if self.probe_runner_mode != "remote":
+            problems.append("PROBE_RUNNER_MODE must be remote (isolated verifier)")
+        return problems
 
     @model_validator(mode="after")
     def _validate_verifier_auth(self) -> "Settings":

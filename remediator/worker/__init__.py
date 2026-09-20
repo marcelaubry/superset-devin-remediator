@@ -487,17 +487,31 @@ class Worker:
         metrics_task = (
             asyncio.create_task(metrics_server.serve()) if metrics_server is not None else None
         )
+        stop_waiter = asyncio.create_task(self.stop_event.wait())
+        crashed: BaseException | None = None
         try:
-            await self.stop_event.wait()
+            done, _ = await asyncio.wait([stop_waiter, *tasks], return_when=asyncio.FIRST_COMPLETED)
+            for task in tasks:
+                if task in done and not task.cancelled() and task.exception() is not None:
+                    # A loop died on a non-transient error (schema drift, programming error).
+                    # Stop the whole process so the supervisor restarts it instead of leaving
+                    # a container that looks healthy but claims no work.
+                    crashed = task.exception()
+                    logger.critical("worker loop crashed, shutting down", exc_info=crashed)
+                    self.stop_event.set()
+                    break
             try:
                 await asyncio.wait_for(
-                    asyncio.gather(*tasks), timeout=self.settings.worker_shutdown_timeout_seconds
+                    asyncio.gather(*tasks, return_exceptions=True),
+                    timeout=self.settings.worker_shutdown_timeout_seconds,
                 )
             except TimeoutError:
                 for task in tasks:
                     task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
         finally:
+            stop_waiter.cancel()
+            await asyncio.gather(stop_waiter, return_exceptions=True)
             if metrics_server is not None and metrics_task is not None:
                 metrics_server.should_exit = True
                 await asyncio.gather(metrics_task, return_exceptions=True)
@@ -508,6 +522,8 @@ class Worker:
             if isinstance(self.probes, RemoteProbeRunner):
                 await self.probes.aclose()
             await self.engine.dispose()
+        if crashed is not None:
+            raise crashed
 
     def stop(self) -> None:
         self.stop_event.set()

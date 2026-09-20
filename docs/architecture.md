@@ -22,6 +22,19 @@
   `status_detail` vocabulary) per deterministic scenario and never touches the
   network. Both share `status.classify`, the Draft 7 triage output schema, the
   versioned prompt template, and the tag helpers.
+
+  Contract as re-verified against the published `v3-openapi.json` and the
+  Devin docs during Phase 6 (nothing here creates a session):
+
+  | Surface | Implementation | Official contract |
+  | --- | --- | --- |
+  | Create | `POST /v3/organizations/{org_id}/sessions` with `prompt`, `repos[1]`, `tags`, `max_acu_limit`, `structured_output_required=true`, `structured_output_schema`, `resumable=false`, `title` | Same path; permission `UseDevinSessions`; every listed field is an optional `SessionCreateRequest` member (`repos: array[string] \| null`) |
+  | Repository identifier | `repos[0] = DEVIN_REPOS_FORMAT.format(repository)`, default `{repository}` → `owner/repo` | The create schema types the entry as a bare string. Every other v3 repository surface uses the repository *path*: the session-list `repo_names` filter documents `owner/repo`, the repository listing exposes `repo_path`. `owner/repo` is therefore the supported default (an inference from those surfaces, not a field-level sentence in the create schema); readiness `devin.repository_access` confirms the exact path against the organization's listing before the first live create |
+  | Tags | operation key as first exact tag + `repo:`/`issue:`/`kind:`/`case:`/`attempt:` | `tags: array[string]`; list supports tag filtering but reconciliation still matches the operation key exactly on the client |
+  | Status | `new`, `claimed`, `running`, `exit`, `error`, `suspended`, `resuming` + `status_detail` | Identical enum in the session response |
+  | List / get / terminate | `GET …/sessions?first=&after=`, `GET …/sessions/{id}`, `DELETE …/sessions/{id}` | `items` + `end_cursor` + `has_next_page`; `ViewOrgSessions` for reads, `ManageOrgSessions` for delete |
+  | PRs | `pull_requests[]` parsed from `pr_url`/`pr_state`; entries without `pr_url` are ignored | `pull_requests[]` with `pr_url`, `pr_state` in the artifact |
+  | ACUs | `acus_consumed` on the session; consumption endpoint optional | `acus_consumed` present; consumption needs `ViewOrgConsumption` and a supporting plan |
 - **DevinRunner (`remediator/worker/devin_runner.py`):** The bounded session
   state machine: durable create intent → single create → reconcile-by-tag →
   poll until deadline → final GET → remote termination → schema validation.
