@@ -13,14 +13,26 @@ container (docker/verifier/Dockerfile, the `verifier` service in docker-compose.
 The wire protocol is deliberately tiny: `POST /probe` takes a `ProbeRunSpec` and returns a
 `ProbeRunResult`. The verifier decides nothing about the case; it only executes the already
 snapshotted script against one exact commit.
+
+Probes are serialized: one in flight per verifier (`409` otherwise, which the worker treats
+as transient and retries later), and after every run every remaining process of the probe
+UID is killed. A descendant that escaped the process group *and* dropped the run marker
+therefore cannot outlive its own probe and tamper with the next one's workspace.
 """
 
+import asyncio
 import os
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 
-from ..probes.runner import LocalProbeRunner, ProbeResourceLimits, _which, credential_exposure
+from ..probes.runner import (
+    LocalProbeRunner,
+    ProbeResourceLimits,
+    _which,
+    credential_exposure,
+    kill_stray_processes,
+)
 from .protocol import (
     KNOWN_TOOLS,
     VERIFIER_PROTOCOL_VERSION,
@@ -72,6 +84,7 @@ def create_app(config: VerifierConfig | None = None) -> FastAPI:
         cfg.clone_url_format, workspace_root=cfg.workspace_root, limits=cfg.limits
     )
     app = FastAPI(title="remediator probe verifier", docs_url=None, redoc_url=None)
+    busy = asyncio.Lock()
 
     @app.get("/health", response_model=Health)
     async def get_health() -> Health:
@@ -81,6 +94,13 @@ def create_app(config: VerifierConfig | None = None) -> FastAPI:
     async def run_probe(request: ProbeRequest) -> ProbeResponse:
         if request.protocol_version != VERIFIER_PROTOCOL_VERSION:
             raise HTTPException(status_code=400, detail="unsupported protocol_version")
-        return ProbeResponse.from_result(await runner.run(request.to_spec(cfg.max_timeout_seconds)))
+        if busy.locked():
+            raise HTTPException(status_code=409, detail="a probe is already running")
+        async with busy:
+            try:
+                result = await runner.run(request.to_spec(cfg.max_timeout_seconds))
+            finally:
+                await asyncio.to_thread(kill_stray_processes)
+        return ProbeResponse.from_result(result)
 
     return app

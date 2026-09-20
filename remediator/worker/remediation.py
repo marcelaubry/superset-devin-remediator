@@ -66,6 +66,7 @@ from ..models import (
     PullRequestEvidence,
 )
 from ..probes.registry import ProbeRegistryError, load_approved_probe
+from ..probes.remote import VerifierBusyError
 from ..probes.runner import ProbeRunner, ProbeRunResult, ProbeRunSpec
 from ..slack.blocks import RemediationProgress, remediation_headline
 from .devin_runner import (
@@ -1052,7 +1053,10 @@ class RemediationPipeline:
             required_tools=tuple(str(t) for t in (snapshot.runtime.get("tools") or [])),
         )
         started = self.clock()
-        result: ProbeRunResult = await self.probes.run(spec)
+        try:
+            result: ProbeRunResult = await self.probes.run(spec)
+        except VerifierBusyError as exc:
+            raise TransientVerificationError(str(exc)) from exc
         if result.infrastructure_failed:
             verdict = ProbeVerdict.INFRASTRUCTURE
         elif result.exit_code == expected and not result.timed_out:

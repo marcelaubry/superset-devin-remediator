@@ -478,6 +478,57 @@ def marked_pids(marker: str, proc_root: Path = Path("/proc")) -> list[int]:
     return found
 
 
+def stray_pids(proc_root: Path = Path("/proc"), keep: frozenset[int] = frozenset()) -> list[int]:
+    """Every live (non-zombie) process owned by this UID other than the caller, its parent
+    and `keep`. In the verifier container nothing else runs under the probe UID, so anything
+    left after a probe returned is a descendant that escaped the process group and dropped
+    the run marker."""
+    spare = set(keep) | {os.getpid(), os.getppid(), 1}
+    uid = os.getuid()
+    found: list[int] = []
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return found
+    for entry in entries:
+        if not entry.name.isdigit() or int(entry.name) in spare:
+            continue
+        try:
+            status = (entry / "status").read_text()
+        except OSError:
+            continue
+        fields = dict(line.split(":", 1) for line in status.splitlines() if ":" in line)
+        if fields.get("State", "").strip().startswith("Z"):
+            continue
+        owner = fields.get("Uid", "").split()
+        if owner and int(owner[0]) == uid:
+            found.append(int(entry.name))
+    return found
+
+
+def kill_stray_processes(
+    proc_root: Path = Path("/proc"), keep: frozenset[int] = frozenset()
+) -> int:
+    """SIGKILL every stray process of this UID (see `stray_pids`); returns how many were hit.
+    Never runs as root: there the UID does not scope the sweep to probe descendants (and the
+    verifier refuses to serve as root anyway)."""
+    if os.getuid() == 0:
+        return 0
+    killed = 0
+    for _ in range(10):
+        pids = stray_pids(proc_root, keep)
+        if not pids:
+            break
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+                killed += 1
+            except (ProcessLookupError, PermissionError):
+                continue
+        time.sleep(0.05)
+    return killed
+
+
 def kill_marked_processes(marker: str, proc_root: Path = Path("/proc")) -> int:
     """SIGKILL every process still carrying the run marker; returns how many were signalled.
     Repeats until a sweep finds nothing so a forking child cannot outrun it."""

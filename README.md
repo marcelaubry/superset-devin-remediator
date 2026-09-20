@@ -263,7 +263,7 @@ failed termination, concurrent retries, and worker restart in every state.
 | `DEVIN_REMEDIATION_TIMEOUT_SECONDS` | `5400` | Absolute remediation deadline; final GET then `DELETE`; live mode enforces `>= 600` |
 | `DEVIN_REMEDIATION_BRANCH_PREFIX` | `devin/` | Required prefix of the PR head branch |
 | `PROBE_RUNNER_MODE` | `fake` | `fake` (deterministic by issue number) or `remote` (credential-free verifier container); the worker has no `local` mode |
-| `PROBE_VERIFIER_URL` | *(unset)* | Verifier base URL, required with `remote`; the worker refuses a verifier whose `/health` shows credentials, UID 0 or a writable root |
+| `PROBE_VERIFIER_URL` | *(unset)* | Verifier base URL, required with `remote`; the worker refuses a verifier whose `/health` shows credentials, UID 0 or a writable root. One probe runs at a time per verifier (`409` while busy → retried) |
 | `PROBE_ROOT` | `probes` | Immutable probe registry root; must exist in live mode |
 | `PROBE_TIMEOUT_SECONDS` | `900` | Upper bound for one probe run (manifest may be shorter) |
 | `PROBE_MAX_OUTPUT_BYTES` | `65536` | Per-stream stdout/stderr capture cap |

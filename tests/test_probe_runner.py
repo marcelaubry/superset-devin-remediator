@@ -14,9 +14,11 @@ from pathlib import Path
 import httpx
 import pytest
 
+import remediator.probes.runner as runner_module
+import remediator.verifier as verifier_module
 from remediator.models import ProbeTarget
 from remediator.probes import build_probe_runner
-from remediator.probes.remote import RemoteProbeRunner
+from remediator.probes.remote import RemoteProbeRunner, VerifierBusyError
 from remediator.probes.runner import (
     PROBE_RUN_MARKER,
     FakeProbeRunner,
@@ -336,6 +338,78 @@ async def test_remote_runner_forwards_spec_and_checks_identity() -> None:
     assert "different command identity" in result.infrastructure_error
 
 
+async def test_remote_runner_busy_verifier_is_retried_not_recorded() -> None:
+    stub = _Stub(_health_json())
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json=stub.health_json)
+        return httpx.Response(409, json={"detail": "a probe is already running"})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://v")
+    with pytest.raises(VerifierBusyError):
+        await RemoteProbeRunner("http://v", client=client).run(_spec("a" * 40, "exit 0\n"))
+
+
+async def test_verifier_serializes_probes_and_kills_unmarked_escapees(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R1: one probe in flight per verifier (409 otherwise) and, after each run, every
+    remaining process of the probe UID is killed even if it dropped the run marker."""
+    monkeypatch.setattr(runner_module, "credential_exposure", lambda: [])
+    _, sha = _git_repo(tmp_path)
+    escapee = tmp_path / "escapee.pid"
+
+    def sweep_only_the_escapee() -> int:
+        # Outside the verifier container this UID owns the whole test session, so the real
+        # sweep is scoped to the one process the probe leaked.
+        target = int(escapee.read_text().strip())
+        keep = frozenset(int(p) for p in os.listdir("/proc") if p.isdigit() and int(p) != target)
+        return runner_module.kill_stray_processes(keep=keep)
+
+    monkeypatch.setattr(verifier_module, "kill_stray_processes", sweep_only_the_escapee)
+    slow = _spec(
+        sha,
+        f"env -u {PROBE_RUN_MARKER} setsid bash -c 'echo $$ > {escapee}; sleep 300' "
+        "</dev/null >/dev/null 2>&1 &\n"
+        "sleep 0.3\nexit 0\n",
+    )
+    cfg = VerifierConfig(
+        {
+            "VERIFIER_CLONE_URL_FORMAT": "https://example.invalid/{repository}.git",
+            "VERIFIER_WORKSPACE_ROOT": str(tmp_path),
+            "VERIFIER_MAX_TIMEOUT_SECONDS": "30",
+        }
+    )
+    cfg.clone_url_format = f"file://{tmp_path}/origin/{{repository}}.git"
+    app = create_app(cfg)
+    body = {"protocol_version": VERIFIER_PROTOCOL_VERSION, **slow.__dict__, "target": "BASE"}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://verifier"
+    ) as client:
+        first = asyncio.create_task(client.post("/probe", json=body))
+        await asyncio.sleep(0.1)
+        second = await client.post("/probe", json=body)
+        assert second.status_code == 409
+        response = await first
+    assert response.status_code == 200, response.text
+    assert response.json()["exit_code"] == 0
+    pid = int(escapee.read_text().strip())
+    for _ in range(40):
+        if not _alive(pid):
+            break
+        await asyncio.sleep(0.05)
+    assert not _alive(pid), "unmarked setsid escapee survived the probe"
+
+
+def _alive(pid: int) -> bool:
+    try:
+        status = Path(f"/proc/{pid}/status").read_text()
+    except OSError:
+        return False
+    return "State:\tZ" not in status
+
+
 async def test_remote_runner_unreachable_is_infrastructure_not_verdict() -> None:
     def boom(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("refused", request=request)
@@ -356,3 +430,16 @@ def test_worker_factory_offers_only_fake_or_remote() -> None:
 def test_health_model_credential_free_property() -> None:
     assert Health.model_validate(_health_json()).credential_free is True
     assert Health.model_validate(_health_json(uid=0)).credential_free is False
+
+
+def test_verifier_entrypoint_pins_the_stdlib_event_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Under uvloop a detached probe descendant keeps the child's stdio socketpair open and
+    `Process.wait()` never resolves, so every such probe would be misreported as a timeout."""
+    import uvicorn
+
+    from remediator.verifier import __main__ as entrypoint
+
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kw: calls.append(kw))
+    entrypoint.main()
+    assert calls and calls[0]["loop"] == "asyncio"

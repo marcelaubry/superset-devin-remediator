@@ -65,6 +65,7 @@ services:
       VERIFIER_MAX_PROCESSES: "256"
       VERIFIER_MAX_FILE_SIZE_BYTES: "536870912"
     user: "65534:65534"
+    init: true
     read_only: true
     tmpfs:
       - /tmp:size=4g,mode=1777,uid=65534,gid=65534

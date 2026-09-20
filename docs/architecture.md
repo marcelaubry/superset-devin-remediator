@@ -614,7 +614,9 @@ the Devin client closes and the database engine is disposed.
   fixed argv, a minimal environment (`PATH`, `HOME`, `LANG`, `CI=1`,
   non-interactive git, a per-run marker), an anonymous HTTPS clone of the exact
   commit, `start_new_session`, rlimits, a deadline that includes `proc.wait()`,
-  `killpg` plus a `/proc` marker sweep for detached descendants, bounded
+  `killpg` plus a `/proc` marker sweep for detached descendants, one probe in
+  flight per verifier (`409` → worker retry) followed by a sweep of every
+  remaining process of the probe UID, `init: true` for orphan reaping, bounded
   captures, and `tempfile` cleanup. See [threat-model.md](threat-model.md) and
   [known-limitations.md](known-limitations.md).
 - Live Devin mode also requires live GitHub and the remote probe runner, so a
@@ -665,8 +667,9 @@ the Devin client closes and the database engine is disposed.
 
 - **Verifier hardening:** the credential-free `verifier` container exists;
   still to do are enforced egress (only anonymous GitHub clones), an
-  authenticated worker↔verifier link (mTLS), and one-probe-per-container
-  scheduling so probes cannot interfere with each other.
+  authenticated worker↔verifier link (mTLS), and per-probe sub-UIDs or
+  namespaces / container recycling so a verifier is never reused after a
+  suspicious run.
 - **GitHub App identity:** replace the PAT with an installation token and pin
   `GITHUB_PR_AUTHOR_LOGINS` to the app's bot login.
 - **CI webhook ingestion:** advance `CI_PENDING` from `check_suite` /

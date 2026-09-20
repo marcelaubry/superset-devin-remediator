@@ -19,6 +19,11 @@ _HEALTH_TIMEOUT_SECONDS = 10.0
 _REQUEST_OVERHEAD_SECONDS = 120.0
 
 
+class VerifierBusyError(Exception):
+    """The verifier serializes probes and is occupied; the caller should retry later without
+    recording any verdict (not even an infrastructure failure)."""
+
+
 class RemoteProbeRunner:
     mode = "remote"
 
@@ -75,6 +80,8 @@ class RemoteProbeRunner:
             return self._infra(
                 identity, started, f"verifier request failed: {exc.__class__.__name__}"
             )
+        if response.status_code == 409:
+            raise VerifierBusyError("verifier is running another probe")
         if response.status_code != 200:
             return self._infra(identity, started, f"verifier returned HTTP {response.status_code}")
         try:

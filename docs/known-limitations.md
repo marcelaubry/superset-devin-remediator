@@ -21,11 +21,20 @@ What is still a limitation:
   Production should pin egress to GitHub with a network policy / egress proxy;
   a malicious probe can otherwise exfiltrate the repository contents it already
   has (it has no credentials to exfiltrate).
-- **Containment is per container, not per probe.** Descendants that both
-  clear their environment (dropping the run marker) and `setsid` out of the
-  process group survive until the container's `pids_limit`/restart. One probe
-  run at a time per verifier is the intended deployment; a compromised probe
-  can interfere with a concurrent one in the same container.
+- **One probe at a time per verifier.** `/probe` is serialized (a second
+  request gets `409`, which the worker treats as transient and retries on its
+  next claim), and after every run the verifier SIGKILLs every remaining
+  process of the probe UID, so a descendant that dropped the run marker and
+  `setsid`-escaped cannot outlive its probe or touch the next one's workspace.
+  `init: true` (tini) reaps whatever exits as an orphan. The cost is
+  throughput: probe verification is sequential per verifier instance; scale by
+  running more verifier containers behind distinct `PROBE_VERIFIER_URL`s, not
+  by lifting the lock.
+- **The verifier runs on the stdlib asyncio loop, not uvloop.** With uvloop
+  (uvicorn's default when installed) a probe that leaves any detached
+  descendant keeps the child's stdio socketpair open, `Process.wait()` never
+  resolves and the probe is misreported as a timeout. `remediator.verifier`
+  pins `loop="asyncio"`; keep it that way.
 - `RLIMIT_NPROC` is per UID, so it is only meaningful because the verifier UID
   runs nothing else. `RLIMIT_AS` is off by default (`VERIFIER_MAX_MEMORY_BYTES`)
   because Node/JVM toolchains reserve large address spaces; the container

@@ -111,7 +111,9 @@ environment, `min(manifest.timeout, PROBE_TIMEOUT_SECONDS,
 VERIFIER_MAX_TIMEOUT_SECONDS)` covering process exit (not just output), rlimits
 (`VERIFIER_MAX_PROCESSES`, `VERIFIER_MAX_FILE_SIZE_BYTES`, optional
 `VERIFIER_MAX_MEMORY_BYTES`), per-stream output caps, process-group kill plus a
-marker sweep that also kills `setsid`-detached descendants, and workspace
+marker sweep that also kills `setsid`-detached descendants, a post-run sweep of
+every remaining process of the probe UID (probes are serialized per verifier;
+a busy verifier answers `409` and the worker retries), and workspace
 cleanup. Missing `git`/`bash`/declared tools are an infrastructure failure,
 never a pass. The verifier image ships `git`, `bash`, `python3`, `node`, `npm`
 and `yarn`; declare what the script needs in `runtime.tools`.
