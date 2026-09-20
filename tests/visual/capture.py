@@ -30,7 +30,12 @@ OPERATOR_TOKEN = os.environ.get("OPERATOR_TOKEN", "change-me")
 REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "apache/superset")
 
 # "narrow" approximates a 390px phone with a classic 15px desktop scrollbar taking layout space.
-VIEWPORTS = {"desktop": (1440, 900), "mobile": (390, 844), "narrow": (360, 780)}
+VIEWPORTS = {
+    "desktop": (1440, 900),
+    "tablet": (820, 1180),
+    "mobile": (390, 844),
+    "narrow": (360, 780),
+}
 # Fixture issue numbers exercised by `simulate.py --scenario all`; each lands in a different
 # resting state so the case page is captured across the evidence hierarchy.
 CASE_ISSUES = {

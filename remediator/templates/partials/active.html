@@ -6,27 +6,20 @@
   <div class="table-wrap" tabindex="0" role="region" aria-labelledby="active-title">
     <table>
       <caption class="sr-only">Non-terminal cases and webhook deliveries being processed</caption>
-      <thead><tr><th scope="col">Issue</th><th scope="col">State</th><th scope="col">In stage</th><th scope="col">Session</th><th scope="col">Devin status</th><th scope="col">Create</th><th scope="col" class="num">ACU used / limit</th><th scope="col">Deadline</th></tr></thead>
+      <thead><tr><th scope="col">Case and state</th><th scope="col">Devin session · ACU</th><th scope="col">Deadline</th></tr></thead>
       <tbody>
         {% for case in active %}
         {% set attempt = latest_attempt(case) %}
         <tr>
-          <th scope="row">{{ ui.case_link(case) }}<span class="muted small">{{ case.repository }}</span></th>
-          <td>{{ b.state(case.state) }}</td>
-          <td>{{ ui.ago(case.state_entered_at) }}</td>
-          <td>{% if attempt and attempt.devin_session_id %}{% if attempt.devin_session_url %}<a href="{{ attempt.devin_session_url }}" rel="noopener" class="ext" class="mono">{{ short(attempt.devin_session_id, 18) }}</a>{% else %}<span class="mono">{{ short(attempt.devin_session_id, 18) }}</span>{% endif %} <span class="muted small">{{ attempt.kind|lower }}</span>{% else %}<span class="muted">-</span>{% endif %}</td>
-          <td>{% if attempt and attempt.devin_status %}{{ attempt.devin_status }}{% if attempt.devin_status_detail %} <span class="muted small">/ {{ attempt.devin_status_detail }}</span>{% endif %}{% else %}<span class="muted">-</span>{% endif %}</td>
-          <td>{% if attempt and attempt.create_state %}{{ b.enum("create", attempt.create_state) }}{% else %}<span class="muted">-</span>{% endif %}</td>
-          <td class="num">{% if attempt %}{{ ui.acu(attempt) }}{% else %}<span class="muted">-</span>{% endif %}</td>
+          <th scope="row" class="job-cell">{{ ui.case_link(case) }}<span class="job-sub">{{ case.repository }}</span><span class="job-state">{{ b.state(case.state) }}<span class="job-sub">in stage {{ ui.ago(case.state_entered_at) }}</span></span></th>
+          <td>{% if attempt and attempt.devin_session_id %}{{ ui.ident(attempt.devin_session_id, 18, attempt.devin_session_url) }} <span class="muted small">{{ attempt.kind.value|lower }}</span><span class="job-sub">{% if attempt.devin_status %}{{ attempt.devin_status }}{% if attempt.devin_status_detail %} / {{ attempt.devin_status_detail }}{% endif %}{% endif %}{% if attempt.create_state and attempt.create_state.value != "CREATED" %} · {{ b.enum("create", attempt.create_state) }}{% endif %}</span>{% elif attempt and attempt.create_state %}{{ b.enum("create", attempt.create_state) }}{% else %}<span class="muted">-</span>{% endif %}<span class="job-sub">{% if attempt %}{{ ui.acu(attempt) }}{% else %}-{% endif %}</span></td>
           <td>{% if attempt and attempt.timeout_at %}{{ ui.deadline(attempt.timeout_at) }}{% else %}<span class="muted">-</span>{% endif %}</td>
         </tr>
         {% endfor %}
         {% for event in processing_events %}
         <tr class="row-event">
-          <th scope="row">{% if event.case_id and event.case_id in case_by_id %}{{ ui.case_link(case_by_id[event.case_id]) }}{% elif event.case_id %}<a href="/cases/{{ event.case_id }}">case {{ short(event.case_id|string, 8) }}</a>{% else %}<span class="mono">delivery {{ short(event.delivery_id, 12) }}</span>{% endif %}<span class="muted small">{{ event.repository }}</span></th>
-          <td>{{ b.enum("event", event.status) }} <span class="muted small">webhook</span></td>
-          <td>{{ ui.ago(event.claimed_at) }}</td>
-          <td colspan="4" class="muted small">{{ event.event_type }}/{{ event.action }} claimed by <span class="mono">{{ event.claimed_by or "?" }}</span></td>
+          <th scope="row" class="job-cell">{% if event.case_id and event.case_id in case_by_id %}{{ ui.case_link(case_by_id[event.case_id]) }}{% elif event.case_id %}<a href="/cases/{{ event.case_id }}">case {{ short(event.case_id|string, 8) }}</a>{% else %}<span class="mono">delivery {{ short(event.delivery_id, 12) }}</span>{% endif %}<span class="job-sub">{{ event.repository }}</span><span class="job-state">{{ b.enum("event", event.status) }} <span class="muted small">webhook</span><span class="job-sub">claimed {{ ui.ago(event.claimed_at) }}</span></span></th>
+          <td class="muted small">{{ event.event_type }}/{{ event.action }} claimed by {{ ui.ident(event.claimed_by or "?", 18) }}</td>
           <td>{{ ui.deadline(event.lease_expires_at) }}</td>
         </tr>
         {% endfor %}

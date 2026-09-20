@@ -1,36 +1,28 @@
 {% import "macros/badges.html" as b %}
 {% import "macros/ui.html" as ui %}
 <section class="panel" aria-labelledby="attention-title" id="attention">
-  <header class="panel-head"><h2 id="attention-title">Requires attention</h2><span class="count">{{ failures|length }} item{{ '' if failures|length == 1 else 's' }} · blocked first, then failed, then webhook errors</span></header>
+  <header class="panel-head"><h2 id="attention-title">Requires attention</h2><span class="count">{{ failures|length }} item{{ '' if failures|length == 1 else 's' }} · blocked, then failed, then webhook errors</span></header>
   {% if failures %}
-  <div class="table-wrap" tabindex="0" role="region" aria-labelledby="attention-title">
-    <table>
-      <caption class="sr-only">Cases and webhook deliveries that need an operator</caption>
-      <thead><tr><th scope="col">Issue</th><th scope="col">Status</th><th scope="col">Reason</th><th scope="col">Since</th><th scope="col">Detail</th></tr></thead>
-      <tbody>
-        {% for item in failures %}
-        {% if item.state is defined %}
-        {% set p = present_state(item.state) %}
-        <tr class="{{ 'row-blocked' if p.glyph == '⛔' else 'row-failed' }}">
-          <th scope="row">{{ ui.case_link(item) }}<span class="muted small">{{ item.repository }}</span></th>
-          <td>{{ b.badge(p) }}</td>
-          <td class="reason">{{ item.failure_reason or "-" }}</td>
-          <td>{{ ui.ago(item.state_entered_at) }}</td>
-          <td><a class="button" href="/cases/{{ item.id }}">Open case</a></td>
-        </tr>
-        {% else %}
-        <tr class="row-event">
-          <th scope="row">{% if item.case_id and item.case_id in case_by_id %}{{ ui.case_link(case_by_id[item.case_id]) }}{% elif item.case_id %}<a href="/cases/{{ item.case_id }}">case {{ short(item.case_id|string, 8) }}</a>{% else %}<span class="mono">delivery {{ short(item.delivery_id, 12) }}</span>{% endif %}</th>
-          <td>{{ b.enum("event", item.status) }} <span class="muted small">webhook</span></td>
-          <td class="reason">{{ item.last_error or "-" }}</td>
-          <td>{{ ui.ago(item.received_at) }}</td>
-          <td class="muted small">{{ item.event_type }}/{{ item.action }} · {{ item.attempts_count }} attempt{{ '' if item.attempts_count == 1 else 's' }} · {{ item.repository }}</td>
-        </tr>
-        {% endif %}
-        {% endfor %}
-      </tbody>
-    </table>
-  </div>
+  <ol class="queue" aria-label="Cases and webhook deliveries that need an operator">
+    {% for item in failures %}
+    {% if item.state is defined %}
+    {% set p = present_state(item.state) %}
+    <li class="{{ 'row-blocked' if p.glyph == '⛔' else 'row-failed' }}">
+      <div class="queue-title">{{ ui.case_link(item) }}<span class="muted small">{{ item.repository }}</span>{{ b.badge(p) }}</div>
+      <a class="button queue-action" href="/cases/{{ item.id }}">Open case</a>
+      <p class="queue-reason">{{ item.failure_reason or "No failure reason recorded." }}</p>
+      <div class="queue-meta"><span>in state {{ ui.ago(item.state_entered_at) }}</span>{% if item.pr_url %}<span>{{ ui.ext(item.pr_url, "PR") }}</span>{% endif %}</div>
+    </li>
+    {% else %}
+    <li class="row-event">
+      <div class="queue-title">{% if item.case_id and item.case_id in case_by_id %}{{ ui.case_link(case_by_id[item.case_id]) }}{% elif item.case_id %}<a href="/cases/{{ item.case_id }}">case {{ short(item.case_id|string, 8) }}</a>{% else %}<span class="mono">delivery {{ short(item.delivery_id, 12) }}</span>{% endif %}{{ b.enum("event", item.status) }} <span class="muted small">webhook</span></div>
+      <span class="queue-action"></span>
+      <p class="queue-reason">{{ item.last_error or "No error recorded." }}</p>
+      <div class="queue-meta"><span>{{ item.event_type }}/{{ item.action }}</span><span>{{ item.attempts_count }} attempt{{ '' if item.attempts_count == 1 else 's' }}</span><span>{{ item.repository }}</span><span>{{ ui.ago(item.received_at) }} ago</span></div>
+    </li>
+    {% endif %}
+    {% endfor %}
+  </ol>
   {% else %}
   {{ ui.empty("Nothing needs attention.") }}
   {% endif %}

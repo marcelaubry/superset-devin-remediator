@@ -5,10 +5,11 @@
 {% set approval = latest_approval(case) %}
 {% set remediation = remediation_json(case) %}
 {% set actions = remediation_actions(case) %}
+{% set latest_rem = remediation.attempts[-1] if remediation and remediation.attempts else None %}
 {% if error %}<p class="alert" role="alert">{{ error }}</p>{% endif %}
 {% include "partials/case/header.html" %}
-<div class="grid-3 case-body">
-  <div class="span-2 evidence">
+<div class="case-body">
+  <div class="case-main">
     {% include "partials/case/evidence.html" %}
     {% include "partials/case/approval.html" %}
     {% include "partials/case/probe.html" %}
@@ -16,8 +17,11 @@
     {% include "partials/case/ci.html" %}
     {% include "partials/case/audit.html" %}
   </div>
-  <div class="evidence">
+  <aside class="case-side" aria-label="Operational status">
     {% include "partials/case/session.html" %}
+    {% include "partials/case/side_pr.html" %}
+    {% include "partials/case/side_probe.html" %}
+    {% include "partials/case/side_ci.html" %}
     {% include "partials/case/outbox.html" %}
-  </div>
+  </aside>
 </div>

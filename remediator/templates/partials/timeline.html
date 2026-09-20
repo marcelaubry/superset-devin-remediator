@@ -1,20 +1,30 @@
 {% import "macros/badges.html" as b %}
 {% import "macros/ui.html" as ui %}
+{% macro transition(item) -%}
+<li>
+  {{ ui.at(item.created_at) }}
+  <span>
+    {% if item.case_id in case_by_id %}<a href="/cases/{{ item.case_id }}">#{{ case_by_id[item.case_id].issue_number }}</a>{% else %}<a href="/cases/{{ item.case_id }}" class="mono">{{ short(item.case_id|string, 8) }}</a>{% endif %}
+    {% if item.from_state %}<span class="mono small muted">{{ item.from_state }}</span>{% else %}<span class="muted">new</span>{% endif %}<span class="arrow" aria-hidden="true">→</span><span class="sr-only">to</span>{{ b.state(item.to_state) }}
+    <span class="muted small">by {{ item.actor }}</span>
+  </span>
+</li>
+{%- endmacro %}
+{% set visible = 10 %}
 <section class="panel" aria-labelledby="timeline-title">
   <header class="panel-head"><h2 id="timeline-title">Recent activity</h2><span class="count">last {{ transitions|length }} transitions</span></header>
   {% if transitions %}
   <ol class="timeline" reversed>
-    {% for item in transitions %}
-    <li>
-      {{ ui.at(item.created_at) }}
-      <span>
-        {% if item.case_id in case_by_id %}<a href="/cases/{{ item.case_id }}">#{{ case_by_id[item.case_id].issue_number }}</a>{% else %}<a href="/cases/{{ item.case_id }}" class="mono">{{ short(item.case_id|string, 8) }}</a>{% endif %}
-        {% if item.from_state %}<span class="mono small muted">{{ item.from_state }}</span>{% else %}<span class="muted">new</span>{% endif %}<span class="arrow" aria-hidden="true">→</span><span class="sr-only">to</span>{{ b.state(item.to_state) }}
-        <span class="muted small">by {{ item.actor }}</span>
-      </span>
-    </li>
-    {% endfor %}
+    {% for item in transitions[:visible] %}{{ transition(item) }}{% endfor %}
   </ol>
+  {% if transitions|length > visible %}
+  <details class="quiet">
+    <summary>Show all {{ transitions|length }} transitions</summary>
+    <ol class="timeline" reversed start="{{ transitions|length - visible }}">
+      {% for item in transitions[visible:] %}{{ transition(item) }}{% endfor %}
+    </ol>
+  </details>
+  {% endif %}
   {% else %}
   {{ ui.empty("No transitions recorded yet.") }}
   {% endif %}

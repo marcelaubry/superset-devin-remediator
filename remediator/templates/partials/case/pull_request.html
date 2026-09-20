@@ -2,15 +2,15 @@
 {% import "macros/ui.html" as ui %}
 {% if remediation and remediation.attempts %}
 <section id="pull-request" class="panel" aria-labelledby="pr-title">
-  <header class="panel-head"><h2 id="pr-title">Pull request</h2><span class="count">{{ remediation.attempts|length }} remediation attempt{{ '' if remediation.attempts|length == 1 else 's' }}</span></header>
+  <header class="panel-head"><h2 id="pr-title">Pull request verification</h2><span class="count">{{ remediation.attempts|length }} remediation attempt{{ '' if remediation.attempts|length == 1 else 's' }}</span></header>
   {% for item in remediation.attempts %}
   <details {% if loop.last %}open{% endif %}>
-    <summary>Attempt <code class="small">{{ item.operation_key }}</code> · {{ b.enum("attempt", item.status) }}{% if item.duration_seconds is not none %} · {{ item.duration_seconds }}s{% endif %}{% if item.failure_stage %} · failed at <code>{{ item.failure_stage }}</code> ({{ item.failure_class }}){% endif %}</summary>
+    <summary>Attempt {{ loop.index }} <span class="muted">of {{ loop.length }}</span> · {{ ui.ident(item.operation_key, 22) }} · {{ b.enum("attempt", item.status) }}{% if item.duration_seconds is not none %} · {{ item.duration_seconds }}s{% endif %}{% if item.failure_stage %} · failed at <code>{{ item.failure_stage }}</code> ({{ item.failure_class }}){% endif %}</summary>
     <dl class="facts">
-      <dt>Devin session</dt><dd>{% if item.devin_session_id %}{{ ui.session_link(item.devin_session_id, item.devin_session_url, 40) }}{% else %}not created{% endif %}{% if item.devin_status %} · <code>{{ item.devin_status }}</code>{% endif %} · {{ ui.acu(item) }}</dd>
-      <dt>Authorised against</dt><dd>approval <code class="small">{{ item.approval_request_id or "-" }}</code> · triage {{ ui.sha(item.triage_result_hash, 16) }} · base {{ ui.sha(item.base_sha) }}</dd>
+      <dt>Devin session</dt><dd>{% if item.devin_session_id %}{{ ui.ident(item.devin_session_id, 28, item.devin_session_url) }}{% else %}not created{% endif %}{% if item.devin_status %} · <code>{{ item.devin_status }}</code>{% endif %} · {{ ui.acu(item) }}</dd>
+      <dt>Authorised against</dt><dd>approval {{ ui.ident(item.approval_request_id, 12) }} · triage {{ ui.sha(item.triage_result_hash, 12) }} · base {{ ui.sha(item.base_sha) }}</dd>
       <dt>Devin-reported PRs</dt><dd>{% for pr in item.devin_pull_requests %}{{ ui.ext(pr.pr_url) }} {% if pr.pr_state %}{{ b.enum("pr", pr.pr_state) }}{% else %}<span class="muted">(?)</span>{% endif %}{% if not loop.last %}, {% endif %}{% else %}<span class="muted">none</span>{% endfor %}</dd>
-      <dt>Verified PR</dt><dd>{% if item.pr_url %}{{ ui.ext(item.pr_url, "#" ~ item.pr_number) }} · branch <code>{{ item.branch }}</code> · head {{ ui.sha(item.head_sha) }}{% else %}<span class="muted">not verified</span>{% endif %}</dd>
+      <dt>Verified PR</dt><dd>{% if item.pr_url %}{{ ui.ext(item.pr_url, "#" ~ item.pr_number) }} · branch {{ ui.ident(item.branch, 32) }} · head {{ ui.sha(item.head_sha) }}{% else %}<span class="muted">not verified</span>{% endif %}</dd>
       {% if item.error %}<dt>Error</dt><dd>{{ item.error }}</dd>{% endif %}
     </dl>
     {% if item.pull_request_evidence %}
@@ -41,7 +41,7 @@
 </section>
 {% elif remediation %}
 <section id="pull-request" class="panel" aria-labelledby="pr-title">
-  <header class="panel-head"><h2 id="pr-title">Pull request</h2></header>
-  <p class="muted small">No remediation attempt has been dispatched yet.</p>
+  <header class="panel-head"><h2 id="pr-title">Pull request verification</h2></header>
+  <p class="empty">No remediation attempt has been dispatched yet.</p>
 </section>
 {% endif %}

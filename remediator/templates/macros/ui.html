@@ -27,6 +27,16 @@
 {% if value %}<code title="{{ value }}">{{ value[:length] }}</code>{% else %}<span class="muted">-</span>{% endif %}
 {%- endmacro %}
 
+{# Visually truncated identifier; the full value is exposed via title (and copyable from the details list). #}
+{% macro ident(value, length=16, href=None) -%}
+{% set text = short(value, length) ~ ("…" if value and value|length > length else "") %}
+{% if value %}{% if href %}<a href="{{ href }}" rel="noopener" class="ident" title="{{ value }}">{{ text }}</a>{% else %}<span class="ident" title="{{ value }}">{{ text }}</span>{% endif %}{% else %}<span class="muted">-</span>{% endif %}
+{%- endmacro %}
+
+{% macro tags(values) -%}
+{% if values %}<ul class="tags" aria-label="Tags">{% for t in values %}<li class="tag" title="{{ t }}">{{ t }}</li>{% endfor %}</ul>{% else %}<span class="muted">-</span>{% endif %}
+{%- endmacro %}
+
 {% macro kv(label, value) -%}
 <dt>{{ label }}</dt><dd>{{ value }}</dd>
 {%- endmacro %}

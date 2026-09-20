@@ -1,0 +1,24 @@
+{% import "macros/badges.html" as b %}
+{% import "macros/ui.html" as ui %}
+{% if remediation %}
+{% set ns = namespace(latest=None, attempt=None) %}
+{% for item in remediation.attempts if item.ci_snapshots %}{% set ns.latest = item.ci_snapshots[-1] %}{% set ns.attempt = item %}{% endfor %}
+<section id="side-ci" class="panel side-card" aria-labelledby="side-ci-title">
+  <header class="panel-head"><h2 id="side-ci-title">CI</h2>{% if ns.latest %}{{ b.enum("ci", ns.latest.overall) }}{% elif case.ci_status %}{{ b.enum("ci", case.ci_status) }}{% endif %}</header>
+  {% if ns.latest %}
+  {% set passed = ns.latest.checks|selectattr("conclusion", "equalto", "success")|list|length %}
+  <div class="metric-pair">
+    <div class="metric"><span class="eyebrow">Checks</span><span class="metric-value">{{ passed }}<span class="muted"> / {{ ns.latest.checks|length }}</span></span><span class="metric-sub">passed</span></div>
+    <div class="metric"><span class="eyebrow">Required</span><span class="metric-value">{{ ns.latest.required_checks|length - ns.latest.missing_required|length }}<span class="muted"> / {{ ns.latest.required_checks|length }}</span></span><span class="metric-sub">{% if ns.latest.missing_required %}{{ ns.latest.missing_required|length }} missing{% else %}none missing{% endif %}</span></div>
+  </div>
+  <dl class="facts">
+    <dt>Head</dt><dd>{{ ui.sha(ns.latest.head_sha) }}</dd>
+    <dt>Summary</dt><dd>{{ ns.latest.summary }}</dd>
+    <dt>Observed</dt><dd>{{ ns.latest.observed_at or "-" }}</dd>
+    {% if ns.attempt.ci_deadline_at %}<dt>Deadline</dt><dd>{{ ns.attempt.ci_deadline_at }}</dd>{% endif %}
+  </dl>
+  {% else %}
+  <p class="empty">No CI observation yet.</p>
+  {% endif %}
+</section>
+{% endif %}

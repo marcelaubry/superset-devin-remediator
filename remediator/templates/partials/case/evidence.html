@@ -2,28 +2,51 @@
 {% import "macros/ui.html" as ui %}
 {% set known = ["schema_version","outcome","reproducible","summary","severity","priority","confidence","evidence","affected_files","acceptance_criteria","probe","focused_tests","scope","risk","blocking_questions"] %}
 <section id="triage-result" class="panel" aria-labelledby="evidence-title">
-  <header class="panel-head"><h2 id="evidence-title">Evidence</h2>{% if triage_result %}<span class="count">triage schema {{ triage_result.get("schema_version", "?") }}</span>{% endif %}</header>
+  <header class="panel-head"><h2 id="evidence-title">Triage evidence</h2>{% if triage_result %}<span class="count">validated · schema {{ triage_result.get("schema_version", "?") }}</span>{% endif %}</header>
   {% if triage_result %}
-  <h3>Validated triage result</h3>
-  {% if triage_result.get("summary") %}<p>{{ triage_result["summary"] }}</p>{% endif %}
-  <dl class="facts">
-    {% if "outcome" in triage_result %}<dt>Outcome</dt><dd><code>{{ triage_result["outcome"] }}</code></dd>{% endif %}
-    {% if "reproducible" in triage_result %}<dt>Reproducible</dt><dd>{{ b.check(triage_result["reproducible"]) }}</dd>{% endif %}
-    {% if "severity" in triage_result or "priority" in triage_result %}<dt>Severity / priority</dt><dd>{{ triage_result.get("severity", "-") }} / {{ triage_result.get("priority", "-") }}</dd>{% endif %}
-    {% if "confidence" in triage_result %}<dt>Confidence</dt><dd>{{ "%.0f"|format(triage_result["confidence"] * 100) }}%</dd>{% endif %}
-    {% if triage_result.get("scope") %}<dt>Scope</dt><dd>{{ triage_result["scope"] }}</dd>{% endif %}
-    {% if triage_result.get("risk") is mapping %}<dt>Risk</dt><dd><code>{{ triage_result["risk"].get("level", "-") }}</code> {{ triage_result["risk"].get("notes", "") }}</dd>{% endif %}
-    {% if triage_result.get("probe") is mapping %}<dt>Probe</dt><dd><code>{{ triage_result["probe"].get("command", "-") }}</code> · expected base exit {{ triage_result["probe"].get("expected_base_exit_code", "-") }}{% if triage_result["probe"].get("rationale") %}<br><span class="muted small">{{ triage_result["probe"]["rationale"] }}</span>{% endif %}</dd>{% endif %}
-    {% for key, label in [("evidence","Evidence"),("affected_files","Affected files"),("acceptance_criteria","Acceptance criteria"),("focused_tests","Focused tests"),("blocking_questions","Blocking questions")] %}
-    {% if triage_result.get(key) %}<dt>{{ label }}</dt><dd><ul class="plain">{% for line in triage_result[key] %}<li>{% if key == "affected_files" or key == "focused_tests" %}<code>{{ line }}</code>{% else %}{{ line }}{% endif %}</li>{% endfor %}</ul></dd>{% endif %}
+  {% if triage_result.get("summary") %}<p class="lead">{{ triage_result["summary"] }}</p>{% endif %}
+  <div class="field-grid">
+    {% if "outcome" in triage_result %}<div class="field"><span class="eyebrow">Outcome</span><span class="field-value"><code>{{ triage_result["outcome"] }}</code></span></div>{% endif %}
+    {% if "reproducible" in triage_result %}<div class="field"><span class="eyebrow">Reproducible</span><span class="field-value">{{ b.check(triage_result["reproducible"], "reproduced", "not reproduced") }}</span></div>{% endif %}
+    {% if "severity" in triage_result %}<div class="field"><span class="eyebrow">Severity</span><span class="field-value">{{ triage_result["severity"] }}</span></div>{% endif %}
+    {% if "priority" in triage_result %}<div class="field"><span class="eyebrow">Priority</span><span class="field-value">{{ triage_result["priority"] }}</span></div>{% endif %}
+    {% if "confidence" in triage_result %}<div class="field"><span class="eyebrow">Confidence</span><span class="field-value">{{ "%.0f"|format(triage_result["confidence"] * 100) }}%</span></div>{% endif %}
+    {% if triage_result.get("scope") %}<div class="field"><span class="eyebrow">Scope</span><span class="field-value">{{ triage_result["scope"] }}</span></div>{% endif %}
+    {% if triage_result.get("risk") is mapping %}<div class="field"><span class="eyebrow">Risk</span><span class="field-value">{{ triage_result["risk"].get("level", "-") }}{% if triage_result["risk"].get("notes") %} <span class="muted">— {{ triage_result["risk"]["notes"] }}</span>{% endif %}</span></div>{% endif %}
+  </div>
+  {% if triage_result.get("probe") is mapping %}
+  <div class="field field-wide">
+    <span class="eyebrow">Probe</span>
+    <span class="field-value"><code>{{ triage_result["probe"].get("command", "-") }}</code> <span class="muted">· expected base exit {{ triage_result["probe"].get("expected_base_exit_code", "-") }}</span></span>
+    {% if triage_result["probe"].get("rationale") %}<span class="muted small">{{ triage_result["probe"]["rationale"] }}</span>{% endif %}
+  </div>
+  {% endif %}
+  <div class="evidence-lists">
+    {% for key, label in [("acceptance_criteria","Acceptance criteria"),("affected_files","Affected files"),("focused_tests","Focused tests"),("evidence","Evidence")] %}
+    {% if triage_result.get(key) %}
+    <div class="evidence-list">
+      <h3>{{ label }}</h3>
+      <ul>{% for line in triage_result[key] %}<li>{% if key in ("affected_files", "focused_tests") %}<code>{{ line }}</code>{% else %}{{ line }}{% endif %}</li>{% endfor %}</ul>
+    </div>
+    {% endif %}
     {% endfor %}
-    {% for key, value in triage_result.items() if key not in known %}
+    {% if triage_result.get("blocking_questions") %}
+    <div class="evidence-list is-warn">
+      <h3>Blocking questions</h3>
+      <ul>{% for line in triage_result["blocking_questions"] %}<li>{{ line }}</li>{% endfor %}</ul>
+    </div>
+    {% endif %}
+  </div>
+  {% set extra = triage_result.items()|rejectattr(0, "in", known)|list %}
+  {% if extra %}
+  <dl class="facts facts-tight subsection">
+    {% for key, value in extra %}
     <dt><code>{{ key }}</code></dt><dd>{% if value is mapping or value is sequence and value is not string %}<code>{{ value|tojson }}</code>{% else %}{{ value }}{% endif %}</dd>
     {% endfor %}
   </dl>
-  <details><summary>Raw JSON</summary><pre>{{ triage_result|tojson(indent=2) }}</pre></details>
+  {% endif %}
   {% else %}
-  <p class="muted small">No validated triage result yet.</p>
+  <p class="empty">No validated triage result yet.</p>
   {% endif %}
   <h3 class="subsection">Rubric</h3>
   {% if case.rubric %}
@@ -31,6 +54,9 @@
     {% for check in case.rubric %}<li>{{ b.check(check.passed) }}<span><strong>{{ check.name }}</strong> — {{ check.reason }}</span></li>{% endfor %}
   </ul>
   {% else %}
-  <p class="muted small">Rubric not evaluated.</p>
+  <p class="empty">Rubric not evaluated.</p>
+  {% endif %}
+  {% if triage_result %}
+  <details class="quiet"><summary>Raw JSON</summary><pre>{{ triage_result|tojson(indent=2) }}</pre></details>
   {% endif %}
 </section>

@@ -1,20 +1,22 @@
 {% import "macros/badges.html" as b %}
 {% import "macros/ui.html" as ui %}
-{% if case.outbox %}
-<section id="outbox" class="panel" aria-labelledby="outbox-title">
-  <header class="panel-head"><h2 id="outbox-title">Outbox</h2><span class="count">{{ case.outbox|length }}</span></header>
-  <ul class="stack">
+<section id="outbox" class="panel side-card" aria-labelledby="outbox-title">
+  <header class="panel-head"><h2 id="outbox-title">Delivery</h2><span class="count">{{ case.outbox|length }} outbox row{{ '' if case.outbox|length == 1 else 's' }}</span></header>
+  {% if case.outbox %}
+  <ul class="stack delivery">
     {% for row in case.outbox|sort(attribute="created_at") %}
     <li>
       {{ b.enum("outbox", row.status) }}
-      <span><code>{{ row.channel.value }}</code> {{ row.kind }}</span>
+      <span><strong>{{ row.channel.value }}</strong> <span class="muted">{{ row.kind }}</span></span>
       <span class="muted small">{{ row.attempts_count }} attempt{{ '' if row.attempts_count == 1 else 's' }}{% if row.status.value == "PENDING" and row.next_attempt_at %} · next {{ ui.deadline(row.next_attempt_at) }}{% endif %}</span>
-      {% if row.last_error %}<span class="small">{{ row.last_error }}</span>{% endif %}
+      {% if row.last_error %}<span class="small tone-err-text">{{ row.last_error }}</span>{% endif %}
       {% if row.status.value == "FAILED" %}
-      <form method="post" action="/operator/outbox/{{ row.id }}/retry" hx-post="/operator/outbox/{{ row.id }}/retry" hx-target="#case-detail" hx-swap="innerHTML" hx-disabled-elt="this" hx-confirm="Retry this {{ row.channel.value }} delivery now? The message or API call is sent again."><button type="submit" class="small">Retry delivery</button></form>
+      <form method="post" action="/operator/outbox/{{ row.id }}/retry" hx-post="/operator/outbox/{{ row.id }}/retry" hx-target="#case-detail" hx-swap="innerHTML" hx-disabled-elt="this" hx-confirm="Retry this {{ row.channel.value }} delivery now? The message or API call is sent again."><button type="submit">Retry delivery</button></form>
       {% endif %}
     </li>
     {% endfor %}
   </ul>
+  {% else %}
+  <p class="empty">No Slack or GitHub deliveries queued for this case.</p>
+  {% endif %}
 </section>
-{% endif %}

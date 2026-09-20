@@ -1,7 +1,7 @@
 {% set terminal = case.state in ["CI_PASSED","TIMED_OUT","POLICY_REJECTED","FAILED","CANCELLED","REMEDIATION_REJECTED","REMEDIATION_CANCELLED"] %}
 {% set legacy_retry = case.state in ["FAILED","TIMED_OUT","HUMAN_BLOCKED"] %}
-<section id="case-status" class="subsection" aria-labelledby="actions-title">
-  <h2 id="actions-title" class="small muted">Actions</h2>
+<section id="case-status" class="subsection case-actions" aria-labelledby="actions-title">
+  <h2 id="actions-title" class="eyebrow">Operator actions</h2>
   <div class="actions">
     {% if legacy_retry %}
     <form method="post" action="/operator/cases/{{ case.id }}/retry" hx-post="/operator/cases/{{ case.id }}/retry" hx-target="#case-detail" hx-swap="innerHTML" hx-disabled-elt="this" hx-confirm="Retry this case? It re-enters the queue and a new triage attempt may be dispatched."><button type="submit" class="btn-primary">Retry</button></form>
@@ -16,16 +16,17 @@
     <form method="post" action="/operator/cases/{{ case.id }}/retry-probe" hx-post="/operator/cases/{{ case.id }}/retry-probe" hx-target="#case-detail" hx-swap="innerHTML" hx-disabled-elt="this" hx-confirm="Re-run probe verification after an infrastructure failure? The probe script and pinned SHAs are unchanged."><button type="submit">Retry probe verification (infrastructure failure)</button></form>
     {% endif %}
     {% if not terminal %}
+    <span class="spacer" aria-hidden="true"></span>
     <form method="post" action="/operator/cases/{{ case.id }}/cancel" hx-post="/operator/cases/{{ case.id }}/cancel" hx-target="#case-detail" hx-swap="innerHTML" hx-disabled-elt="this" hx-confirm="Cancel this case? Any live Devin session owned by it is terminated and the case becomes terminal. This cannot be undone."><button type="submit" class="btn-danger">Cancel case</button></form>
     {% endif %}
     {% if terminal and not legacy_retry and not actions.retry and not actions.retry_ci and not actions.retry_probe %}
-    <span class="muted small">No operator actions: case is terminal.</span>
+    <span class="muted">No operator actions: case is terminal.</span>
     {% endif %}
   </div>
   {% if case.state == "AWAITING_REMEDIATION_APPROVAL" %}
-  <p class="muted small">Remediation approval happens in Slack (approve/reject buttons on the notification). Operators cannot approve from the dashboard.</p>
+  <p class="notice">Remediation approval happens in Slack (approve/reject buttons on the notification). Operators cannot approve from the dashboard.</p>
   {% endif %}
   {% if case.state == "CI_PASSED" %}
-  <p class="muted small">Required checks passed for the verified head SHA. Review and merge the PR on GitHub yourself; this service never merges or closes issues.</p>
+  <p class="notice notice-ok">Required checks passed for the verified head SHA. Review and merge the PR on GitHub yourself; this service never merges or closes issues.</p>
   {% endif %}
 </section>

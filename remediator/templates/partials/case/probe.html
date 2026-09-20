@@ -10,7 +10,7 @@
       <tr>
         <th scope="row">{{ run.target }}</th>
         <td>{{ ui.sha(run.commit_sha) }}</td>
-        <td>{{ run.runner_mode }} <code class="small">{{ run.command_identity }}</code></td>
+        <td>{{ run.runner_mode }} {{ ui.ident(run.command_identity, 18) }}</td>
         <td>{{ run.exit_code if run.exit_code is not none else "none" }} ({{ run.expected_exit_code }}){% if run.timed_out %} <span class="badge tone-err"><span class="badge-glyph" aria-hidden="true">✗</span>timed out</span>{% endif %}</td>
         <td>{{ b.enum("verdict", run.verdict) }}{% if run.error %}<br><span class="small">{{ run.error }}</span>{% endif %}</td>
         <td class="num">{% if run.duration_ms is not none %}{{ run.duration_ms }} ms{% else %}-{% endif %}</td>
@@ -23,13 +23,13 @@
 {%- endmacro %}
 {% if remediation %}
 <section id="remediation" class="panel" aria-labelledby="probe-title">
-  <header class="panel-head"><h2 id="probe-title">Probe</h2>{{ b.state(remediation.state) }}</header>
+  <header class="panel-head"><h2 id="probe-title">Probe verification</h2>{{ b.state(remediation.state) }}</header>
   <p class="muted small">Remediation (Phase 4) verification evidence.{% if remediation.ready_for_human_review %} This case is <strong>ready for human PR review</strong> — nothing is merged or closed automatically.{% endif %}</p>
   {% if remediation.failure_reason %}<p class="alert"><strong>Failure / blocked reason:</strong> {{ remediation.failure_reason }}</p>{% endif %}
   <h3>Pre-session BASE gate</h3>
   {% for snap in remediation.probe_snapshots %}
   <details {% if loop.last and not remediation.attempts %}open{% endif %}>
-    <summary>probe <code>{{ snap.probe_identifier }}</code> · script {{ ui.sha(snap.script_hash) }} · base {{ ui.sha(snap.base_sha) }}</summary>
+    <summary>probe {{ ui.ident(snap.probe_identifier, 28) }} · script {{ ui.sha(snap.script_hash) }} · base {{ ui.sha(snap.base_sha) }}</summary>
     <p class="muted small">The immutable probe must reproduce the defect at the pinned base SHA (expected exit {{ snap.expected_base_exit_code }}) before any Devin session is created. Registry commit <code>{{ snap.registry_commit or "unknown" }}</code>, manifest {{ ui.sha(snap.manifest_hash) }}.</p>
     {% if snap.pre_session_executions %}
     {{ runs_table(snap.pre_session_executions, "Pre-session BASE probe executions for " ~ snap.probe_identifier) }}
@@ -45,7 +45,7 @@
   {% for item in remediation.attempts if item.probe_executions %}
   {% set ns.any = true %}
   <details {% if loop.last %}open{% endif %}>
-    <summary>Attempt <code class="small">{{ item.operation_key }}</code> · {{ b.enum("attempt", item.status) }}{% if item.probe_snapshot %} · probe <code>{{ item.probe_snapshot.probe_identifier }}</code> · expected exit base={{ item.probe_snapshot.expected_base_exit_code }} head={{ item.probe_snapshot.expected_head_exit_code }}{% endif %}</summary>
+    <summary>Attempt {{ loop.index }} · {{ ui.ident(item.operation_key, 22) }} · {{ b.enum("attempt", item.status) }}{% if item.probe_snapshot %} · probe {{ ui.ident(item.probe_snapshot.probe_identifier, 28) }} · expected exit base={{ item.probe_snapshot.expected_base_exit_code }} head={{ item.probe_snapshot.expected_head_exit_code }}{% endif %}</summary>
     {{ runs_table(item.probe_executions, "Independent probe executions for attempt " ~ item.operation_key) }}
   </details>
   {% endfor %}

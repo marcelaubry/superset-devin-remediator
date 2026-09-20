@@ -3,29 +3,47 @@
 {% set current_stage = stage_for_state(case.state) %}
 {% set stage_keys = FUNNEL_STAGES|list %}
 {% set current_index = stage_keys.index(current_stage) if current_stage else stage_keys|length %}
-<section class="panel case-header" aria-labelledby="case-title">
-  <div class="case-title">
-    <h1 id="case-title">#{{ case.issue_number }} {{ case.issue_title }}</h1>
-    {{ b.state(case.state) }}
+{% set state_p = present_state(case.state) %}
+<section class="case-header" aria-labelledby="case-title">
+  <div class="case-eyebrow">
+    <span class="eyebrow">{{ case.repository }}</span>
+    <span class="sep" aria-hidden="true">·</span>
+    <span class="eyebrow">Issue #{{ case.issue_number }}</span>
+    {% if case.recommendation %}<span class="sep" aria-hidden="true">·</span><span class="eyebrow">{{ case.recommendation.value|replace("_", " ") }}</span>{% endif %}
   </div>
-  <ol class="phase-rail" aria-label="Workflow phase">
+  <div class="case-title">
+    <h1 id="case-title"><span class="issue-no">#{{ case.issue_number }}</span> {{ case.issue_title }}</h1>
+    {{ b.badge(state_p, title="Case state") }}
+  </div>
+  <ol class="phase-rail{% if not current_stage %} has-terminal{% endif %}" aria-label="Workflow phase">
     {% for key in stage_keys %}
     {% set done = loop.index0 < current_index %}
     {% set current = key == current_stage %}
-    <li class="{{ 'is-current' if current else ('is-done' if done else '') }}"{% if current %} aria-current="step"{% endif %}><span aria-hidden="true">{{ '●' if current else ('✓' if done else '○') }}</span> {{ FUNNEL_LABELS[key] }}{% if current %}<span class="sr-only"> (current)</span>{% elif done %}<span class="sr-only"> (done)</span>{% endif %}</li>
+    <li class="{{ 'is-current' if current else ('is-done' if done else '') }}"{% if current %} aria-current="step"{% endif %}>
+      <span class="rail-line" aria-hidden="true"></span>
+      <span class="rail-label"><span class="rail-glyph" aria-hidden="true">{{ '●' if current else ('✓' if done else '○') }}</span>{{ FUNNEL_LABELS[key] }}{% if current %}<span class="sr-only"> (current)</span>{% elif done %}<span class="sr-only"> (done)</span>{% endif %}</span>
+    </li>
     {% endfor %}
-    {% if not current_stage %}<li class="is-terminal" aria-current="step"><span aria-hidden="true">■</span> Terminal</li>{% endif %}
+    {% if not current_stage %}
+    <li class="is-terminal tone-{{ state_p.tone }}" aria-current="step">
+      <span class="rail-line" aria-hidden="true"></span>
+      <span class="rail-label"><span class="rail-glyph" aria-hidden="true">■</span>Terminal</span>
+    </li>
+    {% endif %}
   </ol>
   <p class="case-meta">
     <span><strong>Elapsed in stage:</strong> {{ ui.ago(case.state_entered_at) }}</span>
     <span><strong>Age:</strong> {{ ui.ago(case.created_at) }}</span>
-    <span><strong>Repository:</strong> {{ case.repository }}</span>
+    <span><strong>Repository:</strong> <span class="val">{{ case.repository }}</span></span>
     <span><strong>Recommendation:</strong> {% if case.recommendation %}<code>{{ case.recommendation.value }}</code>{% else %}<span class="muted">-</span>{% endif %}</span>
-    <span><strong>Issue:</strong> {{ ui.ext(case.issue_url, "#" ~ case.issue_number ~ " on GitHub") }}</span>
-    <span><strong>Session:</strong> {{ ui.session_link(case.devin_session_id, case.devin_session_url) }}</span>
-    <span><strong>PR:</strong> {{ ui.ext(case.pr_url, "PR") }}</span>
+    <span><strong>Session:</strong> {{ ui.ident(case.devin_session_id, 30, case.devin_session_url) }}</span>
     <span><strong>CI:</strong> {% if case.ci_status %}{{ b.enum("ci", case.ci_status) }}{% else %}<span class="muted">-</span>{% endif %}</span>
   </p>
+  <div class="case-links">
+    {% if case.issue_url %}<a class="button" href="{{ case.issue_url }}" rel="noopener">Issue #{{ case.issue_number }} on GitHub</a>{% endif %}
+    {% if case.pr_url %}<a class="button" href="{{ case.pr_url }}" rel="noopener">Pull request</a>{% endif %}
+    {% if case.devin_session_url %}<a class="button" href="{{ case.devin_session_url }}" rel="noopener">Devin session</a>{% endif %}
+  </div>
   {% if case.failure_reason %}
   <p class="alert" data-kind="failure-reason"><strong>Blocked / failure reason:</strong> {{ case.failure_reason }}</p>
   {% endif %}

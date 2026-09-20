@@ -1,0 +1,21 @@
+{% import "macros/badges.html" as b %}
+{% import "macros/ui.html" as ui %}
+{% if remediation %}
+<section id="side-pr" class="panel side-card" aria-labelledby="side-pr-title">
+  <header class="panel-head"><h2 id="side-pr-title">Pull request</h2>{% if latest_rem %}{{ b.enum("attempt", latest_rem.status) }}{% endif %}</header>
+  {% if latest_rem %}
+  <dl class="facts">
+    <dt>Verified PR</dt><dd>{% if latest_rem.pr_url %}{{ ui.ext(latest_rem.pr_url, "#" ~ latest_rem.pr_number) }}{% else %}<span class="muted">not verified</span>{% endif %}</dd>
+    {% if latest_rem.branch %}<dt>Branch</dt><dd>{{ ui.ident(latest_rem.branch, 28) }}</dd>{% endif %}
+    <dt>Head</dt><dd>{{ ui.sha(latest_rem.head_sha) }}</dd>
+    <dt>Base</dt><dd>{{ ui.sha(latest_rem.base_sha) }}</dd>
+    <dt>Reported PRs</dt><dd>{% for pr in latest_rem.devin_pull_requests %}{{ ui.ext(pr.pr_url, "#" ~ (pr.pr_url|string).rsplit("/", 1)[-1]) }} {% if pr.pr_state %}{{ b.enum("pr", pr.pr_state) }}{% endif %}{% if not loop.last %}<br>{% endif %}{% else %}<span class="muted">none</span>{% endfor %}</dd>
+    {% if latest_rem.failure_stage %}<dt>Failed at</dt><dd><code>{{ latest_rem.failure_stage }}</code> <span class="muted">({{ latest_rem.failure_class }})</span></dd>{% endif %}
+    <dt>Attempts</dt><dd>{{ remediation.attempts|length }}</dd>
+  </dl>
+  {% if latest_rem.pr_url %}<div class="actions"><a class="button" href="{{ latest_rem.pr_url }}" rel="noopener">Open PR on GitHub</a></div>{% endif %}
+  {% else %}
+  <p class="empty">No remediation attempt dispatched yet.</p>
+  {% endif %}
+</section>
+{% endif %}
