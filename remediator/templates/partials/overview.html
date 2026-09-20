@@ -1,6 +1,6 @@
 {% import "macros/badges.html" as b %}
 <section class="panel" aria-labelledby="overview-title">
-  <header class="panel-head"><h2 id="overview-title">Cases by state and recommendation</h2><span class="count">all cases</span></header>
+  <header class="panel-head"><h2 id="overview-title">Cases by state and advisory recommendation</h2><span class="count">all cases</span></header>
   <div class="grid-2">
     <div>
       <h3>Cases by state</h3>
@@ -17,12 +17,13 @@
       </details>
     </div>
     <div>
-      <h3>Cases by recommendation</h3>
-      <ul class="outcomes" aria-label="Triage recommendations">
+      <h3>Cases by advisory recommendation</h3>
+      <p class="muted small">Category hint from the zero-ACU filter; it never decides eligibility. Eligibility asks only whether the issue has enough context for bounded triage.</p>
+      <ul class="outcomes" aria-label="Advisory recommendations">
         {% for name, count in recommendation_counts.items() %}
         <li><code>{{ name }}</code> <span class="n">{{ count }}</span></li>
         {% else %}
-        <li class="empty">No triaged cases yet.</li>
+        <li class="empty">No evaluated cases yet.</li>
         {% endfor %}
       </ul>
     </div>

@@ -32,6 +32,8 @@ _BRANCH_PREFIX_RE = re.compile(r"named `([^`<]+)<short-unique-slug>`")
 class FakeScenario(StrEnum):
     SUCCESS = "success"
     NEEDS_HUMAN = "needs_human"
+    DETERMINISTIC_AUTOMATION = "deterministic_automation"
+    NO_CHANGE_NEEDED = "no_change_needed"
     ERROR = "error"
     WAITING_FOR_HUMAN = "waiting_for_human"
     MALFORMED_OUTPUT = "malformed_output"
@@ -153,13 +155,20 @@ def sample_triage_output(
     issue_number: int, repository: str, outcome: str = "remediation_candidate"
 ) -> dict[str, Any]:
     candidate = outcome == "remediation_candidate"
+    summaries = {
+        "remediation_candidate": "bounded fix identified",
+        "needs_human": "requires product decision",
+        "no_change_needed": "behaviour is already correct at base",
+        "deterministic_automation": "a scripted dependency bump should handle this",
+        "invalid_issue": "not actionable in this repository",
+    }
     return {
         "schema_version": TRIAGE_SCHEMA_VERSION,
         "outcome": outcome,
         "reproducible": candidate,
         "summary": (
             f"simulated triage of {repository}#{issue_number}: "
-            + ("bounded fix identified" if candidate else "requires product decision")
+            f"{summaries.get(outcome, 'requires product decision')}"
         ),
         "severity": "medium",
         "priority": "p2",
@@ -331,6 +340,12 @@ class FakeDevinClient:
                 return {"schema_version": TRIAGE_SCHEMA_VERSION, "outcome": "maybe", "summary": 1}
             case FakeScenario.NEEDS_HUMAN:
                 return sample_triage_output(fake.issue_number, repository, "needs_human")
+            case FakeScenario.DETERMINISTIC_AUTOMATION:
+                return sample_triage_output(
+                    fake.issue_number, repository, "deterministic_automation"
+                )
+            case FakeScenario.NO_CHANGE_NEEDED:
+                return sample_triage_output(fake.issue_number, repository, "no_change_needed")
             case _:
                 return sample_triage_output(fake.issue_number, repository)
 

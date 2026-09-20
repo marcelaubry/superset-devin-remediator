@@ -567,7 +567,7 @@ class NotificationOutbox(Base):
 
 
 class ApprovalRequest(Base):
-    """One Slack approval round for a validated `remediation_candidate` triage result."""
+    """One Slack approval round for a schema-valid triage result (any recommendation)."""
 
     __tablename__ = "approval_requests"
     __table_args__ = (

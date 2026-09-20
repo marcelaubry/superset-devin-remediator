@@ -32,6 +32,18 @@ fake Devin/GitHub/Slack adapters (or the real-Slack/fake-GitHub/fake-Devin
 mix if `.env` says so); nothing creates a paid session or mutates a real
 repository.
 
+Ingest scenarios print the zero-ACU eligibility verdict as context
+completeness: `eligibility: context complete` / `insufficient context`, the
+advisory recommendation (recorded, not gating) and, for rejections, the exact
+missing elements (`Missing concrete
+problem statement`, `Missing expected outcome`,
+`Missing reproduction/example/affected-component signal`). Only
+`needs-scoping` (a one-line body) is rejected before Devin; `deterministic`,
+`human-led` and `triage-infeasible` are context-complete and park at
+`AWAITING_REMEDIATION_APPROVAL`, the last one with Devin's `needs_human`
+recommendation and the non-candidate warning in the Slack message. See the
+scenario table in the README for the expected outcome of every fixture.
+
 Phase 4 scenario names: `remediate`, `remediate-base-passes`,
 `remediate-probe-infra`, `remediate-head-fails`, `remediate-forbidden-files`,
 `remediate-ci-failed`, `remediate-uncertain-create`,

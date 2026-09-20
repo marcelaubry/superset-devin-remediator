@@ -5,8 +5,11 @@
   <header class="panel-head"><h2 id="evidence-title">Triage evidence</h2>{% if triage_result %}<span class="count">validated · schema {{ triage_result.get("schema_version", "?") }}</span>{% endif %}</header>
   {% if triage_result %}
   {% if triage_result.get("summary") %}<p class="lead">{{ triage_result["summary"] }}</p>{% endif %}
+  {% if triage_result.get("outcome") and triage_result["outcome"] != "remediation_candidate" %}
+  <p class="alert" data-kind="non-candidate-recommendation"><strong>Devin recommendation: <code>{{ triage_result["outcome"] }}</code>.</strong> Devin did not recommend autonomous remediation. Approval explicitly accepts this risk and authorizes the bounded remediation attempt.</p>
+  {% endif %}
   <div class="field-grid">
-    {% if "outcome" in triage_result %}<div class="field"><span class="eyebrow">Outcome</span><span class="field-value"><code>{{ triage_result["outcome"] }}</code></span></div>{% endif %}
+    {% if "outcome" in triage_result %}<div class="field"><span class="eyebrow">Devin recommendation</span><span class="field-value"><code>{{ triage_result["outcome"] }}</code></span></div>{% endif %}
     {% if "reproducible" in triage_result %}<div class="field"><span class="eyebrow">Reproducible</span><span class="field-value">{{ b.check(triage_result["reproducible"], "reproduced", "not reproduced") }}</span></div>{% endif %}
     {% if "severity" in triage_result %}<div class="field"><span class="eyebrow">Severity</span><span class="field-value">{{ triage_result["severity"] }}</span></div>{% endif %}
     {% if "priority" in triage_result %}<div class="field"><span class="eyebrow">Priority</span><span class="field-value">{{ triage_result["priority"] }}</span></div>{% endif %}
@@ -48,8 +51,14 @@
   {% else %}
   <p class="empty">No validated triage result yet.</p>
   {% endif %}
-  <h3 class="subsection">Rubric</h3>
+  <h3 class="subsection">Context-completeness eligibility (zero-ACU filter)</h3>
   {% if case.rubric %}
+  {% set missing = case.rubric|rejectattr("passed")|list %}
+  {% if missing %}
+  <p class="alert" data-kind="missing-context"><strong>Not eligible — insufficient context:</strong> {% for check in missing %}{{ check.reason }}{% if not loop.last %}; {% endif %}{% endfor %}</p>
+  {% else %}
+  <p class="muted small" data-kind="context-complete">Enough context for bounded code-aware triage. The filter does not judge whether the work should be automated; that is Devin's triage evidence plus an authorized human's Slack decision.</p>
+  {% endif %}
   <ul class="rubric">
     {% for check in case.rubric %}<li>{{ b.check(check.passed) }}<span><strong>{{ check.name }}</strong> — {{ check.reason }}</span></li>{% endfor %}
   </ul>

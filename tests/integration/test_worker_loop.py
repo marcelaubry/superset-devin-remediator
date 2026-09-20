@@ -17,6 +17,7 @@ from remediator.models import Attempt, AttemptKind, AttemptStatus, Case, EventSt
 from remediator.worker import Worker, is_transient_db_error
 from remediator.worker.devin_runner import allocate_attempt_ordinal
 from remediator.worker.processor import process_case
+from tests.integration.test_worker import ELIGIBLE_BODY
 
 
 def payload(number: int) -> dict[str, object]:
@@ -26,10 +27,7 @@ def payload(number: int) -> dict[str, object]:
         "issue": {
             "number": number,
             "title": "Fix issue",
-            "body": (
-                "Steps to reproduce:\n1. Run.\nExpected behavior works. "
-                "Actual behavior fails. Acceptance criteria: fixed. Similar existing pattern."
-            ),
+            "body": ELIGIBLE_BODY,
             "html_url": f"https://github.com/apache/superset/issues/{number}",
             "labels": [{"name": "bug"}, {"name": "devin-candidate"}],
         },

@@ -35,8 +35,10 @@ from remediator.worker import Worker
 from remediator.worker.processor import fail_case, process_case, process_event
 
 ELIGIBLE_BODY = (
-    "Steps to reproduce:\n1. Run.\nExpected behavior works. "
-    "Actual behavior fails. Acceptance criteria: fixed. Similar existing pattern."
+    "Steps to reproduce:\n1. Open a table chart with a temporal column.\n2. Sort by that column.\n"
+    "Expected behavior: rows are ordered by the timestamp. Actual behavior: rows are ordered "
+    "as strings, so 10:00 sorts before 9:00. Affected code: `superset-frontend/src/utils/sort.ts`. "
+    "Acceptance criteria: the column sorts chronologically and the existing sort unit tests pass."
 )
 SECRET = "apk_integration_secret_never_persisted"
 

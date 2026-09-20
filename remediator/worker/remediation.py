@@ -508,8 +508,6 @@ class RemediationPipeline:
             result = validate_triage_output(attempt.structured_output)
         except TriageValidationError as exc:
             return f"approved triage output no longer validates: {exc}"
-        if result.outcome != "remediation_candidate":
-            return f"triage outcome is {result.outcome}, not remediation_candidate"
         if triage_result_hash(result.raw) != request.triage_result_hash:
             return "triage result hash does not match the approved hash"
         return result.raw

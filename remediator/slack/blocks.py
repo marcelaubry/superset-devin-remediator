@@ -34,6 +34,21 @@ REJECTION_REASONS: tuple[tuple[str, str], ...] = (
 )
 
 
+REMEDIATION_CANDIDATE = "remediation_candidate"
+NON_CANDIDATE_WARNING = (
+    "Devin did not recommend autonomous remediation. Approval explicitly accepts this risk "
+    "and authorizes the bounded remediation attempt."
+)
+
+
+def recommendation_of(triage: dict[str, Any]) -> str:
+    return str(triage.get("outcome") or "unknown")
+
+
+def recommends_remediation(triage: dict[str, Any]) -> bool:
+    return recommendation_of(triage) == REMEDIATION_CANDIDATE
+
+
 class ApprovalMessageStatus(StrEnum):
     AWAITING = "awaiting_approval"
     APPROVED_PENDING_GITHUB = "approved_github_dispatch_pending"
@@ -169,9 +184,11 @@ def fallback_text(message: ApprovalMessageInput) -> str:
     status: str = message.status
     if message.remediation is not None:
         status = message.remediation.case_state
+    warning = "" if recommends_remediation(message.triage) else f" {NON_CANDIDATE_WARNING}"
     return truncate(
         f"Remediation approval for {message.repository}#{message.issue_number}: "
-        f"{message.issue_title} [{status}]",
+        f"{message.issue_title} [{status}] "
+        f"(Devin recommendation: {recommendation_of(message.triage)}){warning}",
         SECTION_MAX,
     )
 
@@ -212,10 +229,14 @@ def build_approval_blocks(message: ApprovalMessageInput) -> list[dict[str, Any]]
     if message.decision_note:
         status_text += f"\n{_safe(message.decision_note, ITEM_MAX)}"
     issue_link = _link(message.issue_url, f"#{message.issue_number} {message.issue_title}")
+    recommendation = f"*Devin recommendation:* `{_safe(recommendation_of(triage), 60)}`"
+    if not recommends_remediation(triage):
+        recommendation += f"\n:warning: {NON_CANDIDATE_WARNING}"
     blocks: list[dict[str, Any]] = [
         {"type": "header", "text": {"type": "plain_text", "text": header, "emoji": False}},
         _section(status_text, block_id="status"),
         _section(f"*Issue:* {issue_link}\n*Repository:* `{_safe(message.repository, ITEM_MAX)}`"),
+        _section(recommendation, block_id="recommendation"),
         {
             "type": "section",
             "fields": [
@@ -231,6 +252,12 @@ def build_approval_blocks(message: ApprovalMessageInput) -> list[dict[str, Any]]
         _section(
             f"*Reproduction summary*\n{_safe(triage.get('summary', ''), 1500)}\n\n"
             f"*Evidence*\n{_bullets(list(triage.get('evidence') or []), empty='none recorded')}"
+        ),
+        _section(
+            f"*Acceptance criteria*\n"
+            f"{_bullets(list(triage.get('acceptance_criteria') or []), empty='none stated')}\n\n"
+            f"*Blocking questions*\n"
+            f"{_bullets(list(triage.get('blocking_questions') or []), empty='none')}"
         ),
         _section(
             f"*Affected files*\n"
@@ -279,6 +306,11 @@ def build_approval_blocks(message: ApprovalMessageInput) -> list[dict[str, Any]]
                             "text": (
                                 "This applies `devin:remediate` on GitHub. Nothing starts a "
                                 "Devin session from Slack."
+                                + (
+                                    ""
+                                    if recommends_remediation(triage)
+                                    else f"\n\n{NON_CANDIDATE_WARNING}"
+                                )
                             ),
                         },
                         "confirm": {"type": "plain_text", "text": "Approve"},

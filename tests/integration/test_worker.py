@@ -60,6 +60,14 @@ async def seed_remediation_session(
     )
 
 
+ELIGIBLE_BODY = (
+    "Steps to reproduce:\n1. Open a table chart with a temporal column.\n2. Sort by that column.\n"
+    "Expected behavior: rows are ordered by the timestamp. Actual behavior: rows are ordered "
+    "as strings, so 10:00 sorts before 9:00. Affected code: `superset-frontend/src/utils/sort.ts`. "
+    "Acceptance criteria: the column sorts chronologically and the existing sort unit tests pass."
+)
+
+
 def payload(number: int, body: str, labels: list[str]) -> dict[str, object]:
     return {
         "action": "opened",
@@ -83,10 +91,7 @@ async def test_processor_success(integration_session: AsyncSession) -> None:
         repository="apache/superset",
         payload=payload(
             4213,
-            (
-                "Steps to reproduce:\n1. Run.\nExpected behavior works. "
-                "Actual behavior fails. Acceptance criteria: fixed. Similar existing pattern."
-            ),
+            ELIGIBLE_BODY,
             ["bug", "devin-candidate"],
         ),
         status=EventStatus.PENDING,
@@ -114,10 +119,7 @@ async def test_processor_success(integration_session: AsyncSession) -> None:
 async def test_processor_failure_modes(
     integration_session: AsyncSession, number: int, expected: CaseState
 ) -> None:
-    body = (
-        "Steps to reproduce:\n1. Run.\nExpected behavior works. "
-        "Actual behavior fails. Acceptance criteria: fixed. Similar existing pattern."
-    )
+    body = ELIGIBLE_BODY
     event = WebhookEvent(
         delivery_id=f"integration-{number}",
         event_type="issues",
@@ -154,6 +156,16 @@ async def test_processor_rejection(integration_session: AsyncSession) -> None:
         )
         == 0
     )
+    rejection = await integration_session.scalar(
+        select(StateTransition.reason).where(
+            StateTransition.case_id == case.id,
+            StateTransition.to_state == CaseState.POLICY_REJECTED,
+        )
+    )
+    assert rejection is not None
+    assert rejection.startswith("insufficient context for triage: ")
+    assert "Missing expected outcome" in rejection
+    assert "HUMAN_LED" not in rejection and "NEEDS_SCOPING" not in rejection
     assert (
         await integration_session.scalar(
             select(func.count())
@@ -176,10 +188,7 @@ async def test_unlabeled_opened_issue_is_evaluated_and_only_remediate_label_reme
     inert, and `devin:remediate` without a delivered Slack approval never starts remediation."""
     settings = Settings(_env_file=None)
     assert settings.github_required_label == ""
-    body = (
-        "Steps to reproduce:\n1. Run.\nExpected behavior works. "
-        "Actual behavior fails. Acceptance criteria: fixed. Similar existing pattern."
-    )
+    body = ELIGIBLE_BODY
     opened = WebhookEvent(
         delivery_id="integration-unlabeled-opened",
         event_type="issues",
@@ -226,6 +235,8 @@ async def test_unlabeled_opened_issue_is_evaluated_and_only_remediate_label_reme
 
 @pytest.mark.asyncio
 async def test_processor_triage_infeasible(integration_session: AsyncSession) -> None:
+    """A schema-valid `needs_human` triage is not rejected by policy: it parks for a human
+    Slack decision with the original recommendation preserved."""
     event = WebhookEvent(
         delivery_id="integration-triage-infeasible",
         event_type="issues",
@@ -233,10 +244,7 @@ async def test_processor_triage_infeasible(integration_session: AsyncSession) ->
         repository="apache/superset",
         payload=payload(
             4533,
-            (
-                "Steps to reproduce:\n1. Run.\nExpected behavior works. "
-                "Actual behavior fails. Acceptance criteria: fixed. Similar existing pattern."
-            ),
+            ELIGIBLE_BODY,
             ["bug", "devin-candidate"],
         ),
         status=EventStatus.PENDING,
@@ -245,17 +253,19 @@ async def test_processor_triage_infeasible(integration_session: AsyncSession) ->
     await integration_session.commit()
     await process_event(integration_session, event, FakeDevinClient(), Settings())
     case = await integration_session.scalar(select(Case).where(Case.issue_number == 4533))
-    assert case and case.state == CaseState.POLICY_REJECTED
+    assert case and case.state == CaseState.AWAITING_REMEDIATION_APPROVAL
     attempts = list(
         (await integration_session.scalars(select(Attempt).where(Attempt.case_id == case.id))).all()
     )
     assert [attempt.kind for attempt in attempts] == [AttemptKind.TRIAGE]
-    assert "triage outcome needs_human" in (
+    assert attempts[0].structured_output is not None
+    assert attempts[0].structured_output["outcome"] == "needs_human"
+    assert "Devin recommendation: needs_human" in (
         await integration_session.scalar(
             select(StateTransition.reason)
             .where(
                 StateTransition.case_id == case.id,
-                StateTransition.to_state == CaseState.POLICY_REJECTED,
+                StateTransition.to_state == CaseState.AWAITING_REMEDIATION_APPROVAL,
             )
             .order_by(StateTransition.created_at.desc())
         )
@@ -319,10 +329,7 @@ async def test_remediation_candidate_parks_awaiting_slack_approval(
         repository="apache/superset",
         payload=payload(
             4213,
-            (
-                "Steps to reproduce:\n1. Run.\nExpected behavior works. "
-                "Actual behavior fails. Acceptance criteria: fixed. Similar existing pattern."
-            ),
+            ELIGIBLE_BODY,
             ["bug", "devin-candidate"],
         ),
         status=EventStatus.PENDING,
@@ -457,10 +464,7 @@ async def test_poll_budget_times_out(
         repository="apache/superset",
         payload=payload(
             4213,
-            (
-                "Steps to reproduce:\n1. Run. Expected behavior works. "
-                "Actual behavior fails. Acceptance criteria: fixed. Similar existing pattern."
-            ),
+            ELIGIBLE_BODY,
             ["bug", "devin-candidate"],
         ),
         status=EventStatus.PENDING,

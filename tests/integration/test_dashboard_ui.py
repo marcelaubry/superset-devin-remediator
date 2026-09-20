@@ -23,6 +23,7 @@ from remediator.api.presentation import (
     present_state,
     stage_for_state,
 )
+from remediator.devin.fake import FakeScenario
 from remediator.fixtures import RemediationFixture
 from remediator.lifecycle import TERMINAL_STATES, CaseState
 from remediator.models import Attempt, AttemptStatus, Case, Recommendation
@@ -131,7 +132,9 @@ async def test_partials_render_and_unknown_is_404(harness: Harness) -> None:
 @pytest.mark.asyncio
 async def test_case_filters(harness: Harness) -> None:
     ok = await harness.triage(4213)  # success -> AWAITING_REMEDIATION_APPROVAL
-    human = await harness.triage(4212)  # % 3 -> needs_human
+    # A malformed structured output fails the attempt and the case; no approval round exists.
+    human = await harness.triage(4212, scenario=FakeScenario.MALFORMED_OUTPUT)
+    assert human.state == CaseState.FAILED
     ok_href, human_href = f"/cases/{ok.id}", f"/cases/{human.id}"
 
     async def rows(**params: str) -> str:
@@ -293,7 +296,8 @@ async def test_case_detail_awaiting_approval(harness: Harness) -> None:
     _assert_case_shell(page.text, case.id)
     assert "Remediation approval" in page.text and "Approval timeline" in page.text
     assert "approval happens in Slack" in page.text
-    assert "Scope is bounded." in page.text
+    assert "Context-completeness eligibility" in page.text
+    assert "Enough context for bounded code-aware triage" in page.text
     assert token not in page.text
     # Rubric checks are rendered as glyph + word, never as Python booleans.
     assert 'data-check="pass"' in page.text
