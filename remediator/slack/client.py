@@ -31,13 +31,48 @@ METADATA_EVENT_TYPE = "remediator_approval_request"
 
 class SlackApiError(Exception):
     def __init__(
-        self, method: str, error: str, *, retryable: bool, retry_after_seconds: float | None = None
+        self,
+        method: str,
+        error: str,
+        *,
+        retryable: bool,
+        retry_after_seconds: float | None = None,
+        needed: str | None = None,
+        provided: str | None = None,
     ) -> None:
         super().__init__(f"Slack {method} failed: {error}")
         self.method = method
         self.error = error
         self.retryable = retryable
         self.retry_after_seconds = retry_after_seconds
+        self.needed = needed
+        self.provided = provided
+
+    def describe(self) -> str:
+        """`method returned error[ needed=... provided=...]` for operator-facing output."""
+        text = f"{self.method} returned {self.error}"
+        if self.needed:
+            text += f" needed={self.needed}"
+        if self.provided:
+            text += f" provided={self.provided}"
+        return text
+
+
+@dataclass(frozen=True)
+class SlackUser:
+    """The subset of `users.info` readiness needs; profile fields are never kept."""
+
+    id: str
+    deleted: bool
+    is_bot: bool
+
+
+def _form_value(value: object) -> str:
+    """Slack GET methods read `application/x-www-form-urlencoded` arguments: booleans are
+    the literals `true`/`false`, numbers their decimal text."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
 
 
 @dataclass(frozen=True)
@@ -230,6 +265,10 @@ _NON_RETRYABLE_ERRORS = frozenset(
 )
 
 
+def _optional_str(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
 def _retry_after(header: str | None) -> float | None:
     if header is None:
         return None
@@ -276,10 +315,26 @@ class LiveSlackClient:
         await self._hooks.aclose()
 
     async def _call(self, method: str, body: dict[str, Any]) -> dict[str, Any]:
+        """Write method (`chat.*`): JSON body."""
         try:
             response = await self._http.post(f"/{method}", json=body)
         except httpx.HTTPError as exc:
             raise SlackApiError(method, exc.__class__.__name__, retryable=True) from exc
+        return self._payload(method, response)
+
+    async def _read(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        """Read method (`http_method: GET` in the method reference: `auth.test`,
+        `conversations.*`, `users.*`): arguments go in the query string; a JSON body is
+        ignored by Slack and surfaces as `invalid_arguments` / `*_not_found`."""
+        query = {key: _form_value(value) for key, value in params.items() if value is not None}
+        try:
+            response = await self._http.get(f"/{method}", params=query)
+        except httpx.HTTPError as exc:
+            raise SlackApiError(method, exc.__class__.__name__, retryable=True) from exc
+        return self._payload(method, response)
+
+    @staticmethod
+    def _payload(method: str, response: httpx.Response) -> dict[str, Any]:
         if response.status_code == 429 or response.status_code >= 500:
             raise SlackApiError(
                 method,
@@ -291,31 +346,45 @@ class LiveSlackClient:
             payload = response.json()
         except ValueError as exc:
             raise SlackApiError(method, "non_json_response", retryable=True) from exc
-        if not isinstance(payload, dict) or not payload.get("ok"):
-            error = str(payload.get("error", "unknown_error")) if isinstance(payload, dict) else "x"
-            raise SlackApiError(method, error, retryable=error not in _NON_RETRYABLE_ERRORS)
+        if not isinstance(payload, dict):
+            raise SlackApiError(method, "non_object_response", retryable=True)
+        if not payload.get("ok"):
+            error = str(payload.get("error", "unknown_error"))
+            raise SlackApiError(
+                method,
+                error,
+                retryable=error not in _NON_RETRYABLE_ERRORS,
+                needed=_optional_str(payload.get("needed")),
+                provided=_optional_str(payload.get("provided")),
+            )
         return payload
 
     async def auth_test(self) -> dict[str, Any]:
         """auth.test: bot identity and workspace (readiness only, read-only)."""
-        return await self._call("auth.test", {})
+        return await self._read("auth.test", {})
 
     async def channel_info(self, channel: str) -> dict[str, Any]:
-        """conversations.info: channel existence and bot membership (readiness only)."""
-        payload = await self._call("conversations.info", {"channel": channel})
+        """conversations.info (`channels:read` / `groups:read` for private channels):
+        existence, archival, privacy and bot membership (readiness only)."""
+        payload = await self._read("conversations.info", {"channel": channel})
         info = payload.get("channel")
-        return info if isinstance(info, dict) else {}
+        if not isinstance(info, dict):
+            raise SlackApiError("conversations.info", "missing_channel_object", retryable=False)
+        return info
 
-    async def user_exists(self, user_id: str) -> bool:
-        """users.info: resolves an approver ID without exposing profile data (readiness only)."""
-        try:
-            payload = await self._call("users.info", {"user": user_id})
-        except SlackApiError as exc:
-            if exc.error == "user_not_found":
-                return False
-            raise
+    async def user_info(self, user_id: str) -> SlackUser:
+        """users.info (`users:read`): resolves an approver ID to its deleted/bot flags
+        without keeping profile data (readiness only). Raises `user_not_found` and every
+        other API error unchanged so callers can tell them apart."""
+        payload = await self._read("users.info", {"user": user_id})
         user = payload.get("user")
-        return isinstance(user, dict) and not bool(user.get("deleted"))
+        if not isinstance(user, dict):
+            raise SlackApiError("users.info", "missing_user_object", retryable=False)
+        return SlackUser(
+            id=str(user.get("id", user_id)),
+            deleted=bool(user.get("deleted")),
+            is_bot=bool(user.get("is_bot")),
+        )
 
     async def post_message(
         self,
@@ -343,15 +412,14 @@ class LiveSlackClient:
         groups:history scope); scans at most a few pages after `oldest`."""
         cursor: str | None = None
         for _ in range(5):
-            body: dict[str, Any] = {
+            params: dict[str, Any] = {
                 "channel": channel,
                 "oldest": f"{oldest.timestamp():.6f}",
                 "limit": 200,
                 "include_all_metadata": True,
+                "cursor": cursor,
             }
-            if cursor:
-                body["cursor"] = cursor
-            payload = await self._call("conversations.history", body)
+            payload = await self._read("conversations.history", params)
             for message in payload.get("messages") or []:
                 if not isinstance(message, dict):
                     continue

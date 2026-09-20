@@ -480,7 +480,12 @@ async def test_live_slack_retry_after_and_metadata_reconciliation() -> None:
         if request.url.path.endswith("chat.postMessage"):
             return httpx.Response(429, headers={"Retry-After": "12"}, json={"ok": False})
         if request.url.path.endswith("conversations.history"):
-            assert body["include_all_metadata"] is True
+            # GET method: documented form arguments in the query string, no JSON body.
+            assert request.method == "GET" and not request.content
+            assert request.url.params["include_all_metadata"] == "true"
+            assert request.url.params["channel"] == "C1"
+            assert request.url.params["limit"] == "200"
+            assert "cursor" not in request.url.params
             return httpx.Response(
                 200,
                 json={

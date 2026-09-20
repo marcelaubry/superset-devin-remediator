@@ -626,7 +626,7 @@ async def check_slack(settings: Settings, probes: Probes) -> list[CheckResult]:
         try:
             me = await client.auth_test()
         except SlackApiError as exc:
-            results.append(CheckResult("slack.identity", "fail", exc.error))
+            results.append(CheckResult("slack.identity", "fail", exc.describe()))
             return results
         results.append(
             CheckResult(
@@ -636,31 +636,36 @@ async def check_slack(settings: Settings, probes: Probes) -> list[CheckResult]:
         try:
             channel = await client.channel_info(settings.slack_channel_id)
         except SlackApiError as exc:
-            results.append(CheckResult("slack.channel", "fail", exc.error))
+            results.append(CheckResult("slack.channel", "fail", exc.describe()))
         else:
             member = bool(channel.get("is_member"))
+            archived = bool(channel.get("is_archived"))
+            private = bool(channel.get("is_private"))
             results.append(
                 CheckResult(
                     "slack.channel",
-                    "pass" if member else "fail",
-                    f"#{channel.get('name', settings.slack_channel_id)} is_member={member}",
+                    "pass" if member and not archived else "fail",
+                    f"#{channel.get('name', settings.slack_channel_id)} is_member={member} "
+                    f"is_archived={archived} is_private={private}",
                 )
             )
         for approver in approvers:
             if approver in malformed:
                 continue
             try:
-                exists = await client.user_exists(approver)
+                user = await client.user_info(approver)
             except SlackApiError as exc:
-                results.append(CheckResult(f"slack.approver[{approver}]", "fail", exc.error))
+                detail = exc.error if exc.error == "user_not_found" else exc.describe()
+                results.append(CheckResult(f"slack.approver[{approver}]", "fail", detail))
             else:
-                results.append(
-                    CheckResult(
-                        f"slack.approver[{approver}]",
-                        "pass" if exists else "fail",
-                        "active" if exists else "unknown or deactivated",
-                    )
-                )
+                verdict: Status
+                if user.deleted:
+                    verdict, detail = "fail", "deactivated"
+                elif user.is_bot:
+                    verdict, detail = "fail", "is a bot user"
+                else:
+                    verdict, detail = "pass", "active"
+                results.append(CheckResult(f"slack.approver[{approver}]", verdict, detail))
     finally:
         await client.aclose()
     return results
