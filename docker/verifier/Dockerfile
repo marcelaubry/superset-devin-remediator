@@ -6,9 +6,10 @@
 # key) is delivered at start-up through VERIFIER_HMAC_KEY_FILE and never baked into a layer.
 #
 # Toolchain pinned to the Superset checkout this deployment verifies
-# (superset-frontend/package.json engines: node ^24.16.0, npm ^11.13.0; .nvmrc v24.16.0).
+# (superset-frontend/package.json engines: node ^24.16.0, npm ^11.13.0; .nvmrc v24.16.0);
+# npm follows the newest 11.x so its bundled node-tar/undici carry the current CVE fixes.
 ARG NODE_VERSION=24.16.0
-ARG NPM_VERSION=11.13.0
+ARG NPM_VERSION=11.19.1
 ARG YARN_VERSION=1.22.22
 
 FROM python:3.11-slim AS node-fetch
@@ -42,7 +43,9 @@ RUN npm install -g "npm@${NPM_VERSION}" "yarn@${YARN_VERSION}" \
  && rm -rf /root/.npm /root/.cache \
  && ln -s /opt/node/bin/node /opt/node/bin/npm /opt/node/bin/npx /opt/node/bin/yarn \
           /opt/node/bin/corepack /usr/local/bin/
-RUN pip install --no-cache-dir uv
+# setuptools/wheel are only build-time helpers of the base image; the verifier venv is
+# populated by uv from the lockfile, so drop them (and their vendored copies) from the image.
+RUN pip install --no-cache-dir uv && pip uninstall -y setuptools wheel
 WORKDIR /app
 COPY pyproject.toml uv.lock* ./
 RUN uv sync --frozen --no-dev
