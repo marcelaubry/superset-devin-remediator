@@ -12,6 +12,7 @@ from typing import Any
 
 from ..fixtures import RemediationFixture, fake_head_sha, fake_pr_number, remediation_fixture
 from .client import (
+    ConsumptionReport,
     CreateSessionRequest,
     DevinApiError,
     DevinSessionNotFound,
@@ -270,6 +271,15 @@ class FakeDevinClient:
             raise DevinSessionNotFound(session_id)
         fake.terminated = True
         return self._snapshot(fake, "exit", "user_request")
+
+    async def session_consumption(self, session_id: str) -> ConsumptionReport:
+        """Fake consumption is always labelled `simulated`; it never looks like billing."""
+        fake = self._sessions.get(session_id)
+        if fake is None:
+            return ConsumptionReport("unavailable", detail="unknown fake session")
+        return ConsumptionReport(
+            "simulated", acus=round(min(fake.polls, self._polls_until_finish) * 0.25, 2)
+        )
 
     async def aclose(self) -> None:
         return None

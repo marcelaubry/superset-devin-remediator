@@ -87,6 +87,20 @@ class SessionSnapshot:
     extra: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
 
 
+@dataclass(frozen=True)
+class ConsumptionReport:
+    """Result of the official per-session consumption endpoint.
+
+    `status` is one of `available`, `unavailable`, `simulated`. `acus` is set only when the
+    API returned a figure; it is never estimated. `detail` explains an unavailable report
+    (403, unsupported plan, network) without any secret material.
+    """
+
+    status: str
+    acus: float | None = None
+    detail: str = ""
+
+
 class DevinClient(Protocol):
     mode: str
 
@@ -97,5 +111,7 @@ class DevinClient(Protocol):
     async def get_session(self, session_id: str) -> SessionSnapshot: ...
 
     async def terminate_session(self, session_id: str) -> SessionSnapshot | None: ...
+
+    async def session_consumption(self, session_id: str) -> ConsumptionReport: ...
 
     async def aclose(self) -> None: ...

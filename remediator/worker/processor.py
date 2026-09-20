@@ -13,6 +13,7 @@ from ..approvals import (
     is_remediation_label_event,
     issue_label_names,
 )
+from ..capacity import CapacityManager
 from ..config import Settings
 from ..devin.client import DevinClient
 from ..devin.triage import TriageValidationError, validate_triage_output
@@ -203,11 +204,15 @@ async def _terminate_case(
     case: Case,
     devin: DevinClient,
     claimed_by: str | None = None,
+    capacity: CapacityManager | None = None,
 ) -> None:
     if not await terminate_running_attempts(session, case, devin):
         case.failure_reason = "operator requested cancel; Devin session termination pending"
         await session.commit()
         return
+    if capacity is not None:
+        # Only now is the remote session confirmed gone; the slot may be reused.
+        await capacity.release_all_for_case(session, case.id, "remote termination confirmed")
     await transition(
         session,
         case,
@@ -217,6 +222,16 @@ async def _terminate_case(
         expected_claimed_by=claimed_by,
     )
     await session.commit()
+
+
+def probe_runner_from_settings(settings: Settings) -> ProbeRunner:
+    return build_probe_runner(
+        settings.probe_runner_mode,
+        settings.probe_verifier_url,
+        settings.probe_verifier_secret_value,
+        require_isolation=settings.probe_verifier_isolation_required,
+        request_timeout_seconds=settings.probe_verifier_request_timeout_seconds,
+    )
 
 
 async def _pending_termination_attempt(session: AsyncSession, case: Case) -> Attempt | None:
@@ -237,8 +252,10 @@ async def process_case(
     resolver: BaseCommitResolver | None = None,
     github: GitHubIssuesClient | None = None,
     probes: ProbeRunner | None = None,
+    capacity: CapacityManager | None = None,
 ) -> None:
     resolver = resolver or build_base_commit_resolver(settings)
+    capacity = capacity or CapacityManager.from_settings(settings, claimed_by or "worker")
     state = CaseState(case.state)
     if state in REMEDIATION_PHASE_STATES:
         if state not in REMEDIATION_WORK_STATES:
@@ -248,14 +265,17 @@ async def process_case(
             case,
             devin,
             github or build_github_client(settings),
-            probes or build_probe_runner(settings.probe_runner_mode, settings.probe_verifier_url),
+            probes or probe_runner_from_settings(settings),
             settings,
             resolver,
             claimed_by=claimed_by,
+            capacity=capacity,
         )
         await pipeline.process()
         return
-    runner = DevinRunner(session, case, devin, settings, resolver, claimed_by=claimed_by)
+    runner = DevinRunner(
+        session, case, devin, settings, resolver, claimed_by=claimed_by, capacity=capacity
+    )
     if state == CaseState.RECEIVED:
         if not await _evaluate_eligibility(session, case, claimed_by):
             return
@@ -269,7 +289,7 @@ async def process_case(
     if state == CaseState.TERMINATION_PENDING:
         pending = await _pending_termination_attempt(session, case)
         if pending is None:
-            await _terminate_case(session, case, devin, claimed_by)
+            await _terminate_case(session, case, devin, claimed_by, capacity)
         else:
             outcome = await runner.run(pending.kind)
             if pending.kind == AttemptKind.TRIAGE:
@@ -293,6 +313,7 @@ async def process_event(
     settings: Settings,
     claimed_by: str | None = None,
     resolver: BaseCommitResolver | None = None,
+    capacity: CapacityManager | None = None,
 ) -> None:
     issue = event.payload.get("issue", {})
     case = await session.scalar(
@@ -361,7 +382,7 @@ async def process_event(
         case.lease_expires_at = datetime.now(UTC) + timedelta(seconds=settings.worker_lease_seconds)
     event.case_id = case.id
     await session.commit()
-    await process_case(session, case, devin, settings, claimed_by, resolver)
+    await process_case(session, case, devin, settings, claimed_by, resolver, capacity=capacity)
     event.status = EventStatus.PROCESSED
     event.last_error = None
     event.processed_at = datetime.now(UTC)

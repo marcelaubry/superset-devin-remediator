@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import socket
+import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from uuid import uuid4
@@ -13,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..adapters import build_github_client, build_slack_client
 from ..api.metrics import worker_transient_db_errors_total
+from ..capacity import CapacityManager
 from ..config import Settings
 from ..db import build_engine, build_session_factory
 from ..devin import build_devin_client
@@ -26,10 +28,15 @@ from ..models import (
     EventStatus,
     WebhookEvent,
 )
-from ..probes import build_probe_runner
 from ..probes.remote import RemoteProbeRunner
 from .outbox import OutboxDispatcher
-from .processor import fail_case, process_case, process_event, terminate_running_attempts
+from .processor import (
+    fail_case,
+    probe_runner_from_settings,
+    process_case,
+    process_event,
+    terminate_running_attempts,
+)
 from .remediation import REMEDIATION_WORK_STATES
 
 CLAIMABLE_STATES = (
@@ -86,7 +93,8 @@ class Worker:
         self.worker_id = f"{socket.gethostname()}:{os.getpid()}:{uuid4().hex[:6]}"
         self.slack = build_slack_client(settings, self.session_factory)
         self.github = build_github_client(settings)
-        self.probes = build_probe_runner(settings.probe_runner_mode, settings.probe_verifier_url)
+        self.probes = probe_runner_from_settings(settings)
+        self.capacity = CapacityManager.from_settings(settings, self.worker_id)
         self.outbox = OutboxDispatcher(
             settings, self.session_factory, self.slack, self.github, self.worker_id
         )
@@ -183,9 +191,23 @@ class Worker:
 
     async def _release_case(self, case_id: object) -> None:
         async with self.session_factory() as session:
-            state = await session.scalar(select(Case.state).where(Case.id == case_id))
+            row = (
+                await session.execute(
+                    select(Case.state, Case.waiting_for).where(Case.id == case_id)
+                )
+            ).first()
+            state, waiting_for = (row.state, row.waiting_for) if row else (None, None)
             backoff: datetime | None = None
-            if state in {CaseState.TERMINATION_PENDING, CaseState.REMEDIATION_TERMINATION_PENDING}:
+            if waiting_for is not None:
+                # Saturated concurrency limit: re-check after the configured backoff so the
+                # queue drains in state_entered_at order without a busy loop.
+                backoff = datetime.now(UTC) + timedelta(
+                    seconds=self.settings.capacity_wait_backoff_seconds
+                )
+            elif state in {
+                CaseState.TERMINATION_PENDING,
+                CaseState.REMEDIATION_TERMINATION_PENDING,
+            }:
                 backoff = datetime.now(UTC) + timedelta(
                     seconds=self.settings.devin_poll_interval_seconds
                 )
@@ -224,6 +246,8 @@ class Worker:
                 )
                 if result.rowcount == 0:
                     logger.warning("case lease lost for %s", case_id)
+                else:
+                    await self.capacity.heartbeat(session, [cast(uuid.UUID, case_id)])
             if event_id is not None:
                 result = cast(
                     Any,
@@ -262,6 +286,7 @@ class Worker:
                             self.settings,
                             self.worker_id,
                             self.base_commits,
+                            capacity=self.capacity,
                         )
                         logger.info("processed webhook %s", fresh.delivery_id)
                 elif case:
@@ -276,11 +301,25 @@ class Worker:
                             self.base_commits,
                             github=self.github,
                             probes=self.probes,
+                            capacity=self.capacity,
                         )
                         logger.info("processed case %s in %s", case.id, fresh_case.state)
         finally:
             heartbeat.cancel()
             await asyncio.gather(heartbeat, return_exceptions=True)
+
+    async def _reap_capacity(self) -> None:
+        """Idle-time bookkeeping: retire expired leases (crashed holders) and leases whose
+        attempt already finished, so waiting cases are admitted on the next claim."""
+        try:
+            async with self.session_factory() as session:
+                await self.capacity.expire_stale(session)
+                await self.capacity.reconcile_finished(session)
+                await session.commit()
+        except DBAPIError as exc:
+            if not is_transient_db_error(exc):
+                raise
+            worker_transient_db_errors_total.inc()
 
     async def _cancel_unsent_attempts(self, session: AsyncSession, case_id: object) -> None:
         """Cancel active attempts that never sent a create.
@@ -326,6 +365,7 @@ class Worker:
                 if outbox_row is not None:
                     await self.outbox.dispatch(outbox_row.id, outbox_row.case_id)
                     continue
+                await self._reap_capacity()
                 await asyncio.sleep(self.settings.worker_poll_interval_seconds)
                 continue
             try:

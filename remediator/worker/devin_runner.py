@@ -18,6 +18,7 @@ from typing import Any, cast
 from sqlalchemy import desc, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ..capacity import CapacityDenied, CapacityManager, clear_waiting, mark_waiting
 from ..config import Settings
 from ..devin.client import (
     CreateSessionRequest,
@@ -54,6 +55,7 @@ from ..lifecycle import (
 )
 from ..models import (
     ACTIVE_ATTEMPT_STATUSES,
+    ACU_REPORT_NOT_ATTEMPTED,
     CANCEL_TERMINATION_REASON,
     FAILURE_CLASS_SESSION,
     UNRESOLVED_CREATE_ACK,
@@ -62,6 +64,7 @@ from ..models import (
     Attempt,
     AttemptKind,
     AttemptStatus,
+    CapacityLeaseKind,
     Case,
     CreateState,
     NotificationOutbox,
@@ -84,6 +87,9 @@ class RunResult(StrEnum):
     TIMED_OUT = "timed_out"
     TERMINATION_PENDING = "termination_pending"
     ORPHANED = "orphaned"
+    # No create intent exists yet: a configured concurrency limit is saturated. The case
+    # keeps its state, spends nothing and is retried by the next claim.
+    WAITING_FOR_CAPACITY = "waiting_for_capacity"
 
 
 @dataclass(frozen=True)
@@ -220,6 +226,7 @@ class DevinRunner:
         clock: Clock = _now,
         sleep: Sleep = asyncio.sleep,
         remediation: RemediationContext | None = None,
+        capacity: CapacityManager | None = None,
     ) -> None:
         self.session = session
         self.case = case
@@ -230,7 +237,90 @@ class DevinRunner:
         self.clock = clock
         self.sleep = sleep
         self.remediation = remediation
+        self.capacity = capacity
         self.phase: PhaseStates = TRIAGE_PHASE
+
+    @staticmethod
+    def _lease_kind(kind: AttemptKind) -> CapacityLeaseKind:
+        return (
+            CapacityLeaseKind.REMEDIATION
+            if kind == AttemptKind.REMEDIATION
+            else CapacityLeaseKind.TRIAGE
+        )
+
+    async def _acquire_capacity(self, kind: AttemptKind) -> CapacityDenied | None:
+        """Take this case's session slot before any create intent. Denied → no attempt row,
+        no POST, the case is marked waiting and left in its current state."""
+        if self.capacity is None:
+            return None
+        lease_kind = self._lease_kind(kind)
+        per_scope = (
+            self.capacity.limits.remediation_per_repository
+            if lease_kind is CapacityLeaseKind.REMEDIATION
+            else None
+        )
+        outcome = await self.capacity.acquire(
+            self.session,
+            kind=lease_kind,
+            case_id=self.case.id,
+            scope=self.case.repository.lower(),
+            per_scope_limit=per_scope,
+        )
+        if isinstance(outcome, CapacityDenied):
+            await mark_waiting(self.session, self.case, outcome)
+            await self.session.commit()
+            return outcome
+        await clear_waiting(self.session, self.case)
+        return None
+
+    async def _bind_lease(self, attempt: Attempt) -> None:
+        """Attach (or re-create after a restart) the lease for an attempt that already
+        exists. The session is already live, so it is counted even if that temporarily
+        exceeds the limit; new sessions then wait until it finishes."""
+        if self.capacity is None:
+            return
+        await self.capacity.acquire(
+            self.session,
+            kind=self._lease_kind(attempt.kind),
+            case_id=self.case.id,
+            scope=self.case.repository.lower(),
+            attempt_id=attempt.id,
+            force=True,
+        )
+
+    async def _release_capacity(self, kind: AttemptKind, reason: str) -> None:
+        if self.capacity is None:
+            return
+        await self.capacity.release(
+            self.session, kind=self._lease_kind(kind), case_id=self.case.id, reason=reason
+        )
+
+    async def _settle_capacity(self, outcome: RunOutcome) -> None:
+        """Release the session slot once the attempt is no longer live. TERMINATION_PENDING
+        keeps the slot: the remote session may still be running (and billing)."""
+        if outcome.result in {RunResult.TERMINATION_PENDING, RunResult.WAITING_FOR_CAPACITY}:
+            return
+        await self._release_capacity(outcome.attempt.kind, f"attempt {outcome.result.value}")
+        await self.session.commit()
+
+    async def _report_consumption(self, attempt: Attempt) -> None:
+        """Optional official ACU figure. Never raises, never estimates, never blocks."""
+        if attempt.devin_session_id is None or attempt.acu_reported_at is not None:
+            return
+        if not self.settings.devin_acu_reporting_enabled:
+            attempt.acu_report_status = ACU_REPORT_NOT_ATTEMPTED
+            return
+        try:
+            report = await self.devin.session_consumption(attempt.devin_session_id)
+        except Exception as exc:  # noqa: BLE001 - reporting must never fail remediation
+            logger.warning("ACU report failed for %s: %s", attempt.devin_session_id, type(exc))
+            attempt.acu_report_status = "unavailable"
+            attempt.acu_report_detail = f"client error: {type(exc).__name__}"
+        else:
+            attempt.acu_report_status = report.status
+            attempt.acu_reported = report.acus
+            attempt.acu_report_detail = report.detail or None
+        attempt.acu_reported_at = self.clock()
 
     def _timeout_seconds(self) -> float:
         if self.phase is REMEDIATION_PHASE:
@@ -267,26 +357,50 @@ class DevinRunner:
             .limit(1)
         )
         if attempt is None:
+            denied = await self._acquire_capacity(kind)
+            if denied is not None:
+                placeholder = Attempt(
+                    case_id=self.case.id, kind=kind, idempotency_key="", operation_key=""
+                )
+                return RunOutcome(
+                    RunResult.WAITING_FOR_CAPACITY,
+                    placeholder,
+                    reason=f"waiting for capacity: {denied.label}",
+                )
             created = await self._create(kind)
             if isinstance(created, RunOutcome):
+                await self._settle_capacity(created)
                 return created
             attempt = created
+            await self._bind_lease(attempt)
+            await self.session.commit()
+            outcome = await self._poll(attempt)
         elif attempt.status == AttemptStatus.TERMINATION_PENDING:
             if attempt.devin_session_id is None:
-                return await self._terminate_by_tag(attempt)
-            return await self._handle_timeout(attempt)
+                outcome = await self._terminate_by_tag(attempt)
+            else:
+                outcome = await self._handle_timeout(attempt)
         elif attempt.devin_session_id is None:
+            await self._bind_lease(attempt)
             reconciled = await self._reconcile_create(attempt)
             if isinstance(reconciled, RunOutcome):
+                await self._settle_capacity(reconciled)
                 return reconciled
+            outcome = await self._poll(attempt)
         else:
             logger.info(
                 "resuming Devin session %s for case %s", attempt.devin_session_id, self.case.id
             )
+            await self._bind_lease(attempt)
             if CaseState(self.case.state) in {self.phase.reconciling, self.phase.intent}:
                 await self._transition(self.phase.running, "Devin session re-attached")
-                await self.session.commit()
-        return await self._poll(attempt)
+            await self.session.commit()
+            outcome = await self._poll(attempt)
+        if outcome.result is not RunResult.TERMINATION_PENDING and outcome.attempt.id is not None:
+            await self._report_consumption(outcome.attempt)
+            await self.session.commit()
+        await self._settle_capacity(outcome)
+        return outcome
 
     # ---------------------------------------------------------------- create
 

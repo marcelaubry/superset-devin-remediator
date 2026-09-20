@@ -29,6 +29,13 @@ _TOOL_RE = re.compile(r"^[A-Za-z0-9_.+-]{1,64}$")
 _MAX_SCRIPT_BYTES = 256 * 1024
 _MIN_TIMEOUT = 1
 _MAX_TIMEOUT = 6 * 3600
+_MAX_SETUP_STEPS = 8
+_MAX_ARGV_ITEMS = 32
+_MAX_ARG_LENGTH = 256
+_MAX_CACHE_INPUTS = 8
+_MAX_RESOURCE_KEYS = 8
+RESOURCE_KEY_MAX_LENGTH = 128
+_REL_PATH_RE = re.compile(r"^[A-Za-z0-9_.@-]+(/[A-Za-z0-9_.@-]+)*$")
 
 
 class ProbeRegistryError(Exception):
@@ -60,6 +67,76 @@ class ApprovedProbe:
     def required_tools(self) -> tuple[str, ...]:
         tools = self.runtime.get("tools", [])
         return tuple(str(t) for t in tools)
+
+
+def validate_resource_key(key: str) -> str:
+    """Resource keys come from the approved probe manifest; keep them boring."""
+    key = key.strip().lower()
+    if not key or len(key) > RESOURCE_KEY_MAX_LENGTH:
+        raise ValueError("resource key must be 1-128 characters")
+    if not all(ch.isalnum() or ch in "-_./:" for ch in key):
+        raise ValueError(f"resource key {key!r} has characters outside [a-z0-9-_./:]")
+    if ".." in key or key.startswith("/"):
+        raise ValueError(f"resource key {key!r} may not look like a path")
+    return key
+
+
+def _validate_relative_path(value: Any, what: str, manifest_path: Path) -> str:
+    if not isinstance(value, str) or not _REL_PATH_RE.match(value) or ".." in value.split("/"):
+        raise ProbeRegistryError(
+            f"{manifest_path}: {what} {value!r} must be a plain repository-relative path"
+        )
+    return value
+
+
+def _validate_setup(manifest: dict[str, Any], tools: list[str], manifest_path: Path) -> None:
+    """`setup` is a list of argv arrays; every argv[0] must be a declared runtime tool so a
+    manifest can only install dependencies with the toolchain it already requires."""
+    steps = manifest.get("setup", [])
+    if not isinstance(steps, list) or len(steps) > _MAX_SETUP_STEPS:
+        raise ProbeRegistryError(f"{manifest_path}: setup must be a list of at most 8 argv arrays")
+    for step in steps:
+        if (
+            not isinstance(step, list)
+            or not step
+            or len(step) > _MAX_ARGV_ITEMS
+            or not all(isinstance(a, str) and 0 < len(a) <= _MAX_ARG_LENGTH for a in step)
+        ):
+            raise ProbeRegistryError(f"{manifest_path}: setup step {step!r} is not a valid argv")
+        if step[0] not in tools or "/" in step[0]:
+            raise ProbeRegistryError(
+                f"{manifest_path}: setup step {step[0]!r} is not one of runtime.tools"
+            )
+        if any("\0" in a or "\n" in a for a in step):
+            raise ProbeRegistryError(f"{manifest_path}: setup argv may not contain NUL/newline")
+    if "setup_timeout_seconds" in manifest:
+        _require_int(manifest, "setup_timeout_seconds", lo=_MIN_TIMEOUT, hi=_MAX_TIMEOUT)
+    inputs = manifest.get("cache_inputs", [])
+    if not isinstance(inputs, list) or len(inputs) > _MAX_CACHE_INPUTS:
+        raise ProbeRegistryError(f"{manifest_path}: cache_inputs must be a short list of paths")
+    for item in inputs:
+        _validate_relative_path(item, "cache_inputs entry", manifest_path)
+    keys = manifest.get("resource_keys", [])
+    if not isinstance(keys, list) or len(keys) > _MAX_RESOURCE_KEYS:
+        raise ProbeRegistryError(f"{manifest_path}: resource_keys must be a short list")
+    for key in keys:
+        try:
+            validate_resource_key(str(key))
+        except ValueError as exc:
+            raise ProbeRegistryError(f"{manifest_path}: {exc}") from exc
+
+
+def manifest_setup_steps(manifest: dict[str, Any]) -> tuple[tuple[str, ...], ...]:
+    return tuple(tuple(str(a) for a in step) for step in manifest.get("setup", []) or [])
+
+
+def manifest_cache_inputs(manifest: dict[str, Any]) -> tuple[str, ...]:
+    return tuple(str(p) for p in manifest.get("cache_inputs", []) or [])
+
+
+def manifest_setup_timeout(manifest: dict[str, Any]) -> int:
+    value = manifest.get("setup_timeout_seconds", 1800)
+    return int(value) if isinstance(value, int) and not isinstance(value, bool) else 1800
 
 
 def probe_identifier(repository: str, issue_number: int, script_hash: str) -> str:
@@ -145,6 +222,7 @@ def validate_manifest(
     digest = manifest.get("script_sha256")
     if not isinstance(digest, str) or not _HEX256_RE.match(digest):
         raise ProbeRegistryError(f"{manifest_path}: script_sha256 must be a 64-hex digest")
+    _validate_setup(manifest, [str(t) for t in tools], manifest_path)
     return manifest
 
 
@@ -238,13 +316,17 @@ def write_probe(
     timeout_seconds: int = 600,
     tools: tuple[str, ...] = ("bash",),
     description: str = "",
+    setup: tuple[tuple[str, ...], ...] = (),
+    setup_timeout_seconds: int | None = None,
+    cache_inputs: tuple[str, ...] = (),
+    resource_keys: tuple[str, ...] = (),
 ) -> Path:
     """Author a probe (used by tests, simulations and `scripts/probe_tool.py`)."""
     directory = probe_directory(root, repository, issue_number)
     directory.mkdir(parents=True, exist_ok=True)
     script_bytes = script.encode("utf-8")
     (directory / "probe.sh").write_bytes(script_bytes)
-    manifest = {
+    manifest: dict[str, Any] = {
         "schema_version": PROBE_SCHEMA_VERSION,
         "repository": repository,
         "issue_number": issue_number,
@@ -255,6 +337,14 @@ def write_probe(
         "runtime": {"tools": list(tools), "description": description},
         "script_sha256": sha256_hex(script_bytes),
     }
+    if setup:
+        manifest["setup"] = [list(step) for step in setup]
+    if setup_timeout_seconds is not None:
+        manifest["setup_timeout_seconds"] = setup_timeout_seconds
+    if cache_inputs:
+        manifest["cache_inputs"] = list(cache_inputs)
+    if resource_keys:
+        manifest["resource_keys"] = list(resource_keys)
     manifest_path = directory / MANIFEST_FILENAME
     manifest_path.write_text(yaml.safe_dump(manifest, sort_keys=False), encoding="utf-8")
     return manifest_path

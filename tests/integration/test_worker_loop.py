@@ -70,7 +70,7 @@ async def test_worker_loop_survives_failed_job(
     calls = 0
 
     async def fake_process_event(
-        session, event, devin, settings, claimed_by=None, resolver=None
+        session, event, devin, settings, claimed_by=None, resolver=None, capacity=None
     ) -> None:
         nonlocal calls
         calls += 1
@@ -297,7 +297,7 @@ async def test_deadlock_releases_the_job_for_retry_instead_of_failing_the_case(
     calls = 0
 
     async def flaky_process_event(
-        session, event, devin, settings, claimed_by=None, resolver=None
+        session, event, devin, settings, claimed_by=None, resolver=None, capacity=None
     ) -> None:
         nonlocal calls
         calls += 1

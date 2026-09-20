@@ -43,6 +43,7 @@ memory limits and the tmpfs workspace size bound what a probe can consume in bet
 """
 
 import asyncio
+import hashlib
 import os
 import resource
 import shutil
@@ -51,7 +52,7 @@ import tempfile
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
@@ -61,7 +62,16 @@ from ..models import ProbeTarget
 _MINIMAL_PATH = "/usr/local/bin:/usr/bin:/bin"
 _FETCH_TIMEOUT_SECONDS = 600
 _KILL_GRACE_SECONDS = 5
+_VERSION_TIMEOUT_SECONDS = 15
+_SETUP_STDERR_BYTES = 2000
 PROBE_RUN_MARKER = "REMEDIATOR_PROBE_RUN"
+# Tools whose `--version` is recorded as evidence when present on the minimal PATH.
+VERSIONED_TOOLS = ("git", "bash", "node", "npm", "yarn", "python3")
+
+STAGE_PREFLIGHT = "preflight"
+STAGE_FETCH = "fetch"
+STAGE_SETUP = "setup"
+STAGE_EXECUTE = "execute"
 
 # Environment variables whose presence in the *hosting* process proves it is a
 # credential-bearing service. Matched exactly or by suffix so `*_TOKEN`-style secrets
@@ -137,6 +147,18 @@ class ProbeRunSpec:
     timeout_seconds: int
     max_output_bytes: int
     required_tools: tuple[str, ...]
+    # Dependency installation declared by the approved manifest: argv arrays whose first
+    # element must be one of `required_tools`. Run in order, argv only, before the script.
+    setup_steps: tuple[tuple[str, ...], ...] = ()
+    setup_timeout_seconds: int = 1800
+    # Repository-relative lockfiles whose hashes (with tool versions and repository) form
+    # the download-cache key. The cache is never consulted for the verdict.
+    cache_inputs: tuple[str, ...] = ()
+    # Hash of the approved manifest; the verifier refuses when its registry differs.
+    manifest_hash: str = ""
+    # Idempotency key for the verifier (`ProbeExecution.id` hex); the same execution asked
+    # twice runs once.
+    request_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -150,6 +172,10 @@ class ProbeRunResult:
     timed_out: bool
     duration_ms: int
     infrastructure_error: str | None = None
+    # Which stage produced `infrastructure_error` (preflight/fetch/setup/execute); None for
+    # a product verdict.
+    failure_stage: str | None = None
+    tool_versions: dict[str, str] = field(default_factory=dict)
 
     @property
     def infrastructure_failed(self) -> bool:
@@ -259,6 +285,7 @@ class LocalProbeRunner:
         fetch_timeout_seconds: int = _FETCH_TIMEOUT_SECONDS,
         limits: ProbeResourceLimits | None = None,
         proc_root: Path = Path("/proc"),
+        cache_root: Path | None = None,
     ) -> None:
         if "{repository}" not in clone_url_format:
             raise ValueError("clone_url_format must contain {repository}")
@@ -267,6 +294,7 @@ class LocalProbeRunner:
         self.fetch_timeout_seconds = fetch_timeout_seconds
         self.limits = limits or ProbeResourceLimits()
         self.proc_root = proc_root
+        self.cache_root = cache_root
         self.credential_check = credential_exposure
 
     def clone_url(self, repository: str) -> str:
@@ -282,10 +310,16 @@ class LocalProbeRunner:
                 started,
                 "refusing to execute probe inside a credential-bearing process "
                 f"(visible: {exposed}); run the verifier in a credential-free container",
+                STAGE_PREFLIGHT,
             )
         missing = [tool for tool in ("git", "bash", *spec.required_tools) if _which(tool) is None]
         if missing:
-            return self._infra(identity, started, f"required tools not installed: {missing}")
+            return self._infra(
+                identity, started, f"required tools not installed: {missing}", STAGE_PREFLIGHT
+            )
+        bad_step = _invalid_setup_step(spec)
+        if bad_step is not None:
+            return self._infra(identity, started, bad_step, STAGE_PREFLIGHT)
         try:
             workspace = Path(
                 tempfile.mkdtemp(
@@ -294,16 +328,22 @@ class LocalProbeRunner:
                 )
             )
         except OSError as exc:
-            return self._infra(identity, started, f"cannot create workspace: {exc}")
+            return self._infra(
+                identity, started, f"cannot create workspace: {exc}", STAGE_PREFLIGHT
+            )
         try:
             repo_dir = workspace / "repo"
             home_dir = workspace / "home"
             repo_dir.mkdir()
             home_dir.mkdir()
             env = _minimal_env(home_dir)
+            versions = await tool_versions(env, ("git", "bash", *spec.required_tools))
             fetch_error = await self._fetch_exact_commit(repo_dir, spec, env)
             if fetch_error is not None:
-                return self._infra(identity, started, fetch_error)
+                return self._infra(identity, started, fetch_error, STAGE_FETCH, versions)
+            identity_error = await self._verify_identity(repo_dir, spec, env)
+            if identity_error is not None:
+                return self._infra(identity, started, identity_error, STAGE_FETCH, versions)
             script_path = workspace / "probe.sh"
             script_path.write_text(spec.script_content, encoding="utf-8")
             script_path.chmod(0o500)
@@ -317,14 +357,101 @@ class LocalProbeRunner:
                     PROBE_RUN_MARKER: marker,
                 }
             )
+            env.update(self._cache_env(repo_dir, spec, versions))
             try:
-                return await self._execute(identity, started, script_path, repo_dir, spec, env)
+                setup_error = await self._run_setup(repo_dir, spec, env)
+                if setup_error is not None:
+                    return self._infra(identity, started, setup_error, STAGE_SETUP, versions)
+                return await self._execute(
+                    identity, started, script_path, repo_dir, spec, env, versions
+                )
             finally:
                 # Nothing spawned by this run may survive it or keep writing into the
                 # workspace we are about to remove.
                 kill_marked_processes(marker, self.proc_root)
         finally:
             shutil.rmtree(workspace, ignore_errors=True)
+
+    async def _verify_identity(
+        self, repo_dir: Path, spec: ProbeRunSpec, env: dict[str, str]
+    ) -> str | None:
+        """The checked-out commit and the remote must be exactly what was requested; a
+        redirecting or lying remote is an infrastructure failure, never a verdict."""
+        head = await _capture(("git", "rev-parse", "--verify", "HEAD^{commit}"), repo_dir, env)
+        if head != spec.commit_sha:
+            return f"checked-out commit {head[:12] or '?'} is not the requested {spec.commit_sha}"
+        remote = await _capture(("git", "remote", "get-url", "origin"), repo_dir, env)
+        if remote != self.clone_url(spec.repository):
+            return "origin remote does not match the allowlisted clone URL"
+        return None
+
+    def _cache_env(
+        self, repo_dir: Path, spec: ProbeRunSpec, versions: dict[str, str]
+    ) -> dict[str, str]:
+        """Point package managers' *download* caches at a directory keyed by repository,
+        tool versions and lockfile hashes. A stale or poisoned cache can only make
+        installation fail (integrity is checked against the lockfile), never pass."""
+        if self.cache_root is None or not spec.cache_inputs:
+            return {}
+        digest = hashlib.sha256()
+        digest.update(spec.repository.encode())
+        for tool in sorted(versions):
+            digest.update(f"\0{tool}={versions[tool]}".encode())
+        for rel in spec.cache_inputs:
+            path = (repo_dir / rel).resolve()
+            if not path.is_relative_to(repo_dir.resolve()) or not path.is_file():
+                return {}
+            digest.update(b"\0" + rel.encode() + b"=" + sha256_file(path).encode())
+        key = digest.hexdigest()
+        base = self.cache_root / key
+        try:
+            for sub in ("npm", "yarn", "pip"):
+                (base / sub).mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return {}
+        return {
+            "npm_config_cache": str(base / "npm"),
+            "YARN_CACHE_FOLDER": str(base / "yarn"),
+            "PIP_CACHE_DIR": str(base / "pip"),
+        }
+
+    async def _run_setup(
+        self, repo_dir: Path, spec: ProbeRunSpec, env: dict[str, str]
+    ) -> str | None:
+        if not spec.setup_steps:
+            return None
+        deadline = time.monotonic() + spec.setup_timeout_seconds
+        for argv in spec.setup_steps:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return f"setup exceeded {spec.setup_timeout_seconds}s before {argv[0]}"
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *argv,
+                    cwd=str(repo_dir),
+                    env=env,
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                    start_new_session=True,
+                    preexec_fn=self.limits.preexec(),
+                )
+            except OSError as exc:
+                return f"cannot start setup step {argv[0]}: {exc}"
+            err = _BoundedCapture(_SETUP_STDERR_BYTES)
+            work = asyncio.gather(err.drain(proc.stderr), proc.wait())
+            try:
+                await asyncio.wait_for(asyncio.shield(work), timeout=remaining)
+            except TimeoutError:
+                _kill_group(proc)
+                kill_marked_processes(env[PROBE_RUN_MARKER], self.proc_root)
+                await proc.wait()
+                work.cancel()
+                return f"setup step {' '.join(argv[:2])} timed out"
+            if proc.returncode != 0:
+                detail = err.text().strip()[:500]
+                return f"setup step {' '.join(argv[:2])} exited {proc.returncode}: {detail}"
+        return None
 
     async def _fetch_exact_commit(
         self, repo_dir: Path, spec: ProbeRunSpec, env: dict[str, str]
@@ -367,6 +494,7 @@ class LocalProbeRunner:
         repo_dir: Path,
         spec: ProbeRunSpec,
         env: dict[str, str],
+        versions: dict[str, str] | None = None,
     ) -> ProbeRunResult:
         marker = env[PROBE_RUN_MARKER]
         try:
@@ -382,7 +510,9 @@ class LocalProbeRunner:
                 preexec_fn=self.limits.preexec(),
             )
         except OSError as exc:
-            return self._infra(identity, started, f"cannot start probe: {exc}")
+            return self._infra(
+                identity, started, f"cannot start probe: {exc}", STAGE_EXECUTE, versions
+            )
         out = _BoundedCapture(spec.max_output_bytes)
         err = _BoundedCapture(spec.max_output_bytes)
         # The deadline covers the child's *exit*, not just its output: a probe that closes
@@ -411,9 +541,17 @@ class LocalProbeRunner:
             output_truncated=out.truncated or err.truncated,
             timed_out=timed_out,
             duration_ms=duration_ms,
+            tool_versions=dict(versions or {}),
         )
 
-    def _infra(self, identity: str, started: float, reason: str) -> ProbeRunResult:
+    def _infra(
+        self,
+        identity: str,
+        started: float,
+        reason: str,
+        stage: str = STAGE_PREFLIGHT,
+        versions: dict[str, str] | None = None,
+    ) -> ProbeRunResult:
         return ProbeRunResult(
             runner_mode=self.mode,
             command_identity=identity,
@@ -424,11 +562,71 @@ class LocalProbeRunner:
             timed_out=False,
             duration_ms=int((time.monotonic() - started) * 1000),
             infrastructure_error=reason,
+            failure_stage=stage,
+            tool_versions=dict(versions or {}),
         )
 
 
 def _which(tool: str) -> str | None:
     return shutil.which(tool, path=_MINIMAL_PATH)
+
+
+def _invalid_setup_step(spec: ProbeRunSpec) -> str | None:
+    """Setup steps may only invoke tools the manifest declared; no shell, no paths."""
+    for argv in spec.setup_steps:
+        if not argv or not all(isinstance(a, str) and a for a in argv):
+            return "setup step must be a non-empty argv array"
+        if "/" in argv[0] or argv[0] not in spec.required_tools:
+            return f"setup step {argv[0]!r} is not one of the manifest's runtime.tools"
+    return None
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+async def _capture(
+    argv: tuple[str, ...], cwd: Path | None, env: dict[str, str], timeout: float = 30
+) -> str:
+    """First line of stdout of a short argv command, or '' on any failure."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            cwd=str(cwd) if cwd else None,
+            env=env,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except OSError:
+        return ""
+    try:
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except TimeoutError:
+        proc.kill()
+        return ""
+    if proc.returncode != 0:
+        return ""
+    lines = stdout.decode("utf-8", errors="replace").strip().splitlines()
+    return lines[0] if lines else ""
+
+
+async def tool_versions(
+    env: dict[str, str] | None = None, tools: tuple[str, ...] = VERSIONED_TOOLS
+) -> dict[str, str]:
+    """`<tool> --version` for every installed tool in `tools` (bounded, argv only)."""
+    env = env or _minimal_env(Path("/tmp"))
+    found: dict[str, str] = {}
+    for tool in dict.fromkeys(tools):
+        if _which(tool) is None:
+            continue
+        line = await _capture((tool, "--version"), None, env, _VERSION_TIMEOUT_SECONDS)
+        found[tool] = line[:120]
+    return found
 
 
 def _minimal_env(home_dir: Path) -> dict[str, str]:
