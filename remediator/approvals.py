@@ -154,7 +154,11 @@ async def create_approval_request(
     result: TriageResult,
     settings: Settings,
 ) -> ApprovalRequest:
-    """Create the approval round for a validated `remediation_candidate` and enqueue Slack.
+    """Create the approval round for a schema-valid triage result and enqueue Slack.
+
+    Every outcome gets a round; the human decides after seeing Devin's evidence. The
+    recommendation is stored verbatim in the attempt output and rendered with a warning when
+    it is not `remediation_candidate`.
 
     Idempotent per triage attempt: a second call for the same attempt returns the existing
     request without enqueueing another notification. Every earlier undecided round for the
@@ -206,7 +210,7 @@ async def create_approval_request(
         request,
         "approval_requested",
         "worker",
-        f"triage {attempt.operation_key} validated as remediation_candidate "
+        f"triage {attempt.operation_key} validated with recommendation {result.outcome} "
         f"(result sha256 {request.triage_result_hash[:12]})",
     )
     enqueue(

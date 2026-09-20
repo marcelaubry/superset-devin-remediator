@@ -24,7 +24,6 @@ from ..lifecycle import REMEDIATION_PHASE_STATES, CaseState, phase_for_state, tr
 from ..models import (
     ACTIVE_ATTEMPT_STATUSES,
     CANCEL_TERMINATION_REASON,
-    OUTBOX_KIND_GITHUB_NOT_FEASIBLE,
     Attempt,
     AttemptKind,
     AttemptStatus,
@@ -32,7 +31,6 @@ from ..models import (
     EventStatus,
     NotificationOutbox,
     OutboxChannel,
-    Recommendation,
     WebhookEvent,
 )
 from ..probes import build_probe_runner
@@ -108,39 +106,16 @@ async def _finish_triage(
         "worker",
         expected_claimed_by=claimed_by,
     )
-    if not result.remediation_candidate:
-        reason = f"triage outcome {result.outcome}: {result.summary}"
-        await transition(
-            session,
-            case,
-            CaseState.POLICY_REJECTED,
-            reason,
-            "worker",
-            expected_claimed_by=claimed_by,
-        )
-        session.add(
-            NotificationOutbox(
-                case_id=case.id,
-                channel=OutboxChannel.GITHUB,
-                kind=OUTBOX_KIND_GITHUB_NOT_FEASIBLE,
-                payload={
-                    "issue_number": case.issue_number,
-                    "outcome": result.outcome,
-                    "summary": result.summary,
-                    "blocking_questions": list(result.blocking_questions),
-                },
-            )
-        )
-        await session.commit()
-        return
-    # The Slack notification is only an outbox row here; delivery happens asynchronously
-    # and its failure can never roll back the validated triage result.
+    # Every schema-valid triage result goes to an authorized human, whatever Devin recommended;
+    # the recommendation is preserved verbatim and Slack warns when it is not
+    # `remediation_candidate`. The Slack notification is only an outbox row here; delivery
+    # happens asynchronously and its failure can never roll back the validated triage result.
     await create_approval_request(session, case, attempt, result, settings)
     await transition(
         session,
         case,
         CaseState.AWAITING_REMEDIATION_APPROVAL,
-        "remediation approval requested",
+        f"remediation approval requested (Devin recommendation: {result.outcome})",
         "worker",
         expected_claimed_by=claimed_by,
     )
@@ -170,16 +145,17 @@ async def _evaluate_eligibility(session: AsyncSession, case: Case, claimed_by: s
         expected_claimed_by=claimed_by,
     )
     await session.commit()
-    eligible = result.recommendation == Recommendation.ELIGIBLE_FOR_DEVIN_TRIAGE
     metrics.eligibility_outcomes_total.labels(
-        metrics.mode(), "eligible" if eligible else "rejected"
+        metrics.mode(), "eligible" if result.eligible else "rejected"
     ).inc()
-    if not eligible:
+    if not result.eligible:
+        reason = "insufficient context for triage: " + "; ".join(result.missing)
+        logger.info("case %s policy-rejected: %s", case.id, reason)
         await transition(
             session,
             case,
             CaseState.POLICY_REJECTED,
-            f"recommendation {result.recommendation.value}",
+            reason,
             "worker",
             expected_claimed_by=claimed_by,
         )
@@ -188,7 +164,11 @@ async def _evaluate_eligibility(session: AsyncSession, case: Case, claimed_by: s
                 case_id=case.id,
                 channel=OutboxChannel.GITHUB,
                 kind="eligibility_rejected",
-                payload={"recommendation": result.recommendation.value},
+                payload={
+                    "reason": "insufficient_context",
+                    "missing": list(result.missing),
+                    "advisory_recommendation": result.recommendation.value,
+                },
             )
         )
         await session.commit()
@@ -197,7 +177,7 @@ async def _evaluate_eligibility(session: AsyncSession, case: Case, claimed_by: s
         session,
         case,
         CaseState.TRIAGE_CREATE_INTENT,
-        "triage requested",
+        f"triage requested (context complete; advisory {result.recommendation.value})",
         "worker",
         expected_claimed_by=claimed_by,
     )

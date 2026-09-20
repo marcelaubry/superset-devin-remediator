@@ -36,7 +36,7 @@
     <span><strong>Elapsed in stage:</strong> {{ ui.ago(case.state_entered_at) }}</span>
     <span><strong>Age:</strong> {{ ui.ago(case.created_at) }}</span>
     <span><strong>Repository:</strong> <span class="val">{{ case.repository }}</span></span>
-    <span><strong>Recommendation:</strong> {% if case.recommendation %}<code>{{ case.recommendation.value }}</code>{% else %}<span class="muted">-</span>{% endif %}</span>
+    <span><strong>Advisory recommendation:</strong> {% if case.recommendation %}<code>{{ case.recommendation.value }}</code> <span class="muted">(does not decide eligibility)</span>{% else %}<span class="muted">-</span>{% endif %}</span>
     <span><strong>Session:</strong> {{ ui.ident(case.devin_session_id, 30, case.devin_session_url) }}</span>
     <span><strong>CI:</strong> {% if case.ci_status %}{{ b.enum("ci", case.ci_status) }}{% else %}<span class="muted">-</span>{% endif %}</span>
   </p>

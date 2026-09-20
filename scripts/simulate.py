@@ -375,8 +375,21 @@ class Simulator:
             for attempt in result.get("attempts", [])
         ]
         print("timeline", json.dumps(summary))
+        eligibility = result.get("eligibility") or {}
+        if eligibility:
+            verdict = "context complete" if eligibility.get("eligible") else "insufficient context"
+            print(
+                f"  eligibility: {verdict}; advisory recommendation "
+                f"{result.get('advisory_recommendation')}"
+            )
+            for item in eligibility.get("missing", []):
+                print(f"    missing: {item}")
         if result["state"] == "AWAITING_REMEDIATION_APPROVAL":
-            print("  awaiting a Slack decision; run `--scenario approve` for the Phase 3 flow")
+            outcome = next((a["outcome"] for a in summary["attempts"] if a["outcome"]), None)
+            print(
+                f"  Devin recommendation {outcome}; awaiting a Slack decision; "
+                "run `--scenario approve` for the Phase 3 flow"
+            )
 
     # ------------------------------------------------------------------ phase 3
     def run_approve(self) -> None:

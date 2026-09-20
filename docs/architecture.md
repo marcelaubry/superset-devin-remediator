@@ -112,7 +112,8 @@
   Every call checks the repository allowlist before any network I/O; the fake
   derives PR/CI shape from the fixture issue number.
 - **Approval service (`remediator/approvals.py`):** creates approval requests
-  after a valid `remediation_candidate` triage, processes verified Slack
+  after any schema-valid triage result (recommendation preserved verbatim),
+  processes verified Slack
   actions (token → expiry → approver → state → dedupe) in one transaction,
   and confirms delivery from the signed `issues/labeled` webhook.
 - **Outbox dispatcher (`remediator/worker/outbox.py`):** claims outbox rows
@@ -150,18 +151,58 @@ pull requests. PostgreSQL is the operational source of truth for work state.
 
 ```text
 GitHub issue opened
-→ deterministic zero-ACU eligibility filter        (rubric.py, no Devin call)
-→ eligible issue automatically queues Devin triage (TRIAGE_CREATE_INTENT)
+→ deterministic zero-ACU eligibility filter        (rubric.py, context completeness only, no Devin call)
+→ context-complete issue queues Devin triage       (TRIAGE_CREATE_INTENT)
 → durable create intent                            (attempts row + unique operation_key, committed BEFORE POST)
 → bounded Devin session                            (max_acu_limit, absolute timeout_at, exact op tag)
 → schema-validated triage result                   (structured_output_required + Draft 7 validation)
-→ awaiting remediation approval                    (AWAITING_REMEDIATION_APPROVAL)
+→ awaiting remediation approval                    (AWAITING_REMEDIATION_APPROVAL, any recommendation)
 ```
+
+## Eligibility rubric
+
+`remediator/rubric.py` answers exactly one question before any ACU is spent:
+
+> Is there enough context for bounded code-aware triage?
+
+It no longer answers *"should this work be autonomously remediated?"* — that
+decision belongs to Devin's triage evidence plus an authorized human in Slack.
+
+An issue is **eligible** when all four are present in its substantive text
+(fenced code, inline code, URLs, images and Markdown decoration are stripped
+before prose is evaluated; headings and template wording are not required):
+
+| Element | Passes when | Missing reason |
+| --- | --- | --- |
+| Problem | a concrete, multi-sentence description of what is wrong or must change — not merely a title, link or one-line request | `Missing concrete problem statement` |
+| Expected outcome | expected behaviour, desired result, acceptance criteria or an objectively stated goal | `Missing expected outcome` |
+| Investigation signal | at least one of: reproduction steps, current-vs-expected example, error/log, sample input/output, affected component/file/endpoint/chart/command/code path, failing or proposed test, link to concrete reference behaviour | `Missing reproduction/example/affected-component signal` |
+| Actionability | enough detail for a code-aware session to start repository investigation without first asking "what is the problem?" | `Not enough actionable detail to start repository investigation` |
+
+Not required: exact implementation instructions, exact file names, a proposed
+fix, a complete test plan, product-manager approval, prior architectural
+certainty, or a specific issue-template heading.
+
+The rubric still derives an **advisory recommendation** (`ELIGIBLE_FOR_DEVIN_TRIAGE`,
+`USE_DETERMINISTIC_AUTOMATION`, `HUMAN_LED`, `NEEDS_SCOPING`) from labels and
+category hints (dependency/version work, migrations, architecture, unresolved
+decisions, multiple change areas). It is stored on the case, shown on the
+dashboard and passed to the triage prompt as context, but it **never** rejects
+a context-complete issue. Rejections carry the specific missing elements —
+never a recommendation label — in the `POLICY_REJECTED` transition
+(`insufficient context for triage: …`), the structured log, the operator JSON
+(`eligibility.missing`), the dashboard case detail and `scripts/simulate.py`
+output.
+
+Operational gates are unchanged and still run before the rubric: webhook
+signature, repository allowlist, event/action support, optional intake label,
+duplicate delivery, active case/operation, payload limits, capacity and spend
+policy, and issue availability.
 
 ## Phase 3 approval flow
 
 ```text
-validated remediation_candidate                    (worker _finish_triage)
+schema-valid triage result (any recommendation)    (worker _finish_triage)
 → approval_requests row + slack outbox row         (same transaction as the triage result)
 → worker posts Block Kit message                   (fake or live; failure never touches the triage result)
    token generated, sha256 + SENDING committed BEFORE chat.postMessage; message carries
@@ -178,10 +219,23 @@ validated remediation_candidate                    (worker _finish_triage)
 
 Design points:
 
-- **Only candidates notify.** `approval_requests` is created only when the
-  triage output validated against the schema and `outcome ==
-  remediation_candidate`; a unique constraint on `attempt_id` prevents a
-  second notification for the same triage result.
+- **Every schema-valid result notifies; the human decides.** `approval_requests`
+  is created when the triage output validated against the schema, regardless
+  of `outcome`; the recommendation is preserved exactly (never rewritten to
+  `remediation_candidate`). The Slack message shows the recommendation,
+  summary/evidence, acceptance criteria, blocking questions, affected files,
+  estimated scope and risk notes, and for any non-candidate outcome the
+  warning *"Devin did not recommend autonomous remediation. Approval
+  explicitly accepts this risk and authorizes the bounded remediation
+  attempt."* (repeated in the confirmation dialog). No approval request is
+  created when the session failed or timed out, structured output is missing
+  or malformed, the result's repository/issue contradicts the case, the
+  evidence is stale, or another approval already exists; a unique constraint
+  on `attempt_id` prevents a second notification for the same triage result.
+  Approval still binds to the exact triage-result hash and every downstream
+  safeguard (label webhook, pinned SHA, immutable probe, capacity, bounded
+  session, PR validation, probe at head, exact-head CI, human review) is
+  unchanged.
 - **Opaque tokens.** The button value is `secrets.token_urlsafe(32)`; only its
   SHA-256 and expiry are stored. Repository, issue number, and case id are
   resolved from the token row, never from the Slack payload. On approval,
@@ -288,10 +342,10 @@ boundary durable on our side:
 Session completion alone is never success: the `structured_output` must exist
 and validate against `TRIAGE_OUTPUT_SCHEMA`, and `outcome` must be one of
 `remediation_candidate`, `needs_human`, `no_change_needed`,
-`deterministic_automation`, `invalid_issue`. Only `remediation_candidate`
-advances to `AWAITING_REMEDIATION_APPROVAL`; every other outcome ends at
-`POLICY_REJECTED` with a `triage_not_feasible` GitHub outbox intent carrying
-the summary and blocking questions.
+`deterministic_automation`, `invalid_issue`. Every valid outcome advances to
+`AWAITING_REMEDIATION_APPROVAL` with the recommendation preserved; Slack
+displays it (with the non-candidate warning where applicable) and an
+authorized human makes the final call.
 
 ### Timeout and termination
 
@@ -394,10 +448,10 @@ and never touch remediation state.
 
 ## Lifecycle
 
-The eligibility filter runs without ACU cost. Eligible cases go directly to
-triage; there is no approval or notification before triage. A
-`remediation_candidate` verdict creates one approval request and one Slack
-outbox row; an authorized human approves or rejects from Slack, and the case
+The eligibility filter runs without ACU cost and judges context completeness
+only. Eligible cases go directly to triage; there is no approval or
+notification before triage. Every schema-valid triage result creates one
+approval request and one Slack outbox row; an authorized human approves or rejects from Slack, and the case
 reaches `REMEDIATION_APPROVED` only through GitHub's signed `labeled` webhook.
 From there the remediation pipeline above takes over; remediation-phase
 terminations always use the `REMEDIATION_*` variants.

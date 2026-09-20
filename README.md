@@ -11,12 +11,13 @@ head, CI), and exposes an authenticated operator dashboard. It never merges.
 
 ```text
 GitHub issue opened
-→ deterministic zero-ACU eligibility filter
-→ eligible issue automatically queues Devin triage
+→ deterministic zero-ACU eligibility filter (context completeness only)
+→ context-complete issue automatically queues Devin triage
 → durable create intent
 → bounded Devin session
-→ schema-validated triage result
-→ AWAITING_REMEDIATION_APPROVAL (Slack notification, only for remediation_candidate)
+→ schema-validated triage result (any recommendation)
+→ AWAITING_REMEDIATION_APPROVAL (Slack shows Devin's recommendation, evidence,
+  blocking questions and a warning when it is not remediation_candidate)
 → authorized Slack user approves or rejects
 → approval queues `devin:remediate` label + audit comment through the outbox
 → signed GitHub `issues/labeled` webhook → REMEDIATION_APPROVED
@@ -49,9 +50,17 @@ spend zero ACUs.
   (off by default so every newly opened issue reaches the zero-ACU eligibility filter).
 - PostgreSQL stores webhook payloads, current cases, attempts, transitions, and
   notification intents.
-- A zero-ACU deterministic eligibility filter rejects non-eligible issues
-  (no Devin session is ever created for them) and queues eligible issues for
-  triage.
+- A zero-ACU deterministic eligibility filter answers one question only: *is
+  there enough context for bounded code-aware triage?* It rejects an issue
+  (no Devin session is ever created) only when the description lacks a
+  concrete problem, an expected outcome, or any investigation signal
+  (reproduction, current-vs-expected example, error/log, sample I/O, affected
+  component/file/endpoint, test, or reference link), and it names the missing
+  elements in the transition, logs, dashboard and simulation output. It does
+  **not** answer *should this work be autonomously remediated?* — dependency,
+  migration, architecture and other category hints are recorded as an advisory
+  recommendation and never reject a sufficiently detailed issue.
+  See [docs/architecture.md](docs/architecture.md#eligibility-rubric).
 - Before any `POST /sessions`, the worker commits an `attempts` row with a
   unique `operation_key`; that key is sent as an exact session tag. An
   uncertain create is reconciled by tag and is never re-sent.
@@ -64,9 +73,16 @@ spend zero ACUs.
   Devin URL, validated result, and blocked/reconciliation reasons.
 - The fake client emits the same v3 `status`/`status_detail` vocabulary and
   deterministically picks a scenario from the issue number.
-- A validated `remediation_candidate` verdict creates one `approval_requests`
-  row and a Slack outbox row. The worker posts a Block Kit message (escaped,
-  length-capped, no raw issue body, no secrets) with `Approve remediation`,
+- Every schema-valid triage result — `remediation_candidate`, `needs_human`,
+  `deterministic_automation`, `no_change_needed` or `invalid_issue` — creates
+  one `approval_requests` row and a Slack outbox row; the recommendation is
+  preserved exactly, never rewritten. The worker posts a Block Kit message
+  (escaped, length-capped, no raw issue body, no secrets) showing Devin's
+  recommendation, summary/evidence, acceptance criteria, blocking questions,
+  affected files, estimated scope and risks, plus the warning *"Devin did not
+  recommend autonomous remediation. Approval explicitly accepts this risk and
+  authorizes the bounded remediation attempt."* for non-candidates, with
+  `Approve remediation`,
   `Reject`, an optional rejection-reason select, `View issue`, and
   `View evidence/dashboard`. Buttons carry an opaque random token; only its
   SHA-256 is stored.
@@ -236,11 +252,11 @@ docker buildx build --platform linux/amd64 -f docker/verifier/Dockerfile .
 | Scenario | Fixture | Issue | Expected outcome | Why |
 | --- | --- | ---: | --- | --- |
 | `good` | `issue_good_candidate.json` | 4213 | `AWAITING_REMEDIATION_APPROVAL` | Complete reproduction, objective checks, acceptance criteria, and existing-pattern evidence |
-| `needs-scoping` | `issue_needs_scoping.json` | 4321 | `POLICY_REJECTED` without Devin session | Missing reproducibility and acceptance details |
-| `deterministic` | `issue_deterministic.json` | 4422 | `POLICY_REJECTED` without Devin session | Dependency/version-bump work is deterministic automation |
-| `human-led` | `issue_human_led.json` | 4501 | `POLICY_REJECTED` without Devin session | Architecture and breaking-change reasoning requires human ownership |
-| `digit-only-temporal` | `issue_digit_only_temporal.json` | 4171 | `AWAITING_REMEDIATION_APPROVAL` | Focused single-area bug; other areas appear only in code paths, context and non-goals, so the filter admits it to bounded Devin triage |
-| `triage-infeasible` | `issue_triage_infeasible.json` | 4533 | `POLICY_REJECTED` after triage | Fake triage reports that remediation requires a product decision |
+| `needs-scoping` | `issue_needs_scoping.json` | 4321 | `POLICY_REJECTED` without Devin session | Body is a one-liner: transition names `Missing concrete problem statement`, `Missing expected outcome`, `Missing reproduction/example/affected-component signal` |
+| `deterministic` | `issue_deterministic.json` | 4422 | `AWAITING_REMEDIATION_APPROVAL` | Context-complete dependency bump (package, version, reason, validation); advisory `USE_DETERMINISTIC_AUTOMATION` is recorded but does not gate; the fake triage returns `remediation_candidate` |
+| `human-led` | `issue_human_led.json` | 4502 | `AWAITING_REMEDIATION_APPROVAL` | Context-complete architecture issue; advisory `HUMAN_LED` is recorded but does not gate; the fake triage returns `remediation_candidate` |
+| `digit-only-temporal` | `issue_digit_only_temporal.json` | 4171 | `AWAITING_REMEDIATION_APPROVAL` | Focused bug with reproduction, current/expected values and acceptance criteria |
+| `triage-infeasible` | `issue_triage_infeasible.json` | 4533 | `AWAITING_REMEDIATION_APPROVAL` with warning | Fake triage returns `needs_human`; Slack shows the recommendation, blocking questions and the non-candidate warning; a human decides |
 | `failure` | `issue_fake_failure.json` | 4515 | `FAILED` | Fake session ends `status=error` for issue numbers divisible by five |
 | `blocked` | `issue_human_blocked.json` | 4529 | `HUMAN_BLOCKED` | Fake session reports `waiting_for_user`; session URL retained, no replacement |
 | `wrong-repo` | `issue_wrong_repo.json` | 4601 | filtered out | Repository does not match `GITHUB_REPOSITORY` |

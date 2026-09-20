@@ -17,7 +17,7 @@
         {% for state in STATE_PRESENTATION %}<option value="{{ state }}" {% if filters.state == state %}selected{% endif %}>{{ state }}</option>{% endfor %}
       </select>
     </div>
-    <div class="field"><label for="filter-recommendation">Recommendation</label>
+    <div class="field"><label for="filter-recommendation">Advisory recommendation</label>
       <select id="filter-recommendation" name="recommendation">
         <option value="" {% if not filters.recommendation %}selected{% endif %}>Any</option>
         {% for name in ["ELIGIBLE_FOR_DEVIN_TRIAGE", "NEEDS_SCOPING", "USE_DETERMINISTIC_AUTOMATION", "HUMAN_LED"] %}<option value="{{ name }}" {% if filters.recommendation == name %}selected{% endif %}>{{ name }}</option>{% endfor %}
@@ -28,7 +28,7 @@
   <div class="table-wrap" tabindex="0" role="region" aria-labelledby="cases-title">
     <table>
       <caption class="sr-only">Ledger of the latest cases, filtered by the controls above</caption>
-      <thead><tr><th scope="col">Issue</th><th scope="col">State</th><th scope="col">Phase</th><th scope="col">Recommendation</th><th scope="col">Session</th><th scope="col">PR</th><th scope="col">CI</th><th scope="col">In stage</th></tr></thead>
+      <thead><tr><th scope="col">Issue</th><th scope="col">State</th><th scope="col">Phase</th><th scope="col">Advisory</th><th scope="col">Session</th><th scope="col">PR</th><th scope="col">CI</th><th scope="col">In stage</th></tr></thead>
       <tbody>
         {% for case in filtered_cases %}
         {% set stage = stage_for_state(case.state) %}

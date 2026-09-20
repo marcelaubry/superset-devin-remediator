@@ -116,11 +116,21 @@ async def case_json(
         "pr_url": case.pr_url,
         "ci_status": case.ci_status,
         "waiting_for": case.waiting_for,
+        "advisory_recommendation": case.recommendation.value if case.recommendation else None,
+        "eligibility": _eligibility_json(case),
         "attempts": [_attempt_json(attempt) for attempt in case.attempts],
         "approval": approval_json(case),
         "remediation": remediation_json(case),
         "outbox": [_outbox_json(row) for row in case.outbox],
     }
+
+
+def _eligibility_json(case: Case) -> dict[str, Any] | None:
+    if not case.rubric:
+        return None
+    checks = [dict(check) for check in case.rubric]
+    missing = [str(check.get("reason", "")) for check in checks if not check.get("passed")]
+    return {"eligible": not missing, "missing": missing, "checks": checks}
 
 
 def _outbox_json(row: NotificationOutbox) -> dict[str, Any]:

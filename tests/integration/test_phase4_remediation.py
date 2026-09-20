@@ -16,6 +16,7 @@ import pytest
 import pytest_asyncio
 from sqlalchemy import select
 
+from remediator.approvals import triage_result_hash
 from remediator.config import Settings
 from remediator.devin.fake import FakeDevinClient
 from remediator.fixtures import REMEDIATION_FIXTURES, RemediationFixture, fake_pr_number
@@ -397,6 +398,50 @@ async def test_missing_probe_blocks_dispatch_without_a_session(rem: RemediationH
     assert rem.base.devin.create_calls == before
     assert await rem.attempts(case.id) == []
     assert "probe" in (case.failure_reason or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_non_candidate_approval_keeps_every_remediation_safeguard(
+    rem: RemediationHarness,
+) -> None:
+    """Approving a `needs_human` triage (with the Slack warning) buys a bounded attempt, not a
+    shortcut: the exact triage hash, the registered immutable probe and the label webhook are
+    still mandatory and nothing is dispatched to Devin without them."""
+    number = 4761  # % 3 -> the fake Devin returns needs_human; no probe is registered
+    assert number not in REMEDIATION_FIXTURES
+    case = await rem.approve(number)
+    async with rem.base.factory() as session:
+        attempt = await session.scalar(select(Attempt).where(Attempt.case_id == case.id))
+        request = await session.scalar(
+            select(ApprovalRequest).where(ApprovalRequest.case_id == case.id)
+        )
+        assert attempt is not None and attempt.structured_output is not None
+        assert request is not None
+        assert attempt.structured_output["outcome"] == "needs_human"
+        assert request.triage_result_hash == triage_result_hash(attempt.structured_output)
+    before = rem.base.devin.create_calls
+    case = await rem.run(case.id)
+    assert case.state == CaseState.REMEDIATION_HUMAN_BLOCKED
+    assert "probe" in (case.failure_reason or "").lower()
+    assert rem.base.devin.create_calls == before
+    assert await rem.attempts(case.id) == []
+
+    # Tamper with the bound hash: dispatch fails closed before any probe or session.
+    async with rem.base.factory() as session:
+        request = await session.scalar(
+            select(ApprovalRequest).where(ApprovalRequest.case_id == case.id)
+        )
+        assert request is not None
+        request.triage_result_hash = "0" * 64
+        row = await session.get(Case, case.id)
+        assert row is not None
+        row.state = CaseState.REMEDIATION_APPROVED
+        await session.commit()
+    case = await rem.run(case.id)
+    assert case.state == CaseState.REMEDIATION_FAILED
+    assert "triage" in (case.failure_reason or "").lower()
+    assert rem.base.devin.create_calls == before
+    assert await rem.attempts(case.id) == []
 
 
 @pytest.mark.asyncio

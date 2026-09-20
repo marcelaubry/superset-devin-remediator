@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from remediator.config import Settings
 from remediator.models import EventStatus, WebhookEvent
+from tests.integration.test_worker import ELIGIBLE_BODY
 
 
 def payload(
@@ -25,7 +26,7 @@ def payload(
         "issue": {
             "number": number,
             "title": "Fix chart rendering regression",
-            "body": "Steps to reproduce:\n1. Run.\nExpected behavior works. Actual behavior fails.",
+            "body": ELIGIBLE_BODY,
             "html_url": f"https://github.com/apache/superset/issues/{number}",
             "labels": [{"name": label} for label in labels or ["devin-candidate"]],
         },

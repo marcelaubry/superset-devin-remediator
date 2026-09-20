@@ -21,7 +21,7 @@ import pytest_asyncio
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from remediator.approvals import hash_action_token, retired_token_hash
+from remediator.approvals import hash_action_token, retired_token_hash, triage_result_hash
 from remediator.config import Settings
 from remediator.devin.fake import FakeDevinClient, FakeScenario
 from remediator.github.client import FakeGitHubClient, GitHubApiError
@@ -46,16 +46,19 @@ from remediator.models import (
     OutboxStatus,
     SlackAction,
     SlackFakeMessage,
+    StateTransition,
     WebhookEvent,
 )
-from remediator.slack.blocks import ACTION_APPROVE, ACTION_REJECT
+from remediator.slack.blocks import ACTION_APPROVE, ACTION_REJECT, NON_CANDIDATE_WARNING
 from remediator.slack.client import FakeSlackClient, SlackApiError
 from remediator.worker.outbox import OutboxDispatcher
 from remediator.worker.processor import process_case, process_event
 
 ELIGIBLE_BODY = (
-    "Steps to reproduce:\n1. Run.\nExpected behavior works. "
-    "Actual behavior fails. Acceptance criteria: fixed. Similar existing pattern."
+    "Steps to reproduce:\n1. Open a table chart with a temporal column.\n2. Sort by that column.\n"
+    "Expected behavior: rows are ordered by the timestamp. Actual behavior: rows are ordered "
+    "as strings, so 10:00 sorts before 9:00. Affected code: `superset-frontend/src/utils/sort.ts`. "
+    "Acceptance criteria: the column sorts chronologically and the existing sort unit tests pass."
 )
 APPROVER = "U_APPROVER_ONE"
 OUTSIDER = "U_NOT_ALLOWED"
@@ -303,15 +306,12 @@ async def harness(harness_factory: Callable[..., Awaitable[Harness]]) -> Harness
 
 
 @pytest.mark.asyncio
-async def test_only_remediation_candidates_notify_slack(harness: Harness) -> None:
+async def test_remediation_candidate_creates_a_normal_approval_request(harness: Harness) -> None:
     candidate = await harness.triage(4213)
     assert candidate.state == CaseState.AWAITING_REMEDIATION_APPROVAL
-    not_candidate = await harness.triage(4214, scenario=FakeScenario.NEEDS_HUMAN)
-    assert not_candidate.state != CaseState.AWAITING_REMEDIATION_APPROVAL
 
     slack_rows = await harness.outbox(candidate.id, OUTBOX_KIND_SLACK_APPROVAL_REQUEST)
     assert len(slack_rows) == 1
-    assert await harness.outbox(not_candidate.id, OUTBOX_KIND_SLACK_APPROVAL_REQUEST) == []
     async with harness.factory() as session:
         requests = (await session.scalars(select(ApprovalRequest))).all()
     assert [r.case_id for r in requests] == [candidate.id]
@@ -321,6 +321,8 @@ async def test_only_remediation_candidates_notify_slack(harness: Harness) -> Non
     assert len(messages) == 1
     text = json.dumps(messages[0].blocks)
     assert "apache/superset#4213" in text
+    assert "remediation_candidate" in text
+    assert NON_CANDIDATE_WARNING not in text  # no warning for a genuine candidate
     assert "Approve remediation" in text and "Reject" in text
     assert ELIGIBLE_BODY not in text  # never the raw issue body
     request = await harness.approval(candidate.id)
@@ -331,6 +333,86 @@ async def test_only_remediation_candidates_notify_slack(harness: Harness) -> Non
     token = await harness.token_from_slack()
     assert request.action_token_hash == hash_action_token(token)
     assert token not in json.dumps(request.__dict__, default=str)
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        FakeScenario.NEEDS_HUMAN,  # covers Devin's needs_scoping / human_led recommendations
+        FakeScenario.DETERMINISTIC_AUTOMATION,
+        FakeScenario.NO_CHANGE_NEEDED,
+    ],
+    ids=["needs_human", "deterministic_automation", "no_change_needed"],
+)
+@pytest.mark.asyncio
+async def test_non_candidate_triage_creates_a_warning_bearing_approval_request(
+    harness: Harness, scenario: FakeScenario
+) -> None:
+    """A schema-valid triage that does *not* recommend remediation still goes to Slack: the
+    recommendation is preserved verbatim, the blocking questions are shown and the message
+    carries the explicit risk-acceptance warning. Humans decide; policy does not."""
+    case = await harness.triage(4214, scenario=scenario)
+    assert case.state == CaseState.AWAITING_REMEDIATION_APPROVAL
+    async with harness.factory() as session:
+        attempt = await session.scalar(select(Attempt).where(Attempt.case_id == case.id))
+        assert attempt is not None and attempt.structured_output is not None
+        expected_outcome = attempt.structured_output["outcome"]
+        transitions = (
+            await session.scalars(
+                select(StateTransition.reason)
+                .where(StateTransition.case_id == case.id)
+                .order_by(StateTransition.created_at)
+            )
+        ).all()
+    assert expected_outcome == scenario.value
+    assert any(f"Devin recommendation: {expected_outcome}" in reason for reason in transitions)
+
+    request = await harness.approval(case.id)
+    assert request.triage_result_hash == triage_result_hash(attempt.structured_output)
+    assert attempt.structured_output["outcome"] == expected_outcome  # never rewritten
+    assert "approval_requested" in await harness.events(request.id)
+
+    assert await harness.drain() == 1
+    messages = await harness.fake_messages()
+    assert len(messages) == 1
+    text = json.dumps(messages[0].blocks)
+    assert expected_outcome in text
+    assert NON_CANDIDATE_WARNING in text
+    assert "Which behaviour is intended?" in text  # blocking questions preserved
+    assert "Approve remediation" in text and "Reject" in text
+    assert NON_CANDIDATE_WARNING in messages[0].text  # fallback text also warns
+
+    # The human decision is still gated: an outsider cannot approve, the approver can.
+    token = await harness.token_from_slack()
+    denied = await harness.click(token, user=OUTSIDER)
+    assert denied.status_code == 200 and denied.json()["outcome"] == "unauthorized"
+    assert (await harness.approval(case.id)).decision == ApprovalDecision.PENDING
+    approved = await harness.click(token)
+    assert approved.status_code == 200 and approved.json()["outcome"] == "approved"
+    request = await harness.approval(case.id)
+    assert request.decision == ApprovalDecision.APPROVED
+    assert request.triage_result_hash == triage_result_hash(attempt.structured_output)
+    # Approval alone never remediates: the GitHub label confirmation webhook is still required.
+    assert (await harness.case(case.id)).state == CaseState.AWAITING_REMEDIATION_APPROVAL
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [FakeScenario.MALFORMED_OUTPUT, FakeScenario.MISSING_OUTPUT, FakeScenario.TIMEOUT],
+    ids=["malformed_output", "missing_output", "timeout"],
+)
+@pytest.mark.asyncio
+async def test_failed_or_malformed_triage_creates_no_approval_request(
+    harness: Harness, scenario: FakeScenario
+) -> None:
+    case = await harness.triage(4214, scenario=scenario)
+    assert case.state != CaseState.AWAITING_REMEDIATION_APPROVAL
+    assert await harness.outbox(case.id, OUTBOX_KIND_SLACK_APPROVAL_REQUEST) == []
+    async with harness.factory() as session:
+        requests = (await session.scalars(select(ApprovalRequest))).all()
+    assert requests == []
+    await harness.drain()  # any record-only rows are drained; nothing reaches Slack
+    assert await harness.fake_messages() == []
 
 
 @pytest.mark.asyncio
