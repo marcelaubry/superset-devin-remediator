@@ -32,6 +32,16 @@
     banner.classList.add("is-visible");
     banner.hidden = false;
   }
+  // Pages that only poll a body region keep the topbar refresh stamp in step with the server's Date header.
+  function stamp(dateHeader) {
+    var el = document.getElementById("rendered-at");
+    var when = dateHeader ? new Date(dateHeader) : null;
+    if (!el || !when || isNaN(when.getTime())) { return; }
+    var iso = when.toISOString().replace(/\.\d{3}Z$/, "Z");
+    el.setAttribute("datetime", iso);
+    el.setAttribute("title", iso);
+    el.textContent = iso.slice(11);
+  }
   function hide() {
     banner.classList.remove("is-visible", "banner-err");
     banner.hidden = true;
@@ -47,6 +57,7 @@
       lastOk = Date.now();
       lastError = null;
       hide();
+      stamp(xhr.getResponseHeader("Date"));
     } else {
       lastError = "Last response: HTTP " + xhr.status + ".";
     }
@@ -54,15 +65,38 @@
   document.body.addEventListener("htmx:sendError", function () {
     lastError = "The server could not be reached.";
   });
-  // hx-preserve keeps preserved elements but detaching them drops focus; restore it after the swap.
+  // Polling swaps replace the DOM: carry focus (hx-preserve drops it) and <details> disclosure state across.
   var focused = null;
-  document.body.addEventListener("htmx:beforeSwap", function () {
+  var openDetails = null;
+  document.body.addEventListener("htmx:beforeSwap", function (evt) {
     var el = document.activeElement;
     if (el && el.id && el.closest("[hx-preserve]")) {
       focused = { id: el.id, start: el.selectionStart, end: el.selectionEnd };
     }
+    var target = evt.detail && evt.detail.target;
+    if (target) {
+      openDetails = { target: target, keys: [] };
+      detailsKeys(target).forEach(function (pair) { if (pair[0].open) { openDetails.keys.push(pair[1]); } });
+    }
   });
+  // Identify each <details> by id or summary text, disambiguating repeats (e.g. BASE/HEAD stdout) by order.
+  function detailsKeys(root) {
+    var seen = {};
+    return Array.prototype.map.call(root.querySelectorAll("details"), function (d) {
+      var summary = d.querySelector(":scope > summary");
+      var base = (d.id || "") + "|" + (summary ? summary.textContent.trim() : "");
+      seen[base] = (seen[base] || 0) + 1;
+      return [d, base + "#" + seen[base]];
+    });
+  }
   document.body.addEventListener("htmx:afterSettle", function () {
+    if (openDetails && openDetails.keys.length) {
+      var keys = openDetails.keys;
+      detailsKeys(openDetails.target).forEach(function (pair) {
+        if (keys.indexOf(pair[1]) !== -1) { pair[0].open = true; }
+      });
+    }
+    openDetails = null;
     if (!focused) { return; }
     var saved = focused;
     focused = null;
