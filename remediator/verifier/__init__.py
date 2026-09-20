@@ -200,11 +200,25 @@ def health() -> Health:
 
 
 class _ResultStore:
-    """Bounded, TTL'd idempotency store keyed by request_id."""
+    """Bounded, TTL'd idempotency store keyed by request_id.
+
+    Each id is bound to the fingerprint of the request it first arrived with; the same id
+    with different parameters is a conflict, never a replay of someone else's verdict."""
 
     def __init__(self) -> None:
         self._done: OrderedDict[str, tuple[float, ProbeResponse]] = OrderedDict()
         self._inflight: dict[str, asyncio.Future[ProbeResponse]] = {}
+        self._fingerprints: OrderedDict[str, str] = OrderedDict()
+
+    def bind(self, request_id: str, fingerprint: str) -> bool:
+        """True when the id is new or already bound to this exact fingerprint."""
+        known = self._fingerprints.get(request_id)
+        if known is None:
+            self._fingerprints[request_id] = fingerprint
+            while len(self._fingerprints) > 2 * _RESULT_MAX_ENTRIES:
+                self._fingerprints.popitem(last=False)
+            return True
+        return known == fingerprint
 
     def _evict(self) -> None:
         now = time.monotonic()
@@ -212,6 +226,7 @@ class _ResultStore:
             key, (stamp, _) = next(iter(self._done.items()))
             if now - stamp > _RESULT_TTL_SECONDS or len(self._done) > _RESULT_MAX_ENTRIES:
                 self._done.popitem(last=False)
+                self._fingerprints.pop(key, None)
             else:
                 break
 
@@ -237,6 +252,7 @@ class _ResultStore:
 
     def abort(self, request_id: str, exc: BaseException) -> None:
         fut = self._inflight.pop(request_id, None)
+        self._fingerprints.pop(request_id, None)
         if fut is not None and not fut.done():
             fut.set_exception(exc)
 
@@ -337,6 +353,10 @@ def create_app(config: VerifierConfig | None = None) -> FastAPI:
             raise HTTPException(status_code=422, detail="malformed probe request") from exc
         if parsed.protocol_version != VERIFIER_PROTOCOL_VERSION:
             raise HTTPException(status_code=400, detail="unsupported protocol_version")
+        if not store.bind(parsed.request_id, parsed.fingerprint()):
+            raise HTTPException(
+                status_code=409, detail="request_id already used with different parameters"
+            )
         done = store.get(parsed.request_id)
         if done is not None:
             return done.model_copy(update={"replayed": True})

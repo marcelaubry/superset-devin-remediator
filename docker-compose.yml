@@ -41,6 +41,8 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://remediator:remediator@db:5432/remediator
       PROBE_VERIFIER_URL: http://verifier:8080
+      # Same key the verifier reads from its secret file; the worker gets it via .env.
+      # PROBE_VERIFIER_SHARED_SECRET is the only value shared across the trust boundary.
     command: python -m remediator.worker
     stop_grace_period: 40s
     depends_on:
@@ -51,27 +53,41 @@ services:
     networks: [default, verifier]
     restart: unless-stopped
   # Credential-free probe verifier: the only process that executes repository code.
-  # No env_file, no secrets, dedicated UID, read-only root, bounded tmpfs workspace,
-  # no capabilities, PID and memory limits. Reachable only from the worker over the
-  # `verifier` network; its own egress (git clone over https) should be restricted to the
-  # allowlisted forge by the host firewall / egress proxy in production.
+  # No env_file, no Docker socket, no provider/database credentials, dedicated UID,
+  # read-only root, bounded tmpfs workspace, no capabilities, no-new-privileges, PID,
+  # memory and CPU limits. The probe registry is mounted read-only; the request HMAC key
+  # is the only secret it ever sees (a Compose secret file, not an environment variable).
+  # Reachable only from the worker over the `verifier` network; its own egress (git clone
+  # and dependency installs over https) should be restricted to the allowlisted forge and
+  # package registry by the host firewall / egress proxy in production.
   verifier:
     build:
       context: .
       dockerfile: docker/verifier/Dockerfile
     environment:
       VERIFIER_CLONE_URL_FORMAT: https://github.com/{repository}.git
+      VERIFIER_REPOSITORY_ALLOWLIST: ${VERIFIER_REPOSITORY_ALLOWLIST:-apache/superset}
+      VERIFIER_HMAC_KEY_FILE: /run/secrets/verifier_hmac_key
+      VERIFIER_PROBE_ROOT: /probes
+      VERIFIER_CACHE_ROOT: /tmp/cache
       VERIFIER_MAX_TIMEOUT_SECONDS: "3600"
+      VERIFIER_MAX_CONCURRENT: "1"
       VERIFIER_MAX_PROCESSES: "256"
       VERIFIER_MAX_FILE_SIZE_BYTES: "536870912"
+      VERIFIER_MAX_MEMORY_BYTES: "3221225472"
+    secrets:
+      - verifier_hmac_key
+    volumes:
+      - ./probes:/probes:ro
     user: "65534:65534"
     init: true
     read_only: true
     tmpfs:
-      - /tmp:size=4g,mode=1777,uid=65534,gid=65534
+      - /tmp:size=8g,mode=1777,uid=65534,gid=65534
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
     pids_limit: 512
+    cpus: 2
     mem_limit: 4g
     memswap_limit: 4g
     healthcheck:
@@ -83,6 +99,12 @@ services:
     restart: unless-stopped
 volumes:
   postgres-data:
+
+# Create with e.g. `openssl rand -hex 32 > docker/secrets/verifier_hmac_key` and set the same
+# value as PROBE_VERIFIER_SHARED_SECRET in .env. docker/secrets/ is git-ignored.
+secrets:
+  verifier_hmac_key:
+    file: ./docker/secrets/verifier_hmac_key
 
 networks:
   default: {}

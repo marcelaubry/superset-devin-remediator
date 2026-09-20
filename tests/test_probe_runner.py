@@ -199,6 +199,15 @@ def test_credential_exposure_sees_env_and_files(tmp_path: Path) -> None:
     assert credential_exposure({"PATH": "/bin"}, ()) == []
 
 
+def test_credential_exposure_allows_only_the_verifiers_own_secret_file(tmp_path: Path) -> None:
+    secrets = tmp_path / "run" / "secrets"
+    secrets.mkdir(parents=True)
+    (secrets / "verifier_hmac_key").write_text("k")
+    assert credential_exposure({}, (str(secrets),)) == []
+    (secrets / "github_token").write_text("t")
+    assert credential_exposure({}, (str(secrets),)) == [f"{secrets}/github_token"]
+
+
 async def test_missing_tool_is_infrastructure_failure(tmp_path: Path) -> None:
     _, sha = _git_repo(tmp_path)
     spec = _spec(sha, "exit 0\n")
@@ -274,7 +283,7 @@ async def _register(
         script=script,
         expected_base_exit_code=1,
         expected_head_exit_code=0,
-        tools=("bash",),
+        tools=kwargs.pop("tools", ("bash",)),  # type: ignore[arg-type]
         **kwargs,  # type: ignore[arg-type]
     )
     return await load_approved_probe(tmp_path / REGISTRY, "acme/demo", issue_number)

@@ -21,6 +21,7 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .. import metrics
 from ..approvals import enqueue, is_current_request, open_request_for_case, triage_result_hash
 from ..capacity import (
     CapacityDenied,
@@ -1089,6 +1090,7 @@ class RemediationPipeline:
                 per_scope_limit=1,
             )
             if isinstance(outcome, CapacityDenied):
+                metrics.capacity_denied_total.labels(metrics.mode(), "resource").inc()
                 await mark_waiting(self.session, self.case, outcome)
                 raise CapacityWait(outcome)
         await clear_waiting(self.session, self.case)
@@ -1109,6 +1111,7 @@ class RemediationPipeline:
             self.session, kind=CapacityLeaseKind.PROBE, case_id=self.case.id
         )
         if isinstance(outcome, CapacityDenied):
+            metrics.capacity_denied_total.labels(metrics.mode(), "probe").inc()
             await mark_waiting(self.session, self.case, outcome)
             raise CapacityWait(outcome)
         await clear_waiting(self.session, self.case)
@@ -1174,6 +1177,7 @@ class RemediationPipeline:
         try:
             result: ProbeRunResult = await self.probes.run(spec)
         except VerifierBusyError as exc:
+            metrics.probe_outcomes_total.labels(metrics.mode(), target.value, "busy").inc()
             raise TransientVerificationError(str(exc)) from exc
         finally:
             await self._release_probe_slot()
@@ -1184,6 +1188,9 @@ class RemediationPipeline:
             verdict = ProbeVerdict.MATCHED
         else:
             verdict = ProbeVerdict.MISMATCHED
+        metrics.probe_outcomes_total.labels(
+            metrics.mode(), target.value, verdict.value.lower()
+        ).inc()
         execution = ProbeExecution(
             case_id=self.case.id,
             attempt_id=attempt.id if attempt is not None else None,
@@ -1364,6 +1371,8 @@ class RemediationPipeline:
             )
         )
         case.ci_status = overall
+        if overall in {CI_PASSED, CI_FAILED, CI_TIMED_OUT}:
+            metrics.ci_outcomes_total.labels(metrics.mode(), overall.lower()).inc()
         if overall == CI_PASSED:
             await self._transition(
                 CaseState.CI_PASSED,

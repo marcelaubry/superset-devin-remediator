@@ -1,3 +1,4 @@
+import ipaddress
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
@@ -35,6 +36,33 @@ def unsafe_service_url(url: str) -> str | None:
         return "must not carry a query string or fragment"
     if any(ch.isspace() for ch in url.strip()):
         return "must not contain whitespace"
+    return None
+
+
+_METADATA_HOSTS = frozenset(
+    {"metadata.google.internal", "metadata", "instance-data", "169.254.169.254", "fd00:ec2::254"}
+)
+
+
+def non_public_service_host(url: str) -> str | None:
+    """Why `url` cannot be a *provider* base (GitHub/Devin/Slack) in live mode, or None.
+
+    Provider APIs are public SaaS endpoints; a loopback, private, link-local or cloud
+    metadata host there means either a typo or an SSRF pivot through configuration.
+    """
+    host = (urlsplit(url.strip()).hostname or "").lower().rstrip(".")
+    if not host:
+        return "must include a host"
+    if host in _METADATA_HOSTS or host == "localhost" or host.endswith(".localhost"):
+        return f"host {host!r} is loopback or cloud metadata"
+    if host.endswith((".internal", ".local", ".localdomain")) or "." not in host:
+        return f"host {host!r} is not a public DNS name"
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return None
+    if not address.is_global:
+        return f"host {host!r} is a non-public IP address"
     return None
 
 
@@ -206,7 +234,7 @@ class Settings(BaseSettings):
     @property
     def secret_values(self) -> tuple[str, ...]:
         """Every configured credential, for log redaction and leak tests."""
-        candidates = (
+        candidates: tuple[str, ...] = (
             self.github_webhook_secret,
             self.operator_token,
             self.github_token.get_secret_value() if self.github_token else "",
@@ -219,6 +247,9 @@ class Settings(BaseSettings):
                 else ""
             ),
         )
+        db_password = urlsplit(self.database_url).password or ""
+        if db_password:
+            candidates += (db_password, f"{urlsplit(self.database_url).username}:{db_password}")
         return tuple(value for value in candidates if value and value != PLACEHOLDER_SECRET)
 
     def _require_secret(
@@ -310,12 +341,16 @@ class Settings(BaseSettings):
                 raise ValueError("SLACK_CLIENT_MODE=live requires SLACK_CHANNEL_ID")
             if not self.slack_api_base_url.startswith("https://"):
                 raise ValueError("SLACK_API_BASE_URL must use https in live mode")
+            if problem := non_public_service_host(self.slack_api_base_url):
+                raise ValueError(f"SLACK_API_BASE_URL {problem}")
             if self.slack_fake_fail_posts:
                 raise ValueError("SLACK_FAKE_FAIL_POSTS is a fake-mode-only switch")
         if self.github_live:
             self._require_secret("GITHUB_TOKEN", self.github_token, "GITHUB_CLIENT_MODE")
             if not self.github_api_base_url.startswith("https://"):
                 raise ValueError("GITHUB_API_BASE_URL must use https in live mode")
+            if problem := non_public_service_host(self.github_api_base_url):
+                raise ValueError(f"GITHUB_API_BASE_URL {problem}")
             if self.github_fake_fail_labels:
                 raise ValueError("GITHUB_FAKE_FAIL_LABELS is a fake-mode-only switch")
         if not self.live_mode:
@@ -337,6 +372,8 @@ class Settings(BaseSettings):
             )
         if not self.devin_api_base_url.startswith("https://"):
             raise ValueError("DEVIN_API_BASE_URL must use https in live mode")
+        if problem := non_public_service_host(self.devin_api_base_url):
+            raise ValueError(f"DEVIN_API_BASE_URL {problem}")
         if self.devin_triage_timeout_seconds < MIN_LIVE_TRIAGE_TIMEOUT_SECONDS:
             raise ValueError(
                 "DEVIN_TRIAGE_TIMEOUT_SECONDS must be at least "

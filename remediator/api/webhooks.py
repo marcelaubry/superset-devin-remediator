@@ -9,8 +9,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..config import Settings, get_settings
 from ..db import get_session
 from ..github.signature import verify_signature
+from ..metrics import webhook_requests_total
 from ..models import EventStatus, WebhookEvent
-from .metrics import webhook_requests_total
 
 router = APIRouter()
 

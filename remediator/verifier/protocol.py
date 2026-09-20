@@ -76,6 +76,10 @@ class ProbeRequest(BaseModel):
     timeout_seconds: int = Field(ge=1)
     max_output_bytes: int = Field(ge=1024, le=10_000_000)
 
+    def fingerprint(self) -> str:
+        """Digest of everything that decides what runs; bound to `request_id` for replays."""
+        return hashlib.sha256(self.model_dump_json(exclude={"request_id"}).encode()).hexdigest()
+
 
 class ProbeResponse(BaseModel):
     protocol_version: str = VERIFIER_PROTOCOL_VERSION

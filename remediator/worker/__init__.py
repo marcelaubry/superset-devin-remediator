@@ -12,14 +12,15 @@ from sqlalchemy import exists, select, update
 from sqlalchemy.exc import DBAPIError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .. import metrics
 from ..adapters import build_github_client, build_slack_client
-from ..api.metrics import worker_transient_db_errors_total
 from ..capacity import CapacityManager
 from ..config import Settings
 from ..db import build_engine, build_session_factory
 from ..devin import build_devin_client
 from ..github_refs import build_base_commit_resolver
 from ..lifecycle import CaseState, InvalidTransition
+from ..metrics import worker_transient_db_errors_total
 from ..models import (
     ACTIVE_ATTEMPT_STATUSES,
     Attempt,
@@ -85,6 +86,7 @@ def is_transient_db_error(exc: BaseException) -> bool:
 class Worker:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        metrics.configure(settings.metrics_mode)
         self.engine = build_engine(settings)
         self.session_factory = build_session_factory(self.engine)
         self.devin = build_devin_client(settings)
@@ -313,9 +315,17 @@ class Worker:
         attempt already finished, so waiting cases are admitted on the next claim."""
         try:
             async with self.session_factory() as session:
-                await self.capacity.expire_stale(session)
-                await self.capacity.reconcile_finished(session)
+                expired = await self.capacity.expire_stale(session)
+                finished = await self.capacity.reconcile_finished(session)
                 await session.commit()
+            if expired:
+                metrics.reconciliations_total.labels(
+                    metrics.mode(), "capacity_lease", "expired"
+                ).inc(expired)
+            if finished:
+                metrics.reconciliations_total.labels(
+                    metrics.mode(), "capacity_lease", "finished"
+                ).inc(finished)
         except DBAPIError as exc:
             if not is_transient_db_error(exc):
                 raise

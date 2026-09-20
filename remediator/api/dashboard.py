@@ -36,6 +36,7 @@ from ..models import (
     WebhookEvent,
 )
 from .auth import require_operator
+from .hardening import safe_href
 
 router = APIRouter()
 templates = Jinja2Templates(directory=str(Path(__file__).parents[1] / "templates"))
@@ -194,12 +195,18 @@ def _pr_evidence_json(row: PullRequestEvidence) -> dict[str, Any]:
     }
 
 
+def _safe_check(check: Any) -> Any:
+    if isinstance(check, dict) and "html_url" in check:
+        return {**check, "html_url": safe_href(check.get("html_url"))}
+    return check
+
+
 def _ci_snapshot_json(row: CiSnapshot) -> dict[str, Any]:
     return {
         "id": str(row.id),
         "head_sha": row.head_sha,
         "overall": row.overall,
-        "checks": list(row.checks),
+        "checks": [_safe_check(check) for check in row.checks],
         "required_checks": list(row.required_checks),
         "missing_required": list(row.missing_required),
         "summary": row.summary,
@@ -284,10 +291,19 @@ def remediation_json(case: Case) -> dict[str, Any] | None:
                 "operation_key": attempt.operation_key,
                 "create_state": attempt.create_state,
                 "devin_session_id": attempt.devin_session_id,
-                "devin_session_url": attempt.devin_session_url,
+                "devin_session_url": safe_href(attempt.devin_session_url),
                 "devin_status": attempt.devin_status,
                 "devin_acus_consumed": attempt.devin_acus_consumed,
                 "max_acu_limit": attempt.max_acu_limit,
+                "acu_report_status": attempt.acu_report_status,
+                "acu_reported": attempt.acu_reported,
+                "acu_display": (
+                    f"{attempt.acu_reported:g} ACU"
+                    f"{' (simulated)' if attempt.acu_report_status == 'simulated' else ''}"
+                    if attempt.acu_reported is not None
+                    and attempt.acu_report_status in ("available", "simulated")
+                    else "Unavailable"
+                ),
                 "base_sha": attempt.base_sha,
                 "triage_result_hash": attempt.triage_result_hash,
                 "approval_request_id": (
@@ -296,7 +312,11 @@ def remediation_json(case: Case) -> dict[str, Any] | None:
                 "started_at": _iso(attempt.started_at),
                 "finished_at": _iso(attempt.finished_at),
                 "duration_seconds": int((end - start).total_seconds()) if start else None,
-                "devin_pull_requests": attempt.devin_pull_requests or [],
+                "devin_pull_requests": [
+                    {**pr, "pr_url": safe_href(pr.get("pr_url"))}
+                    for pr in (attempt.devin_pull_requests or [])
+                    if isinstance(pr, dict)
+                ],
                 "structured_output": attempt.structured_output,
                 "pr_url": attempt.pr_url,
                 "pr_number": attempt.pr_number,

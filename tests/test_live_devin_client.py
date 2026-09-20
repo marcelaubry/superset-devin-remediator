@@ -262,3 +262,52 @@ async def test_api_key_never_appears_in_repr_errors_or_logs(
         await client.aclose()
     finally:
         root.removeHandler(handler_obj)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("response", "expected_status", "detail_fragment"),
+    [
+        (lambda: httpx.Response(200, json={"total_acus": 3.25}), "available", None),
+        (lambda: httpx.Response(200, json={"total_acus": 2}), "available", None),
+        (
+            lambda: httpx.Response(403, json={"detail": "forbidden"}),
+            "unavailable",
+            "ViewOrgConsumption",
+        ),
+        (lambda: httpx.Response(401, json={}), "unavailable", "credentials"),
+        (lambda: httpx.Response(404, json={}), "unavailable", "not found"),
+        (lambda: httpx.Response(200, json={"total_acus": "3"}), "unavailable", "total_acus"),
+        (lambda: httpx.Response(200, json={"total_acus": True}), "unavailable", "total_acus"),
+        (lambda: httpx.Response(200, json=[1, 2]), "unavailable", "total_acus"),
+    ],
+)
+async def test_session_consumption_never_estimates_and_maps_failures_to_unavailable(
+    response: Callable[[], httpx.Response], expected_status: str, detail_fragment: str | None
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == f"/v3/organizations/{ORG}/consumption/daily/sessions/devin-1"
+        return response()
+
+    client = _client(handler, max_retries=0)
+    report = await client.session_consumption("devin-1")
+    assert report.status == expected_status
+    if expected_status == "available":
+        assert report.acus is not None and report.acus > 0
+    else:
+        assert report.acus is None
+        assert detail_fragment is not None and detail_fragment in (report.detail or "")
+        assert API_KEY not in (report.detail or "")
+
+
+@pytest.mark.asyncio
+async def test_session_consumption_transport_error_is_unavailable_not_raised() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("boom", request=request)
+
+    client = _client(handler, max_retries=0)
+    report = await client.session_consumption("devin-1")
+    assert report.status == "unavailable"
+    assert report.acus is None
+    assert "transport" in (report.detail or "")

@@ -10,7 +10,7 @@ session is re-read once and then terminated remotely before the case is marked
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any, cast
@@ -18,6 +18,7 @@ from typing import Any, cast
 from sqlalchemy import desc, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .. import metrics
 from ..capacity import CapacityDenied, CapacityManager, clear_waiting, mark_waiting
 from ..config import Settings
 from ..devin.client import (
@@ -73,6 +74,7 @@ from ..models import (
     ProbeSnapshot,
     WebhookEvent,
 )
+from ..safe_urls import safe_href
 
 logger = logging.getLogger(__name__)
 
@@ -267,6 +269,7 @@ class DevinRunner:
             per_scope_limit=per_scope,
         )
         if isinstance(outcome, CapacityDenied):
+            metrics.capacity_denied_total.labels(metrics.mode(), kind.value.lower()).inc()
             await mark_waiting(self.session, self.case, outcome)
             await self.session.commit()
             return outcome
@@ -399,6 +402,10 @@ class DevinRunner:
         if outcome.result is not RunResult.TERMINATION_PENDING and outcome.attempt.id is not None:
             await self._report_consumption(outcome.attempt)
             await self.session.commit()
+        if outcome.result not in {RunResult.TERMINATION_PENDING, RunResult.WAITING_FOR_CAPACITY}:
+            metrics.session_outcomes_total.labels(
+                metrics.mode(), kind.value.lower(), outcome.result.value
+            ).inc()
         await self._settle_capacity(outcome)
         return outcome
 
@@ -659,6 +666,7 @@ class DevinRunner:
         attempt.create_state = state
         attempt.status = AttemptStatus.RUNNING
         attempt.devin_session_id = snapshot.session_id
+        snapshot = replace(snapshot, url=safe_href(snapshot.url) or "")
         attempt.devin_session_url = snapshot.url
         attempt.devin_status = snapshot.status
         attempt.devin_status_detail = snapshot.status_detail

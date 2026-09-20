@@ -6,6 +6,7 @@ from sqlalchemy import desc, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .. import metrics
 from ..adapters import build_github_client
 from ..approvals import (
     confirm_label_webhook,
@@ -37,6 +38,7 @@ from ..models import (
 from ..probes import build_probe_runner
 from ..probes.runner import ProbeRunner
 from ..rubric import IssueSnapshot, evaluate
+from ..safe_urls import safe_href
 from .devin_runner import (
     DevinRunner,
     RunOutcome,
@@ -168,7 +170,11 @@ async def _evaluate_eligibility(session: AsyncSession, case: Case, claimed_by: s
         expected_claimed_by=claimed_by,
     )
     await session.commit()
-    if result.recommendation != Recommendation.ELIGIBLE_FOR_DEVIN_TRIAGE:
+    eligible = result.recommendation == Recommendation.ELIGIBLE_FOR_DEVIN_TRIAGE
+    metrics.eligibility_outcomes_total.labels(
+        metrics.mode(), "eligible" if eligible else "rejected"
+    ).inc()
+    if not eligible:
         await transition(
             session,
             case,
@@ -349,12 +355,13 @@ async def process_event(
             repository=event.repository,
             issue_number=int(issue["number"]),
             issue_title=str(issue.get("title", "")),
-            issue_url=str(issue.get("html_url", "")),
+            issue_url=safe_href(str(issue.get("html_url", ""))) or "",
             state=CaseState.RECEIVED,
         )
         session.add(case)
         try:
             await session.flush()
+            metrics.cases_received_total.labels(metrics.mode()).inc()
         except IntegrityError:
             await session.rollback()
             case = await session.scalar(

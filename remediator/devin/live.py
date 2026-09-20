@@ -19,6 +19,8 @@ from typing import Any
 
 import httpx
 
+from ..metrics import instrument_http_client, retries_total
+from ..metrics import mode as metrics_mode
 from .client import (
     ConsumptionReport,
     CreateSessionRequest,
@@ -144,6 +146,7 @@ class LiveDevinClient:
             timeout=httpx.Timeout(request_timeout_seconds),
             transport=transport,
         )
+        instrument_http_client(self._http, "devin")
         self._redactor = SecretRedactingFilter(api_key)
         for handler in logging.getLogger().handlers:
             handler.addFilter(self._redactor)
@@ -183,6 +186,7 @@ class LiveDevinClient:
                     return response.json()
             if attempt < self._max_retries:
                 delay = self._backoff(attempt) if server_delay is None else server_delay
+                retries_total.labels(metrics_mode(), "provider_backoff").inc()
                 logger.warning(
                     "Devin GET %s failed (%s); retrying in %.2fs", path, last_error, delay
                 )

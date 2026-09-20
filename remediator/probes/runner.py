@@ -90,6 +90,9 @@ CREDENTIAL_ENV_NAMES = frozenset(
 CREDENTIAL_ENV_SUFFIXES = ("_TOKEN", "_SECRET", "_API_KEY", "_PASSWORD", "_PRIVATE_KEY")
 # Files whose presence means the process runs inside a credential-bearing deployment.
 CREDENTIAL_PATHS = ("/run/secrets", "/var/run/docker.sock", ".env")
+# The verifier's own request-authentication key is the one Compose secret it may hold; any
+# other entry under /run/secrets is a provider or database credential and fails the boundary.
+VERIFIER_OWN_SECRET_FILES = frozenset({"verifier_hmac_key"})
 
 
 def credential_exposure(
@@ -103,7 +106,21 @@ def credential_exposure(
         if value
         and (name in CREDENTIAL_ENV_NAMES or name.upper().endswith(CREDENTIAL_ENV_SUFFIXES))
     )
-    found.extend(path for path in paths if Path(path).exists())
+    for path in paths:
+        target = Path(path)
+        if not target.exists():
+            continue
+        if target.is_dir():
+            try:
+                entries = sorted(e.name for e in target.iterdir())
+            except OSError:
+                found.append(path)
+                continue
+            found.extend(
+                f"{path}/{name}" for name in entries if name not in VERIFIER_OWN_SECRET_FILES
+            )
+        else:
+            found.append(path)
     return found
 
 

@@ -259,6 +259,8 @@ async def load_approved_probe(root: Path, repository: str, issue_number: int) ->
     manifest_path = directory / MANIFEST_FILENAME
     if not manifest_path.is_file():
         raise ProbeRegistryError(f"no approved probe registered at {manifest_path}")
+    if directory.resolve() != directory or manifest_path.is_symlink():
+        raise ProbeRegistryError(f"{directory}: probe directory and manifest must not be symlinks")
     try:
         raw = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
     except (OSError, yaml.YAMLError) as exc:
@@ -266,8 +268,12 @@ async def load_approved_probe(root: Path, repository: str, issue_number: int) ->
     manifest = validate_manifest(
         raw, repository=repository, issue_number=issue_number, manifest_path=manifest_path
     )
-    script_path = (directory / manifest["script"]).resolve()
-    if script_path.parent != directory.resolve() or not script_path.is_file():
+    script_path = directory / manifest["script"]
+    if (
+        script_path.is_symlink()
+        or script_path.resolve().parent != directory
+        or not script_path.is_file()
+    ):
         raise ProbeRegistryError(f"{manifest_path}: script {manifest['script']!r} not found")
     try:
         script_bytes = script_path.read_bytes()
