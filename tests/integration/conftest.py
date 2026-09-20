@@ -35,7 +35,8 @@ async def integration_session_factory(
         await connection.execute(
             text(
                 "TRUNCATE notification_outbox, approval_events, slack_actions, "
-                "approval_requests, slack_fake_messages, state_transitions, attempts, "
+                "approval_requests, slack_fake_messages, state_transitions, capacity_leases, "
+                "attempts, "
                 "webhook_events, cases CASCADE"
             )
         )

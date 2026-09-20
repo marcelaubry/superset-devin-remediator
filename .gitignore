@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Verifier HMAC key delivered as a Compose secret file (see docker-compose.yml)
+docker/secrets/*
+!docker/secrets/README.md

@@ -13,6 +13,7 @@ import httpx
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from ..metrics import instrument_http_client
 from ..models import SlackFakeMessage
 
 logger = logging.getLogger(__name__)
@@ -259,6 +260,7 @@ class LiveSlackClient:
             timeout=httpx.Timeout(timeout_seconds),
             transport=transport,
         )
+        instrument_http_client(self._http, "slack")
         # response_url posts are unauthenticated; never send the bot token there.
         self._hooks = httpx.AsyncClient(
             headers={"User-Agent": "superset-devin-remediator/phase3"},
@@ -293,6 +295,27 @@ class LiveSlackClient:
             error = str(payload.get("error", "unknown_error")) if isinstance(payload, dict) else "x"
             raise SlackApiError(method, error, retryable=error not in _NON_RETRYABLE_ERRORS)
         return payload
+
+    async def auth_test(self) -> dict[str, Any]:
+        """auth.test: bot identity and workspace (readiness only, read-only)."""
+        return await self._call("auth.test", {})
+
+    async def channel_info(self, channel: str) -> dict[str, Any]:
+        """conversations.info: channel existence and bot membership (readiness only)."""
+        payload = await self._call("conversations.info", {"channel": channel})
+        info = payload.get("channel")
+        return info if isinstance(info, dict) else {}
+
+    async def user_exists(self, user_id: str) -> bool:
+        """users.info: resolves an approver ID without exposing profile data (readiness only)."""
+        try:
+            payload = await self._call("users.info", {"user": user_id})
+        except SlackApiError as exc:
+            if exc.error == "user_not_found":
+                return False
+            raise
+        user = payload.get("user")
+        return isinstance(user, dict) and not bool(user.get("deleted"))
 
     async def post_message(
         self,

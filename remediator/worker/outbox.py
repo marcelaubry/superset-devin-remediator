@@ -16,7 +16,6 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from ..api.metrics import outbox_deliveries_total
 from ..approvals import (
     enqueue_slack_status_update,
     generate_action_token,
@@ -29,6 +28,7 @@ from ..approvals import (
 from ..config import Settings
 from ..github.client import GitHubApiError, GitHubIssuesClient, IssueNotFound, comment_marker
 from ..lifecycle import CaseState, InvalidTransition, transition
+from ..metrics import outbox_deliveries_total
 from ..models import (
     OUTBOX_KIND_GITHUB_APPLY_LABEL,
     OUTBOX_KIND_GITHUB_NOT_FEASIBLE,

@@ -19,7 +19,10 @@ from typing import Any
 
 import httpx
 
+from ..metrics import instrument_http_client, retries_total
+from ..metrics import mode as metrics_mode
 from .client import (
+    ConsumptionReport,
     CreateSessionRequest,
     DevinApiError,
     DevinSessionNotFound,
@@ -33,6 +36,22 @@ logger = logging.getLogger(__name__)
 RETRYABLE_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
 _LIST_PAGE_SIZE = 200
 _MAX_LIST_PAGES = 5
+MAX_RETRY_AFTER_SECONDS = 60.0
+
+
+def retry_after_seconds(response: httpx.Response) -> float | None:
+    """Honour an integer `Retry-After` header (seconds), capped so a hostile or broken
+    value can never park the worker for hours."""
+    raw = response.headers.get("Retry-After")
+    if raw is None:
+        return None
+    try:
+        seconds = float(raw.strip())
+    except ValueError:
+        return None
+    if seconds < 0:
+        return None
+    return min(seconds, MAX_RETRY_AFTER_SECONDS)
 
 
 class SecretRedactingFilter(logging.Filter):
@@ -127,6 +146,7 @@ class LiveDevinClient:
             timeout=httpx.Timeout(request_timeout_seconds),
             transport=transport,
         )
+        instrument_http_client(self._http, "devin")
         self._redactor = SecretRedactingFilter(api_key)
         for handler in logging.getLogger().handlers:
             handler.addFilter(self._redactor)
@@ -149,7 +169,9 @@ class LiveDevinClient:
 
     async def _get_with_retries(self, path: str, params: dict[str, Any] | None = None) -> Any:
         last_error: Exception | None = None
+        server_delay: float | None = None
         for attempt in range(self._max_retries + 1):
+            server_delay = None
             try:
                 response = await self._http.get(path, params=params)
             except httpx.HTTPError as exc:
@@ -157,12 +179,14 @@ class LiveDevinClient:
             else:
                 if response.status_code in RETRYABLE_STATUS_CODES:
                     last_error = self._api_error(response)
+                    server_delay = retry_after_seconds(response)
                 elif response.status_code >= 400:
                     raise self._api_error(response)
                 else:
                     return response.json()
             if attempt < self._max_retries:
-                delay = self._backoff(attempt)
+                delay = self._backoff(attempt) if server_delay is None else server_delay
+                retries_total.labels(metrics_mode(), "provider_backoff").inc()
                 logger.warning(
                     "Devin GET %s failed (%s); retrying in %.2fs", path, last_error, delay
                 )
@@ -246,6 +270,38 @@ class LiveDevinClient:
             if isinstance(payload, dict) and "session_id" in payload
             else None
         )
+
+    async def session_consumption(self, session_id: str) -> ConsumptionReport:
+        """GET /organizations/{org}/consumption/daily/sessions/{id} (Enterprise plans, service
+        user with `ViewOrgConsumption`). Any failure is reported as `unavailable`; nothing is
+        estimated and nothing propagates to the caller."""
+        path = f"/organizations/{self._org_id}/consumption/daily/sessions/{session_id}"
+        try:
+            payload = await self._get_with_retries(path)
+        except DevinApiError as exc:
+            reason = {
+                401: "credentials rejected",
+                403: "service user lacks ViewOrgConsumption or plan does not include it",
+                404: "consumption endpoint or session not found",
+            }.get(exc.status_code, f"HTTP {exc.status_code}")
+            return ConsumptionReport("unavailable", detail=reason)
+        except DevinTransportError as exc:
+            return ConsumptionReport("unavailable", detail=f"transport: {exc}")
+        total = payload.get("total_acus") if isinstance(payload, dict) else None
+        if isinstance(total, bool) or not isinstance(total, int | float):
+            return ConsumptionReport("unavailable", detail="response carried no total_acus")
+        return ConsumptionReport("available", acus=float(total))
+
+    async def whoami(self) -> dict[str, Any]:
+        """GET /self: service-user identity (readiness only, read-only)."""
+        payload = await self._get_with_retries("/self")
+        return payload if isinstance(payload, dict) else {}
+
+    async def list_sessions_probe(self) -> int:
+        """GET one page of sessions to prove the read permission (readiness only)."""
+        payload = await self._get_with_retries(self._sessions_path(), params={"first": 1})
+        items = payload.get("items", []) if isinstance(payload, dict) else []
+        return len(items) if isinstance(items, list) else 0
 
     async def aclose(self) -> None:
         for handler in logging.getLogger().handlers:

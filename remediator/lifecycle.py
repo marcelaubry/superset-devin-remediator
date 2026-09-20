@@ -365,6 +365,7 @@ async def transition(
     from_state = CaseState(case.state)
     if to_state not in TRANSITIONS[from_state]:
         raise InvalidTransition(f"{from_state} cannot transition to {to_state}")
+    from . import metrics
     from .models import Case, StateTransition
 
     now = datetime.now(UTC)
@@ -392,6 +393,7 @@ async def transition(
     case.state_entered_at = now
     case.completed_at = completed_at
     case.version += 1
+    metrics.observe_transition(case, to_state, actor)
     session.add(
         StateTransition(
             case_id=case.id,

@@ -69,6 +69,10 @@ PHASE4_SCENARIOS: dict[str, int] = {
     "remediate-unlabeled-intake": 4222,  # unlabeled opened issue is evaluated; `bug` label inert
 }
 
+# Phase 5: twenty consecutive fixture issues; none is a pinned fake-Devin scenario.
+PHASE5_FIRST_ISSUE = 5200
+PHASE5_SCENARIOS: dict[str, int] = {"concurrency-20": PHASE5_FIRST_ISSUE}
+
 REMEDIATION_RESTING_STATES = {
     "REMEDIATION_HUMAN_BLOCKED",
     "PROBE_INFRASTRUCTURE_BLOCKED",
@@ -875,12 +879,113 @@ class Simulator:
         except (SimulationError, httpx.HTTPError) as exc:
             self.check(False, f"{scenario}: {exc}")
 
+    # ---- Phase 5 -------------------------------------------------------------------------
+
+    def metric(self, name: str, *, worker: bool = False, **labels: str) -> float | None:
+        if worker:
+            response = httpx.get(
+                _environment("WORKER_METRICS_URL", "http://localhost:8001") + "/metrics",
+                headers=self.operator,
+                timeout=10,
+            )
+        else:
+            response = self.client.get("/metrics", headers=self.operator)
+        response.raise_for_status()
+        for line in response.text.splitlines():
+            if not line.startswith(name + "{"):
+                continue
+            raw, value = line.rsplit(" ", 1)
+            pairs = dict(part.split("=", 1) for part in raw[len(name) + 1 : -1].split(",") if part)
+            if all(pairs.get(k) == f'"{v}"' for k, v in labels.items()):
+                return float(value)
+        return None
+
+    def run_concurrency_20(self) -> None:
+        """Twenty eligible issues at once. The worker may only hold MAX_CONCURRENT_TRIAGE
+        triage leases at any time (default 2); everything else parks (waiting_for set)
+        without a Devin session, and all twenty eventually settle."""
+        limit_metric = self.metric("capacity_limit", kind="triage")
+        self.check(limit_metric is not None, "metrics endpoint exposes capacity_limit{triage}")
+        limit = int(limit_metric or 0)
+        mode = _environment("METRICS_MODE", "simulated")
+        numbers = list(range(PHASE5_FIRST_ISSUE, PHASE5_FIRST_ISSUE + 20))
+        repository = "apache/superset"
+        fresh = 0
+        for number in numbers:
+            if self.case(repository, number) is None:
+                response = self.github_post(self.phase4_payload(number))
+                self.check(response.json().get("accepted") is True, f"issue #{number} accepted")
+                fresh += 1
+        peak = 0
+        waited_peak = 0
+        deadline = time.monotonic() + 600
+        settled: set[int] = set()
+        while time.monotonic() < deadline and len(settled) < len(numbers):
+            active = self.metric("active_jobs", mode=mode, kind="triage") or 0
+            waiting = self.metric("cases_waiting_for_capacity", mode=mode) or 0
+            peak = max(peak, int(active))
+            waited_peak = max(waited_peak, int(waiting))
+            for number in numbers:
+                case = self.case(repository, number)
+                if (
+                    case
+                    and case["state"] not in {"RECEIVED", "TRIAGE_CREATE_INTENT", "TRIAGING"}
+                    and not case.get("waiting_for")
+                ):
+                    settled.add(number)
+            time.sleep(0.5)
+        print(f"  limit={limit} peak_active_triage={peak} peak_waiting={waited_peak}")
+        self.check(len(settled) == len(numbers), "all twenty cases left the triage queue")
+        self.check(peak <= limit, f"active triage jobs never exceeded the limit ({peak}<={limit})")
+        loops = int(_environment("WORKER_CONCURRENCY", "2"))
+        contended = loops > limit and fresh > limit
+        if contended:
+            self.check(waited_peak > 0, "the surplus cases were parked waiting for capacity")
+        elif fresh <= limit:
+            print(
+                f"  note: only {fresh} of the twenty issues were new (the rest settled in an "
+                "earlier run against this database); the limit was never contended, so parking "
+                "cannot be observed here (reset the database to re-exercise it)"
+            )
+        else:
+            print(
+                f"  note: WORKER_CONCURRENCY={loops} <= MAX_CONCURRENT_TRIAGE={limit}; the limit "
+                "was never contended, so parking cannot be observed here (set "
+                "WORKER_CONCURRENCY above the limit to exercise it)"
+            )
+        sessions = 0
+        for number in numbers:
+            case = self.case(repository, number) or {}
+            triage = [a for a in case.get("attempts") or [] if a.get("kind") == "TRIAGE"]
+            sessions += len(triage)
+            self.check(len(triage) <= 1, f"issue #{number} created at most one triage session")
+        denied = self.metric("capacity_denied_total", worker=True, mode=mode, kind="triage") or 0
+        print(f"  triage sessions={sessions} capacity_denied_total={denied:.0f}")
+        if contended:
+            self.check(denied > 0, "worker /metrics counted the capacity denials")
+
+    def run_phase5(self, scenario: str) -> None:
+        print(f"== phase5 {scenario}")
+        try:
+            getattr(self, "run_" + scenario.replace("-", "_"))()
+        except (SimulationError, httpx.HTTPError) as exc:
+            self.check(False, f"{scenario}: {exc}")
+
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--scenario",
-        choices=[*SCENARIOS, *PHASE3_SCENARIOS, *PHASE4_SCENARIOS, "all", "phase3", "phase4"],
+        choices=[
+            *SCENARIOS,
+            *PHASE3_SCENARIOS,
+            *PHASE4_SCENARIOS,
+            *PHASE5_SCENARIOS,
+            "all",
+            "phase3",
+            "phase4",
+            "phase5",
+        ],
         default="all",
     )
     parser.add_argument("--delivery-id", default=None, help="(ignored; kept for compatibility)")
@@ -892,16 +997,22 @@ def main() -> None:
     ingest: list[str] = []
     phase3: list[str] = []
     phase4: list[str] = []
+    phase5: list[str] = []
     if args.scenario == "all":
         ingest, phase3, phase4 = list(SCENARIOS), list(PHASE3_SCENARIOS), list(PHASE4_SCENARIOS)
+        phase5 = list(PHASE5_SCENARIOS)
     elif args.scenario == "phase3":
         phase3 = list(PHASE3_SCENARIOS)
     elif args.scenario == "phase4":
         phase4 = list(PHASE4_SCENARIOS)
+    elif args.scenario == "phase5":
+        phase5 = list(PHASE5_SCENARIOS)
     elif args.scenario in SCENARIOS:
         ingest = [args.scenario]
     elif args.scenario in PHASE3_SCENARIOS:
         phase3 = [args.scenario]
+    elif args.scenario in PHASE5_SCENARIOS:
+        phase5 = [args.scenario]
     else:
         phase4 = [args.scenario]
     with httpx.Client(base_url=base_url, timeout=10) as client:
@@ -914,11 +1025,13 @@ def main() -> None:
             simulator.run_phase3(scenario)
         for scenario in phase4:
             simulator.run_phase4(scenario)
+        for scenario in phase5:
+            simulator.run_phase5(scenario)
         if simulator.failures:
             print(f"{len(simulator.failures)} check(s) failed:", *simulator.failures, sep="\n  ")
             sys.exit(1)
-        if phase3 or phase4:
-            print("all phase 3/4 checks passed")
+        if phase3 or phase4 or phase5:
+            print("all phase 3/4/5 checks passed")
 
 
 if __name__ == "__main__":

@@ -70,7 +70,7 @@ async def test_worker_loop_survives_failed_job(
     calls = 0
 
     async def fake_process_event(
-        session, event, devin, settings, claimed_by=None, resolver=None
+        session, event, devin, settings, claimed_by=None, resolver=None, capacity=None
     ) -> None:
         nonlocal calls
         calls += 1
@@ -297,7 +297,7 @@ async def test_deadlock_releases_the_job_for_retry_instead_of_failing_the_case(
     calls = 0
 
     async def flaky_process_event(
-        session, event, devin, settings, claimed_by=None, resolver=None
+        session, event, devin, settings, claimed_by=None, resolver=None, capacity=None
     ) -> None:
         nonlocal calls
         calls += 1
@@ -401,3 +401,52 @@ def test_remediation_operation_key_keeps_full_hashes() -> None:
     assert len(key) <= 255
     with pytest.raises(ValueError):
         remediation_operation_key("case", "a" * 12, "b" * 40, 1)
+
+
+@pytest.mark.asyncio
+async def test_sibling_loops_in_one_process_cannot_release_each_others_case_lease(
+    integration_session_factory: async_sessionmaker[AsyncSession],
+    test_database_url: str,
+) -> None:
+    """Loops share a process id but must not share a claim identity: after loop 0 claims a
+    case, loop 1 releasing "its" claim (e.g. after a webhook for the same case) must be a
+    no-op, otherwise a third loop re-claims the case and two loops run it concurrently."""
+    async with integration_session_factory() as session:
+        case = Case(
+            repository="apache/superset",
+            issue_number=4999,
+            issue_title="Fix issue",
+            issue_url="https://github.com/apache/superset/issues/4999",
+            state=CaseState.RECEIVED,
+        )
+        session.add(case)
+        await session.commit()
+        case_id = case.id
+
+    worker = Worker(Settings(database_url=test_database_url, worker_concurrency=2))
+    try:
+        worker_module._loop_slot.set(0)
+        claimed = await worker._claim_case()
+        assert claimed is not None and claimed.id == case_id
+        assert claimed.claimed_by == f"{worker.worker_id}/0"
+
+        worker_module._loop_slot.set(1)
+        assert worker.claim_id == f"{worker.worker_id}/1"
+        await worker._release_case(case_id)
+        assert await worker._claim_case() is None, "sibling loop released or re-claimed the case"
+        await worker._heartbeat(case_id)
+
+        async with integration_session_factory() as session:
+            fresh = await session.get(Case, case_id)
+            assert fresh is not None
+            assert fresh.claimed_by == f"{worker.worker_id}/0"
+            assert fresh.lease_expires_at is not None
+
+        worker_module._loop_slot.set(0)
+        await worker._release_case(case_id)
+        async with integration_session_factory() as session:
+            fresh = await session.get(Case, case_id)
+            assert fresh is not None and fresh.claimed_by is None
+    finally:
+        worker_module._loop_slot.set(None)
+        await worker.engine.dispose()

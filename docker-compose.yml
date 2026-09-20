@@ -41,7 +41,11 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://remediator:remediator@db:5432/remediator
       PROBE_VERIFIER_URL: http://verifier:8080
+      # Same key the verifier reads from its secret file; the worker gets it via .env.
+      # PROBE_VERIFIER_SHARED_SECRET is the only value shared across the trust boundary.
     command: python -m remediator.worker
+    ports:
+      - "8001:8001"  # worker-process metrics (operator token), see docs/metrics.md
     stop_grace_period: 40s
     depends_on:
       migrate:
@@ -50,40 +54,143 @@ services:
         condition: service_healthy
     networks: [default, verifier]
     restart: unless-stopped
-  # Credential-free probe verifier: the only process that executes repository code.
-  # No env_file, no secrets, dedicated UID, read-only root, bounded tmpfs workspace,
-  # no capabilities, PID and memory limits. Reachable only from the worker over the
-  # `verifier` network; its own egress (git clone over https) should be restricted to the
-  # allowlisted forge by the host firewall / egress proxy in production.
+  # Verifier front (controller). Holds the request HMAC key (Compose secret file, never an
+  # environment variable), authenticates the worker, binds requests to the read-only probe
+  # registry and forwards only the bound identities to the runner over `verifier-internal`.
+  # It never executes repository code. No env_file, no Docker socket, no provider/database
+  # credentials; dedicated UID 65533, read-only root, no capabilities, no-new-privileges.
   verifier:
     build:
       context: .
       dockerfile: docker/verifier/Dockerfile
+    command: python -m remediator.verifier
     environment:
-      VERIFIER_CLONE_URL_FORMAT: https://github.com/{repository}.git
+      VERIFIER_EXECUTION: runner
+      VERIFIER_RUNNER_URL: http://verifier-runner:8081
+      VERIFIER_HMAC_KEY_FILE: /run/secrets/verifier_hmac_key
+      VERIFIER_PROBE_ROOT: /probes
+      VERIFIER_REPOSITORY_ALLOWLIST: ${VERIFIER_REPOSITORY_ALLOWLIST:-apache/superset}
       VERIFIER_MAX_TIMEOUT_SECONDS: "3600"
-      VERIFIER_MAX_PROCESSES: "256"
-      VERIFIER_MAX_FILE_SIZE_BYTES: "536870912"
-    user: "65534:65534"
+      VERIFIER_EGRESS_CHECK: "off"  # the front has no egress route to check; the runner does
+    secrets:
+      - verifier_hmac_key
+    volumes:
+      - ./probes:/probes:ro
+    user: "65533:65533"
     init: true
     read_only: true
     tmpfs:
-      - /tmp:size=4g,mode=1777,uid=65534,gid=65534
+      - /tmp:size=64m,mode=1777,uid=65533,gid=65533
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
-    pids_limit: 512
-    mem_limit: 4g
-    memswap_limit: 4g
+    pids_limit: 64
+    cpus: 0.5
+    mem_limit: 256m
+    memswap_limit: 256m
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3).status == 200 else 1)"]
       interval: 10s
       timeout: 5s
       retries: 6
-    networks: [verifier]
+    depends_on:
+      verifier-runner:
+        condition: service_healthy
+    networks: [verifier, verifier-internal]
+    restart: unless-stopped
+  # Probe runner (executor): the only process that executes repository code. It has NO
+  # secret at all — not even the verifier HMAC key — so nothing a probe can read, dump or
+  # exfiltrate lets it forge or replay verifier requests. Same image, different entrypoint,
+  # different UID, separate container/PID namespace. Read-only root, disk-backed workspace
+  # volume wiped after every run, tmpfs HOME/caches, no capabilities, no-new-privileges,
+  # PID/memory/CPU limits. Its only network is `verifier-internal` (internal: true, no
+  # gateway): git clone and npm/yarn installs can leave only through egress-proxy, which
+  # admits CONNECT to an exact host allowlist on :443. /health reports whether a direct
+  # public connection is still possible; the worker and readiness fail closed if it is.
+  verifier-runner:
+    build:
+      context: .
+      dockerfile: docker/verifier/Dockerfile
+    command: python -m remediator.verifier.executor
+    environment:
+      VERIFIER_PORT: "8081"  # the image default (8080) is the front's port
+      VERIFIER_CLONE_URL_FORMAT: https://github.com/{repository}.git
+      VERIFIER_REPOSITORY_ALLOWLIST: ${VERIFIER_REPOSITORY_ALLOWLIST:-apache/superset}
+      VERIFIER_PROBE_ROOT: /probes
+      VERIFIER_WORKSPACE_ROOT: /workspace
+      VERIFIER_CACHE_ROOT: /workspace/cache
+      VERIFIER_EGRESS_PROXY_URL: http://egress-proxy:3128
+      VERIFIER_EGRESS_CHECK: "on"
+      VERIFIER_MAX_TIMEOUT_SECONDS: "3600"
+      VERIFIER_MAX_CONCURRENT: "1"  # the executor refuses anything else (UID-wide cleanup)
+      VERIFIER_MAX_PROCESSES: "512"
+      VERIFIER_MAX_FILE_SIZE_BYTES: "1073741824"
+      VERIFIER_MAX_MEMORY_BYTES: "6442450944"
+    volumes:
+      - ./probes:/probes:ro
+      - verifier-workspace:/workspace
+    user: "65534:65534"
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=1g,mode=1777,uid=65534,gid=65534
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 1024
+    cpus: 4
+    mem_limit: 8g
+    memswap_limit: 8g
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8081/health', timeout=3).status == 200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    depends_on:
+      egress-proxy:
+        condition: service_started
+    networks: [verifier-internal]
+    restart: unless-stopped
+  # Egress allowlist proxy for the runner (remediator.verifier.egress_proxy): CONNECT-only,
+  # exact hostnames on :443, denies logged. Bridges `verifier-internal` to the default
+  # network. Credential-free, same hardened image.
+  egress-proxy:
+    build:
+      context: .
+      dockerfile: docker/verifier/Dockerfile
+    command: python -m remediator.verifier.egress_proxy
+    environment:
+      EGRESS_PROXY_PORT: "3128"
+      EGRESS_ALLOWED_HOSTS: ${EGRESS_ALLOWED_HOSTS:-github.com,codeload.github.com,objects.githubusercontent.com,registry.npmjs.org,registry.yarnpkg.com,cdn.sheetjs.com}
+    user: "65532:65532"
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777,uid=65532,gid=65532
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 32
+    cpus: 1
+    mem_limit: 256m
+    memswap_limit: 256m
+    networks: [egress, verifier-internal]
     restart: unless-stopped
 volumes:
   postgres-data:
+  verifier-workspace:
+
+# Create with e.g. `openssl rand -hex 32 > docker/secrets/verifier_hmac_key` and set the same
+# value as PROBE_VERIFIER_SHARED_SECRET in .env. docker/secrets/ is git-ignored.
+secrets:
+  verifier_hmac_key:
+    file: ./docker/secrets/verifier_hmac_key
 
 networks:
   default: {}
-  verifier: {}
+  # worker <-> verifier front only; internal, the front needs no route anywhere else
+  verifier:
+    internal: true
+  # egress-proxy's way out; nothing else is attached to it
+  egress: {}
+  # front <-> runner <-> egress-proxy; `internal` means no gateway, so the runner has no
+  # route to the host, the database, the API/worker or the public internet.
+  verifier-internal:
+    internal: true

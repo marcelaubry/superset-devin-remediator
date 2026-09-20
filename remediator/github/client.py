@@ -16,6 +16,7 @@ from typing import Any, Protocol
 import httpx
 
 from ..fixtures import RemediationFixture, fake_head_sha, fake_pr_number, remediation_fixture
+from ..metrics import instrument_http_client
 
 logger = logging.getLogger(__name__)
 
@@ -460,6 +461,7 @@ class LiveGitHubClient:
             timeout=httpx.Timeout(timeout_seconds),
             transport=transport,
         )
+        instrument_http_client(self._http, "github")
 
     def __repr__(self) -> str:
         return f"LiveGitHubClient(repositories={sorted(self._allowed)!r})"
@@ -552,6 +554,23 @@ class LiveGitHubClient:
             if len(payload) < 100:
                 break
         return None
+
+    async def repository_metadata(self, repository: str) -> dict[str, Any]:
+        """GET /repos/{repo}: identity, default branch and token permissions (readiness only)."""
+        repo = _check_allowed(self._allowed, repository)
+        payload = await self._request("GET", f"/repos/{repo}")
+        return payload if isinstance(payload, dict) else {}
+
+    async def label_exists(self, repository: str, label: str) -> bool:
+        """GET /repos/{repo}/labels/{name} (readiness only, read-only)."""
+        repo = _check_allowed(self._allowed, repository)
+        try:
+            await self._request("GET", f"/repos/{repo}/labels/{label}")
+        except GitHubApiError as exc:
+            if exc.status_code == 404:
+                return False
+            raise
+        return True
 
     async def create_comment(self, repository: str, issue_number: int, body: str) -> int:
         repo = _check_allowed(self._allowed, repository)
