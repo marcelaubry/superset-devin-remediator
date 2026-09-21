@@ -28,15 +28,17 @@ request is left open for human review and is never merged automatically.
    and is only trusted once GitHub confirms it through a second signed webhook,
    so a click in Slack alone cannot start paid work. A rejection is recorded,
    commented on the issue, and ends the case.
-6. A bounded Devin remediation session runs and produces a pull request. Where a
-   reproduction probe is registered, it is executed at the base commit first, so
-   there is evidence the bug was real before the fix is attempted.
+6. A bounded Devin remediation session runs and produces a pull request. Under
+   the default `PROBE_POLICY=required`, an approved immutable acceptance probe
+   must first reproduce the defect at the pinned base commit, so there is
+   evidence the bug was real before any fix is attempted; without such a probe
+   the case is blocked rather than remediated.
 7. The service then validates the result rather than trusting the session: the
    pull request must be in the expected repository, authored by the configured
    service user, based on the recorded base SHA, linked to the originating
    issue, and limited to plausible files. The head SHA is corroborated against
-   GitHub, the probe is re-run at that head, and CI is read for that exact head
-   SHA — not for the branch, which can move.
+   GitHub, the probe is re-run unchanged at that head, and CI is read for that
+   exact head SHA — not for the branch, which can move.
 8. The case ends at **Ready for human review**. Nothing is merged, closed, or
    force-pushed by the service. Failures stop in a state that says what failed
    and what the operator can retry, visible on the dashboard.
@@ -68,9 +70,10 @@ builds the images, applies the migrations, and waits for the API to be healthy.
 signed GitHub webhooks, signed Slack interactions, operator routes — from inside
 the API image, and asserts each outcome. It creates representative cases: an
 issue rejected by the context check, a triage session parked for approval, a
-triage session blocked on a question, an approval and a rejection, a successful
-remediation that reaches CI and stops at ready-for-human-review, and a
-remediation whose probe fails at head.
+triage session blocked on a question, a Slack rejection, an approval whose case
+then blocks because no acceptance probe is registered (`PROBE_POLICY=required`),
+a successful remediation that reaches CI and stops at ready-for-human-review,
+and a remediation whose probe fails at head.
 
 The dashboard is at <http://localhost:8000>; sign in with the operator token:
 
@@ -100,11 +103,16 @@ callback URL for both webhooks, and a remote isolated verifier for probe
 execution. The step-by-step procedure, including the readiness check, is in
 [docs/canary-runbook.md](docs/canary-runbook.md).
 
-The explicit override that allows remediation when no reproduction probe is
-registered (`LIVE_CANARY_ALLOW_MISSING_PROBE`) is off by default. When it is
-enabled, the case is remediated without independent behavioral verification —
-only the PR and CI checks apply — and the dashboard and PR evidence record that
-no probe ran.
+`PROBE_POLICY` decides what happens when an issue has no registered acceptance
+probe:
+
+- `required` (default) — remediation is blocked until an approved probe
+  reproduces the defect at the pinned base commit and passes unchanged at head.
+- `if_available` — for demonstrations without probes. An already-approved,
+  label-confirmed case goes straight to the bounded session; every other gate is
+  unchanged, but the case has no behavioral verification — only the PR structure
+  and exact-head CI are validated — and it is recorded and displayed as
+  `probe_status=not_configured` rather than as a verified fix.
 
 ## Development with uv
 
