@@ -1,200 +1,212 @@
 # Superset Devin Remediator
 
-A Dockerized service that turns GitHub issues on an allowlisted repository into
-reviewed pull requests, with a human in the loop.
+An event-driven service that receives GitHub issues from an allowlisted
+repository, runs a bounded Devin triage session, asks a human for approval in
+Slack, starts a bounded Devin remediation session, validates the pull request
+and the CI run for the exact commit it verified, and then stops: the pull
+request is left open for human review and is never merged automatically.
 
-For each incoming issue it checks **contextual completeness** deterministically
-(zero ACUs, no session is created for an under-specified issue), runs a
-**bounded Devin triage** session, asks for **Slack approval**, runs a **bounded
-Devin remediation** session only after a human approves, then **validates the
-resulting PR and the CI run for the exact head SHA** it verified. It never
-merges, closes or force-pushes anything: the final step is always human review.
+## How it works
 
-## Workflow
+1. A signed GitHub `issues/opened` webhook starts the workflow. The signature is
+   verified, the repository must be allowlisted, and the delivery is recorded so
+   a replay cannot start the work twice.
+2. A deterministic context check runs first. It reads the issue text and asks
+   whether there is a concrete problem, an expected outcome, and enough of a
+   reproduction or code-path signal to start investigating. An issue that fails
+   is rejected with the missing items spelled out, before any session exists, so
+   an incomplete issue consumes zero ACUs.
+3. A bounded Devin session performs repository-aware triage under an ACU budget,
+   a timeout, and a per-repository concurrency lease. The session is created
+   with an idempotency key, so a retried webhook reuses the existing session
+   instead of paying for a second one.
+4. A schema-valid triage result creates a Slack approval request. Invalid or
+   unparseable output fails the case instead of guessing. The Slack message
+   carries the triage summary, the evidence links, and approve/reject buttons
+   bound to an opaque token.
+5. Approval applies the `devin:remediate` label. The label is the actual trigger
+   and is only trusted once GitHub confirms it through a second signed webhook,
+   so a click in Slack alone cannot start paid work. A rejection is recorded,
+   commented on the issue, and ends the case.
+6. A bounded Devin remediation session runs and produces a pull request. Where a
+   reproduction probe is registered, it is executed at the base commit first, so
+   there is evidence the bug was real before the fix is attempted.
+7. The service then validates the result rather than trusting the session: the
+   pull request must be in the expected repository, authored by the configured
+   service user, based on the recorded base SHA, linked to the originating
+   issue, and limited to plausible files. The head SHA is corroborated against
+   GitHub, the probe is re-run at that head, and CI is read for that exact head
+   SHA — not for the branch, which can move.
+8. The case ends at **Ready for human review**. Nothing is merged, closed, or
+   force-pushed by the service. Failures stop in a state that says what failed
+   and what the operator can retry, visible on the dashboard.
 
-```text
-GitHub issue
-  → context eligibility   (deterministic, zero ACUs)
-  → Devin triage          (bounded session, structured result)
-  → Slack approval        (signed interactive message, human decision)
-  → Devin remediation     (bounded session, only after approval)
-  → PR validation         (PR exists, belongs to the issue, head SHA corroborated)
-  → CI                    (checks for that exact head SHA)
-  → human review          (nothing merges automatically)
-```
+## Quick start
 
-## Quick start with Docker
+### A. Run the Docker simulation
 
-You need only **Docker** (with Compose v2) and **Git**. No host Python, uv,
-Node, PostgreSQL, cloudflared, or Slack/GitHub/Devin credentials are required:
-the default configuration uses fake Devin, GitHub, Slack and probe adapters and
-contacts no external service.
+Docker (with Compose v2) is the only substantial prerequisite. No GitHub, Slack
+or Devin credentials are needed, and no ACUs are consumed: the stack runs with
+fake GitHub, Slack, Devin and probe adapters that contact no external service.
 
 ```bash
 git clone https://github.com/marcelaubry/superset-devin-remediator.git
 cd superset-devin-remediator
 
-cp .env.example .env      # fake mode defaults
-./scripts/demo.sh up      # generate local secrets, build, migrate, start
-./scripts/demo.sh run     # drive the representative scenarios
+cp .env.example .env
+./scripts/demo.sh up
+./scripts/demo.sh run
 ```
 
-`./scripts/demo.sh up` is idempotent and safe to re-run. It:
+`./scripts/demo.sh up` is idempotent. It creates `.env` from `.env.example` if
+it is missing, replaces the remaining `change-me` placeholders with locally
+generated random values without touching anything you have already set, writes
+the git-ignored `docker/secrets/verifier_hmac_key` only if it does not exist,
+builds the images, applies the migrations, and waits for the API to be healthy.
 
-- creates `.env` from `.env.example` if missing (`cp` above is optional);
-- replaces the `change-me` placeholders for `GITHUB_WEBHOOK_SECRET`,
-  `OPERATOR_TOKEN` and `SLACK_SIGNING_SECRET` with locally generated random
-  values, and never overwrites a value you already set;
-- creates the git-ignored `docker/secrets/verifier_hmac_key` if it does not
-  already exist;
-- runs `docker compose up --build -d` (Postgres, Alembic migrations, API,
-  worker, credential-free verifier, isolated verifier runner, egress proxy) and
-  waits for the API to become healthy.
+`./scripts/demo.sh run` drives the workflow through the real HTTP surface —
+signed GitHub webhooks, signed Slack interactions, operator routes — from inside
+the API image, and asserts each outcome. It creates representative cases: an
+issue rejected by the context check, a triage session parked for approval, a
+triage session blocked on a question, an approval and a rejection, a successful
+remediation that reaches CI and stops at ready-for-human-review, and a
+remediation whose probe fails at head.
 
-Then open the dashboard and sign in with the operator token:
+The dashboard is at <http://localhost:8000>; sign in with the operator token:
 
 ```bash
-open http://localhost:8000        # or just browse to it
-./scripts/demo.sh token           # prints OPERATOR_TOKEN
+./scripts/demo.sh token
 ```
 
-Stop the stack (local data kept):
+Stop the demo, keeping the local data:
 
 ```bash
 ./scripts/demo.sh down
 ```
 
-If you prefer the raw commands, `scripts/demo.sh` is a short shell script; the
-equivalent is:
-
-```bash
-cp -n .env.example .env
-openssl rand -hex 32 > docker/secrets/verifier_hmac_key
-docker compose up --build -d
-```
-
-## Simulate the workflow
-
-One Docker-only command (it runs inside the API image, so nothing is installed
-on the host):
-
-```bash
-./scripts/demo.sh run
-```
-
-It drives the real HTTP endpoints — signed GitHub webhooks, signed Slack
-interactions, operator routes — and asserts the outcome of each case. Expected
-result: the command prints `all phase 3/4/5 checks passed`, and
-<http://localhost:8000> shows cases covering
-
-| Case | Dashboard state |
-| --- | --- |
-| Under-specified issue rejected before any session | `POLICY_REJECTED` |
-| Devin triage completed, waiting on a human | `AWAITING_REMEDIATION_APPROVAL` |
-| Triage session blocked on a question | `HUMAN_BLOCKED` |
-| Slack approval, label confirmed by webhook | `REMEDIATION_APPROVED` |
-| Slack rejection recorded, no label, no session | `REMEDIATION_REJECTED` |
-| Remediation with PR, head probe and CI verified | `CI_PASSED` (ready for human review) |
-| Remediation whose head probe fails verification | `REMEDIATION_FAILED` |
-
-The simulation uses the built-in `apache/superset` fixtures; you do **not** need
-to change `GITHUB_REPOSITORY` between the fork and `apache/superset`.
-`scripts/simulate.py` also has finer-grained scenarios — see
-[docs/simulation.md](docs/simulation.md).
-
-Optional reset — **this deletes the local demo database and verifier workspace
-volumes**:
+Optionally delete the local demo database and verifier workspace volumes. This
+is destructive:
 
 ```bash
 ./scripts/demo.sh reset
 ```
 
-## Live canary
+### B. Run live
 
-Running against a real repository additionally requires: Devin service-user
-credentials, a fine-grained GitHub token plus a webhook on the target
-repository, a Slack app (bot token and signing secret), a public HTTPS callback
-URL for the GitHub and Slack webhooks, and an isolated verifier host for probe
-execution. Step-by-step instructions are in
+A live run against a real repository needs a Devin service-user API key and
+organization ID, a fine-grained GitHub token plus a webhook on the target
+repository, a Slack bot token with an interactivity endpoint, a public HTTPS
+callback URL for both webhooks, and a remote isolated verifier for probe
+execution. The step-by-step procedure, including the readiness check, is in
 [docs/canary-runbook.md](docs/canary-runbook.md).
 
-In live mode the guarantees are unchanged: a human must approve in Slack before
-any paid remediation session starts, the PR and the CI run for the exact
-verified head SHA are still validated, and nothing is merged automatically. The
-explicit option that allows remediation without a reproduction probe
-(`LIVE_CANARY_ALLOW_MISSING_PROBE`) is **off by default**; when enabled, the
-case is remediated without independent behavioral verification and the
-dashboard/PR evidence says so.
+The explicit override that allows remediation when no reproduction probe is
+registered (`LIVE_CANARY_ALLOW_MISSING_PROBE`) is off by default. When it is
+enabled, the case is remediated without independent behavioral verification —
+only the PR and CI checks apply — and the dashboard and PR evidence record that
+no probe ran.
+
+## Development with uv
+
+```bash
+uv sync --frozen
+docker compose up -d db
+make test
+```
+
+Formatting, linting and typing:
+
+```bash
+make fmt lint typecheck
+```
+
+None of this is needed for the Docker demo above.
+
+## Architecture decisions
+
+**Event-driven webhooks over repository polling.** The service reacts to signed
+GitHub deliveries instead of scanning the repository on a timer, so work starts
+immediately and costs nothing while the repository is quiet. The trade-off is
+that the webhook path must be publicly reachable and every delivery has to be
+signature-verified and de-duplicated, which is where a fair amount of the
+handling logic lives.
+
+**PostgreSQL for durability and idempotency.** Every case, attempt, approval,
+transition and outgoing message is a row, and operation keys make session
+creation and side effects exactly-once across restarts and retries. A database
+is heavier than an in-memory queue, but the thing being protected is paid,
+externally visible work: a crash mid-remediation must not create a second Devin
+session or post a second Slack approval.
+
+**Separate API and worker processes.** The API answers webhooks and dashboard
+requests in milliseconds and commits the intent; a worker claims cases and runs
+the slow lifecycle — sessions, probes, PR validation, CI polling — with its own
+concurrency leases. This keeps a stalled Devin session from blocking webhook
+delivery, at the cost of an asynchronous model where the dashboard shows work in
+progress rather than a synchronous result.
+
+**Human Slack approval before remediation.** Triage is cheap and automatic;
+remediation is not, so it is gated on a person clicking approve, and the
+approval is only honored once GitHub confirms the resulting label through a
+signed webhook. This deliberately adds latency and a human dependency, and it is
+what keeps a misjudged triage from spending ACUs and opening pull requests
+unsupervised.
+
+**Credential-free isolated verifier and independent verification.** Reproduction
+probes clone and execute untrusted repository code, so they run in a separate
+service that holds no GitHub, Slack or Devin credentials, behind an exact-host
+egress allowlist, with the same probe executed at base and at head. The service
+then re-derives the outcome from GitHub — PR metadata, head SHA, CI for that SHA
+— rather than believing the session's own report. It is more moving parts than
+running probes in the worker, and it means a compromised probe gains nothing
+worth stealing.
 
 ## Superset fork and results
 
-Target repository: <https://github.com/marcelaubry/superset> (fork of
-[apache/superset](https://github.com/apache/superset)).
+Target repository: <https://github.com/marcelaubry/superset>, a fork of
+[apache/superset](https://github.com/apache/superset).
 
 | Issue | Outcome | PR |
 | --- | --- | --- |
-| [#2 bump js-yaml override to clear GHSA-2883-xcg3-v3hh](https://github.com/marcelaubry/superset/issues/2) | Not remediated (open, no PR) | — |
-| [#3 Alembic migration graph has two heads](https://github.com/marcelaubry/superset/issues/3) | Not remediated (open, no PR) | — |
-| [#4 short digit-only strings formatted as epoch offsets](https://github.com/marcelaubry/superset/issues/4) | Not remediated (open, no PR) | — |
-| [#5 V2 of #4, edited](https://github.com/marcelaubry/superset/issues/5) | Not remediated (open, no PR) | — |
-| [#6 CheckboxControl has no accessible name](https://github.com/marcelaubry/superset/issues/6) | Remediated, awaiting human review | [#7 (open, draft)](https://github.com/marcelaubry/superset/pull/7) |
-| [#8 connect_args from adjust_engine_params are dropped](https://github.com/marcelaubry/superset/issues/8) | Remediated, awaiting human review | [#9 (open, draft)](https://github.com/marcelaubry/superset/pull/9) |
-| [#10 get_columns_description runs the probe statement twice](https://github.com/marcelaubry/superset/issues/10) | Remediated, awaiting human review | [#11 (open, draft)](https://github.com/marcelaubry/superset/pull/11) |
+| [#2 bump js-yaml override (GHSA-2883-xcg3-v3hh)](https://github.com/marcelaubry/superset/issues/2) | Not remediated — no remediation PR | — |
+| [#3 Alembic migration graph has two heads](https://github.com/marcelaubry/superset/issues/3) | Not remediated — no remediation PR | — |
+| [#4 short digit-only strings formatted as epoch offsets](https://github.com/marcelaubry/superset/issues/4) | Not remediated — no remediation PR | — |
+| [#5 second version of #4](https://github.com/marcelaubry/superset/issues/5) | Not remediated — no remediation PR | — |
+| [#6 CheckboxControl has no accessible name](https://github.com/marcelaubry/superset/issues/6) | Remediated, ready for human review | [#7 — open, draft](https://github.com/marcelaubry/superset/pull/7) |
+| [#8 connect_args from adjust_engine_params are dropped](https://github.com/marcelaubry/superset/issues/8) | Remediated, ready for human review | [#9 — open, draft](https://github.com/marcelaubry/superset/pull/9) |
+| [#10 get_columns_description runs the probe statement twice](https://github.com/marcelaubry/superset/issues/10) | Remediated, ready for human review | [#11 — open, draft](https://github.com/marcelaubry/superset/pull/11) |
 
-All three PRs are open drafts; none has been merged, by design. Issues without
-a PR were either filtered before any session was created or not approved for
-remediation — the context filter is deterministic and costs zero ACUs, which is
-the point of running it first.
+Three issues were remediated and their pull requests are open drafts awaiting
+human review; none has been merged, which is the intended end state. The
+remaining issues have no remediation pull request: they were filtered or not
+carried through to remediation, and the ones stopped by the deterministic
+context check cost nothing, which is the point of running that check before any
+session is created.
 
-## Safety boundaries
-
-- Only allowlisted repositories are accepted; webhook payloads must carry a
-  valid HMAC signature, and rendered URLs are allowlist-validated.
-- Every Devin session is bounded by ACU budget, timeout and per-repository
-  concurrency leases; the deterministic context filter spends zero ACUs.
-- Session creation is idempotent (operation keys), so replayed webhooks and
-  repeated clicks never create a second paid session.
-- Remediation starts only after a signed Slack approval from a human, recorded
-  with the deciding user and an append-only event trail.
-- The PR is validated against the issue and its head SHA is corroborated with
-  GitHub; CI is read for that exact head SHA, and probes run at base then head.
-- Nothing is merged, closed or force-pushed automatically — the terminal state
-  is "ready for human review".
-
-## Architecture
-
-FastAPI application (webhooks, operator dashboard, Slack interactions) backed by
-PostgreSQL, with a separate worker process that drives the case lifecycle, the
-Devin API client, and a transactional outbox for GitHub and Slack side effects.
-GitHub and Slack adapters have live and fake implementations. Reproduction
-probes run in a **credential-free verifier** service that holds no tokens and
-executes in an isolated runner behind an exact-host egress allowlist. An
-authenticated operator dashboard shows every case, its evidence and the
-available operator actions.
-
-Details: [docs/architecture.md](docs/architecture.md) ·
-[docs/threat-model.md](docs/threat-model.md).
-
-## Project layout
+## Project structure
 
 ```text
-remediator/   FastAPI app, worker, Devin/GitHub/Slack adapters, probes, verifier
-alembic/      Database migrations
-docker/       Dockerfiles, Compose secrets, DB init
-docs/         Architecture, runbooks and reference documentation
-fixtures/     Deterministic fake issues, sessions and CI payloads
-probes/       Immutable reproduction probe registry
-scripts/      demo.sh (Docker-only demo), simulate.py, operational helpers
-tests/        Unit and integration tests (Postgres + fake adapters)
+remediator/api/         FastAPI app: webhooks, Slack actions, operator dashboard
+remediator/worker/      Lifecycle processing, remediation pipeline, outbox dispatch
+remediator/devin/       Devin API client, result schemas, versioned prompts
+remediator/github/      Signature verification, issues/PR/CI client (live + fake)
+remediator/slack/       Request signing, Block Kit approval messages (live + fake)
+remediator/verifier/    Credential-free probe verifier and its isolated runner
+remediator/templates/   Jinja2 dashboard pages and HTMX partials
+probes/                 Immutable reproduction probe registry
+scripts/                demo.sh (Docker-only demo), simulate.py, helpers
+tests/                  Unit and integration tests against Postgres + fakes
+docs/                   Architecture, runbooks, reference documentation
+Dockerfile              Application image (API, worker, simulator)
+docker-compose.yml      Full stack: db, migrate, api, worker, verifier, proxy
+.env.example            Documented configuration, fake-mode by default
 ```
 
 ## Further documentation
 
-- [Architecture](docs/architecture.md)
 - [Canary runbook](docs/canary-runbook.md)
+- [Architecture](docs/architecture.md)
 - [Simulation](docs/simulation.md)
 - [Probes](docs/probes.md)
 - [Threat model](docs/threat-model.md)
-- [Concurrency](docs/concurrency.md)
-- [Metrics](docs/metrics.md)
 - [Known limitations](docs/known-limitations.md)
