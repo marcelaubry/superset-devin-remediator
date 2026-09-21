@@ -7,8 +7,11 @@
 {% if not ns.base and snap and snap.pre_session_executions %}{% set ns.base = snap.pre_session_executions[-1] %}{% endif %}
 <section id="side-probe" class="panel side-card" aria-labelledby="side-probe-title">
   <header class="panel-head"><h2 id="side-probe-title">Probe</h2>{% if ns.head %}{{ b.enum("verdict", ns.head.verdict) }}{% elif ns.base %}{{ b.enum("verdict", ns.base.verdict) }}{% endif %}</header>
-  {% if remediation.canary_override_warning %}
-  <p class="alert small"><strong>CANARY_PROBE_OVERRIDE</strong> — {{ remediation.canary_override_warning }}</p>
+  {% if remediation.probe_status_note %}
+  <p class="muted small"><strong>Acceptance probe: Not configured</strong> — {{ remediation.probe_status_note }}</p>
+  {% endif %}
+  {% if remediation.legacy_canary_override_warning %}
+  <p class="alert small"><strong>CANARY_PROBE_OVERRIDE</strong> (historical) — {{ remediation.legacy_canary_override_warning }}</p>
   {% endif %}
   {% if snap %}
   <dl class="facts">
@@ -18,6 +21,8 @@
     <dt>BASE run</dt><dd>{% if ns.base %}{{ b.enum("verdict", ns.base.verdict) }} <span class="muted">exit {{ ns.base.exit_code if ns.base.exit_code is not none else "none" }} (expected {{ ns.base.expected_exit_code }})</span>{% else %}<span class="muted">not run</span>{% endif %}</dd>
     <dt>HEAD run</dt><dd>{% if ns.head %}{{ b.enum("verdict", ns.head.verdict) }} <span class="muted">exit {{ ns.head.exit_code if ns.head.exit_code is not none else "none" }} (expected {{ ns.head.expected_exit_code }})</span>{% else %}<span class="muted">not run</span>{% endif %}</dd>
   </dl>
+  {% elif remediation.probe_status == "not_configured" %}
+  <p class="empty">Not configured — PR structure and exact-head CI are validated independently.</p>
   {% else %}
   <p class="empty">No probe snapshot pinned yet.</p>
   {% endif %}

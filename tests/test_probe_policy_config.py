@@ -1,17 +1,13 @@
-"""Configuration, readiness, prompt/schema and lifecycle rules of the canary-only
-`LIVE_CANARY_ALLOW_MISSING_PROBE` override. No provider is contacted."""
+"""Configuration, readiness, prompt/schema and lifecycle rules of `PROBE_POLICY`, and the
+readiness migration off the removed `LIVE_CANARY_ALLOW_MISSING_PROBE`. No provider is
+contacted."""
 
 from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
-from remediator.canary import (
-    CANARY_OVERRIDE_WARNING,
-    CANARY_PROBE_OVERRIDE,
-    is_missing_probe_block,
-    is_missing_probe_error,
-)
+from remediator.config import ProbePolicy
 from remediator.devin.prompt import RemediationPromptInput, render_remediation_prompt
 from remediator.devin.remediation import (
     REMEDIATION_OUTPUT_SCHEMA,
@@ -20,9 +16,14 @@ from remediator.devin.remediation import (
     validate_remediation_output,
 )
 from remediator.lifecycle import (
-    CANARY_PROBE_OVERRIDE_TRANSITIONS,
+    PROBE_NOT_CONFIGURED_TRANSITIONS,
     TRANSITIONS,
     CaseState,
+)
+from remediator.probe_policy import (
+    PROBE_NOT_CONFIGURED_NOTE,
+    is_missing_probe_block,
+    is_missing_probe_error,
 )
 from remediator.readiness import Probes, run_checks
 from remediator.worker.devin_runner import RemediationContext
@@ -35,31 +36,56 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # --------------------------------------------------------------------------- configuration
 
 
-def test_override_is_off_by_default() -> None:
+def test_probe_policy_defaults_to_required() -> None:
     settings = _settings()
-    assert settings.live_canary_allow_missing_probe is False
-    assert settings.canary_probe_override_violations == []
+    assert settings.probe_policy is ProbePolicy.REQUIRED
+    assert settings.probe_required is True
+    assert settings.live_canary_allow_missing_probe is None
+    assert settings.obsolete_probe_override_problem is None
 
 
-def test_override_accepts_the_safeguarded_canary_configuration() -> None:
-    settings = _settings(**_canary_kwargs(live_canary_allow_missing_probe=True))
-    assert settings.live_canary_allow_missing_probe is True
-    assert settings.canary_probe_override_violations == []
+def test_if_available_is_a_normal_setting_with_no_extra_safeguards() -> None:
+    settings = _settings(**_canary_kwargs(probe_policy="if_available"))
+    assert settings.probe_policy is ProbePolicy.IF_AVAILABLE
+    assert settings.probe_required is False
+    assert settings.canary_violations == []
+
+
+def test_invalid_probe_policy_fails_startup() -> None:
+    with pytest.raises(ValidationError, match="probe_policy"):
+        _settings(probe_policy="whenever")
 
 
 @pytest.mark.parametrize(
-    ("overrides", "fragment"),
-    [
-        ({"live_canary": False}, "LIVE_CANARY must be true"),
-        ({"github_required_label": ""}, "GITHUB_REQUIRED_LABEL"),
-        ({"max_concurrent_remediation": 2}, "MAX_CONCURRENT_REMEDIATION must be 1"),
-    ],
+    ("configured", "replacement"),
+    [(False, "required"), (True, "if_available")],
 )
-def test_override_cannot_be_enabled_without_its_safeguards(
-    overrides: dict[str, object], fragment: str
+def test_obsolete_override_is_reported_with_its_replacement(
+    configured: bool, replacement: str
 ) -> None:
-    with pytest.raises(ValidationError, match=fragment):
-        _settings(**_canary_kwargs(live_canary_allow_missing_probe=True, **overrides))
+    settings = _settings(live_canary_allow_missing_probe=configured)
+    problem = settings.obsolete_probe_override_problem
+    assert problem is not None
+    assert "LIVE_CANARY_ALLOW_MISSING_PROBE" in problem
+    assert f"PROBE_POLICY={replacement}" in problem
+
+
+def test_the_obsolete_variable_is_detected_from_the_real_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`extra="ignore"` must not hide a deployment that still exports the removed variable."""
+    monkeypatch.setenv("LIVE_CANARY_ALLOW_MISSING_PROBE", "true")
+    settings = _settings()
+    assert settings.live_canary_allow_missing_probe is True
+    assert settings.obsolete_probe_override_problem is not None
+
+
+def test_invalid_probe_policy_from_the_environment_fails_startup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PROBE_POLICY", "whenever")
+    with pytest.raises(ValidationError, match="probe_policy"):
+        _settings()
 
 
 def test_only_a_missing_probe_registration_is_recognised() -> None:
@@ -81,43 +107,43 @@ def test_only_a_missing_probe_registration_is_recognised() -> None:
 # --------------------------------------------------------------------------- readiness
 
 
-@pytest.mark.asyncio
-async def test_readiness_passes_warns_and_fails_on_the_override() -> None:
-    probes = Probes(
+def _probes() -> Probes:
+    return Probes(
         devin=_happy_handler,
         github=_happy_handler,
         slack=_happy_handler,
         verifier=_happy_handler,
         public=_happy_handler,
     )
-    off = _by_name(await run_checks(_live_settings(**_canary_kwargs()), probes=probes))
-    assert off["canary.probe_override"].status == "pass"
 
-    on = _by_name(
+
+@pytest.mark.asyncio
+async def test_readiness_reports_the_configured_policy() -> None:
+    probes = _probes()
+    required = _by_name(await run_checks(_live_settings(**_canary_kwargs()), probes=probes))
+    assert required["probe.policy"].status == "pass"
+    assert "PROBE_POLICY=required" in required["probe.policy"].detail
+    assert "probe.policy_migration" not in required
+
+    relaxed = _by_name(
         await run_checks(
-            _live_settings(**_canary_kwargs(live_canary_allow_missing_probe=True)), probes=probes
+            _live_settings(**_canary_kwargs(probe_policy="if_available")), probes=probes
         )
     )
-    assert on["canary.probe_override"].status == "warn"
-    assert CANARY_PROBE_OVERRIDE in on["canary.probe_override"].detail
-    assert CANARY_OVERRIDE_WARNING in on["canary.probe_override"].detail
+    assert relaxed["probe.policy"].status == "warn"
+    assert PROBE_NOT_CONFIGURED_NOTE in relaxed["probe.policy"].detail
 
 
 @pytest.mark.asyncio
-async def test_readiness_fails_when_the_override_loses_a_safeguard_after_startup() -> None:
-    probes = Probes(
-        devin=_happy_handler,
-        github=_happy_handler,
-        slack=_happy_handler,
-        verifier=_happy_handler,
-        public=_happy_handler,
+async def test_readiness_fails_while_the_obsolete_variable_is_still_configured() -> None:
+    results = _by_name(
+        await run_checks(
+            _live_settings(**_canary_kwargs(live_canary_allow_missing_probe=True)),
+            probes=_probes(),
+        )
     )
-    settings = _live_settings(**_canary_kwargs(live_canary_allow_missing_probe=True)).model_copy(
-        update={"max_concurrent_remediation": 3}
-    )
-    results = _by_name(await run_checks(settings, probes=probes))
-    assert results["canary.probe_override"].status == "fail"
-    assert "MAX_CONCURRENT_REMEDIATION" in results["canary.probe_override"].detail
+    assert results["probe.policy_migration"].status == "fail"
+    assert "PROBE_POLICY=if_available" in results["probe.policy_migration"].detail
 
 
 # --------------------------------------------------------------------------- prompt & schema
@@ -201,10 +227,10 @@ def test_no_probe_prompt_states_no_probe_runs_and_never_asks_for_probe_metadata(
 # --------------------------------------------------------------------------- lifecycle
 
 
-def test_probe_gates_are_bypassable_only_through_the_explicit_override_edges() -> None:
+def test_probe_gates_are_bypassable_only_through_the_explicit_policy_edges() -> None:
     assert CaseState.REMEDIATION_CREATE_INTENT not in TRANSITIONS[CaseState.REMEDIATION_APPROVED]
     assert CaseState.PR_VALIDATED not in TRANSITIONS[CaseState.PR_VALIDATING]
-    assert CANARY_PROBE_OVERRIDE_TRANSITIONS == {
+    assert PROBE_NOT_CONFIGURED_TRANSITIONS == {
         CaseState.REMEDIATION_APPROVED: frozenset({CaseState.REMEDIATION_CREATE_INTENT}),
         CaseState.PR_VALIDATING: frozenset({CaseState.PR_VALIDATED}),
     }
@@ -224,13 +250,13 @@ def test_remediation_context_needs_explicit_authorisation_to_run_without_a_probe
             approval=approval,  # type: ignore[arg-type]
             triage_output=triage,
             base_ref="master",
-            probe_override=True,
+            probe_not_configured=True,
         )
     context = RemediationContext(
         approval=approval,  # type: ignore[arg-type]
         triage_output=triage,
         base_ref="master",
-        probe_override=True,
+        probe_not_configured=True,
         pinned_base_sha="a" * 40,
     )
     assert context.base_sha == "a" * 40
@@ -239,13 +265,13 @@ def test_remediation_context_needs_explicit_authorisation_to_run_without_a_probe
 # --------------------------------------------------------------------------- documentation
 
 
-def test_env_example_documents_the_override_without_enabling_it() -> None:
+def test_env_example_documents_the_policy_and_retires_the_override() -> None:
     text = (REPO_ROOT / ".env.example").read_text()
-    assert "LIVE_CANARY_ALLOW_MISSING_PROBE=false" in text
-    assert "LIVE_CANARY_ALLOW_MISSING_PROBE=true" not in text
+    assert "PROBE_POLICY=required" in text
+    assert "LIVE_CANARY_ALLOW_MISSING_PROBE=" not in text
 
 
-def test_runbook_documents_the_override_and_its_warning() -> None:
+def test_runbook_documents_the_policy_and_its_neutral_status() -> None:
     text = (REPO_ROOT / "docs" / "canary-runbook.md").read_text()
-    assert "LIVE_CANARY_ALLOW_MISSING_PROBE" in text
-    assert CANARY_OVERRIDE_WARNING in text
+    assert "PROBE_POLICY=if_available" in text
+    assert PROBE_NOT_CONFIGURED_NOTE.rstrip(".") in text.replace("\n", " ")

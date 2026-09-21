@@ -23,6 +23,7 @@ from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from .lifecycle import CaseState
+from .probe_policy import ProbeStatus
 
 
 class Base(DeclarativeBase):
@@ -241,6 +242,10 @@ class Case(Base):
     probe_snapshots: Mapped[list["ProbeSnapshot"]] = relationship(
         order_by="ProbeSnapshot.created_at"
     )
+    probe_policy_decisions: Mapped[list["ProbePolicyDecision"]] = relationship(
+        order_by="ProbePolicyDecision.created_at"
+    )
+    # Historical only: rows written by the removed canary override.
     canary_overrides: Mapped[list["CanaryProbeOverride"]] = relationship(
         order_by="CanaryProbeOverride.created_at"
     )
@@ -314,10 +319,19 @@ class Attempt(Base):
     probe_snapshot_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("probe_snapshots.id", ondelete="SET NULL")
     )
-    # Canary-only: this attempt was authorised without an immutable probe, so no BASE or
-    # HEAD probe evidence exists and none may ever be claimed for it.
+    # Historical: set on attempts dispatched under the removed canary override. Read for
+    # rendering old cases; new attempts record `probe_status` instead.
     canary_probe_override: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default="false", nullable=False
+    )
+    # "verified" (a probe snapshot gates this attempt) or "not_configured" (no probe is
+    # registered under PROBE_POLICY=if_available, so no probe evidence exists or may be
+    # claimed for it).
+    probe_status: Mapped[str] = mapped_column(
+        String(32),
+        default=ProbeStatus.VERIFIED.value,
+        server_default=ProbeStatus.VERIFIED.value,
+        nullable=False,
     )
     devin_pull_requests: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB)
     pr_url: Mapped[str | None] = mapped_column(Text)
@@ -344,6 +358,11 @@ class Attempt(Base):
     ci_snapshots: Mapped[list["CiSnapshot"]] = relationship(
         back_populates="attempt", order_by="CiSnapshot.observed_at"
     )
+
+    @property
+    def without_probe(self) -> bool:
+        """No acceptance-probe evidence backs this attempt (new policy or legacy override)."""
+        return self.probe_status == ProbeStatus.NOT_CONFIGURED.value or self.canary_probe_override
 
 
 class ProbeSnapshot(Base):
@@ -527,12 +546,40 @@ class CiSnapshot(Base):
     attempt: Mapped[Attempt] = relationship(back_populates="ci_snapshots")
 
 
-class CanaryProbeOverride(Base):
-    """Append-only audit record of one `CANARY_PROBE_OVERRIDE` decision.
+class ProbePolicyDecision(Base):
+    """Append-only record of the acceptance-probe policy one case dispatched under.
 
-    Written once per case when `LIVE_CANARY_ALLOW_MISSING_PROBE` lets an approved case
-    dispatch with no registered probe. It is evidence of what was *skipped*; it is never
-    probe evidence and never records a probe verdict.
+    Written once per (case, approved triage hash) when `PROBE_POLICY=if_available` finds no
+    registered probe: it pins the base SHA the session runs against and states that no probe
+    evidence exists. It is never probe evidence and never records a probe verdict.
+    """
+
+    __tablename__ = "probe_policy_decisions"
+    __table_args__ = (
+        UniqueConstraint("case_id", "triage_result_hash", name="uq_probe_policy_case_hash"),
+    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    case_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("cases.id", ondelete="CASCADE"))
+    repository: Mapped[str] = mapped_column(String(255))
+    issue_number: Mapped[int] = mapped_column(Integer)
+    triage_result_hash: Mapped[str] = mapped_column(String(64))
+    base_sha: Mapped[str] = mapped_column(String(64))
+    policy: Mapped[str] = mapped_column(String(32))
+    probe_status: Mapped[str] = mapped_column(String(32))
+    actor: Mapped[str] = mapped_column(String(255))
+    approved_by: Mapped[str | None] = mapped_column(String(255))
+    reason: Mapped[str] = mapped_column(Text)
+    note: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+
+
+class CanaryProbeOverride(Base):
+    """Historical append-only record of one `CANARY_PROBE_OVERRIDE` decision.
+
+    Written by the removed `LIVE_CANARY_ALLOW_MISSING_PROBE` escape hatch. Nothing writes
+    it any more; rows are retained and rendered as evidence on the cases that ran under it.
     """
 
     __tablename__ = "canary_probe_overrides"

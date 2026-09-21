@@ -32,7 +32,6 @@ from pydantic import SecretStr, ValidationError
 from sqlalchemy import text
 
 from .adapters import SettingsRedactingFilter
-from .canary import CANARY_OVERRIDE_WARNING, CANARY_PROBE_OVERRIDE
 from .config import (
     CANARY_CONCURRENCY_LIMIT,
     DEFAULT_DEVIN_REPOS_FORMAT,
@@ -47,6 +46,7 @@ from .db import build_engine
 from .devin.live import LiveDevinClient
 from .github.client import GitHubApiError, LiveGitHubClient
 from .models import ProbeTarget
+from .probe_policy import PROBE_NOT_CONFIGURED_NOTE
 from .probes.registry import (
     ProbeRegistryError,
     load_approved_probe,
@@ -217,7 +217,7 @@ async def check_canary(settings: Settings, probes: Probes) -> list[CheckResult]:
     """The controlled-canary envelope (`LIVE_CANARY=true`): reported here so an operator sees
     every deviation at once; `Settings` refuses to start on the same list."""
     violations = settings.canary_violations
-    results = _probe_override_results(settings)
+    results = _probe_policy_results(settings)
     if not settings.live_canary:
         if settings.live_mode:
             return results + [
@@ -245,25 +245,32 @@ async def check_canary(settings: Settings, probes: Probes) -> list[CheckResult]:
     ]
 
 
-def _probe_override_results(settings: Settings) -> list[CheckResult]:
-    """`LIVE_CANARY_ALLOW_MISSING_PROBE`: reported at every readiness run because it removes
-    the only independent behavioural evidence the pipeline has."""
-    if not settings.live_canary_allow_missing_probe:
-        return [
-            CheckResult("canary.probe_override", "pass", "LIVE_CANARY_ALLOW_MISSING_PROBE=false")
-        ]
-    violations = settings.canary_probe_override_violations
-    if violations:
-        return [CheckResult("canary.probe_override", "fail", "; ".join(violations))]
-    return [
-        CheckResult(
-            "canary.probe_override",
-            "warn",
-            "LIVE_CANARY_ALLOW_MISSING_PROBE=true: remediation may start with no acceptance "
-            "probe; base/head probe verification is skipped and "
-            f"{CANARY_PROBE_OVERRIDE} is recorded. " + CANARY_OVERRIDE_WARNING,
+def _probe_policy_results(settings: Settings) -> list[CheckResult]:
+    """`PROBE_POLICY`: reported at every readiness run because `if_available` removes the
+    only independent behavioural evidence the pipeline has when no probe is registered."""
+    obsolete = settings.obsolete_probe_override_problem
+    results: list[CheckResult] = []
+    if obsolete is not None:
+        results.append(CheckResult("probe.policy_migration", "fail", obsolete))
+    if settings.probe_required:
+        results.append(
+            CheckResult(
+                "probe.policy",
+                "pass",
+                "PROBE_POLICY=required: an approved probe must fail at base and pass "
+                "unchanged at the PR head",
+            )
         )
-    ]
+        return results
+    results.append(
+        CheckResult(
+            "probe.policy",
+            "warn",
+            "PROBE_POLICY=if_available: a registered probe is verified normally; with no "
+            "probe the case records probe_status=not_configured. " + PROBE_NOT_CONFIGURED_NOTE,
+        )
+    )
+    return results
 
 
 async def check_limits(settings: Settings, probes: Probes) -> list[CheckResult]:

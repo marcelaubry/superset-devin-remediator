@@ -15,7 +15,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import metrics
 from ..adapters import build_github_client, build_slack_client
-from ..canary import MISSING_PROBE_BLOCK_PREFIX
 from ..capacity import CapacityManager
 from ..config import Settings
 from ..db import build_engine, build_session_factory
@@ -33,6 +32,7 @@ from ..models import (
     EventStatus,
     WebhookEvent,
 )
+from ..probe_policy import MISSING_PROBE_BLOCK_PREFIX
 from ..probes.remote import RemoteProbeRunner
 from .metrics_server import build_server as build_metrics_server
 from .outbox import OutboxDispatcher
@@ -75,7 +75,7 @@ RECONCILABLE_BLOCKED_ATTEMPT = exists(
     )
 )
 
-# REMEDIATION_HUMAN_BLOCKED is claimable only while the canary override is enabled and the
+# REMEDIATION_HUMAN_BLOCKED is claimable only under PROBE_POLICY=if_available when the
 # sole recorded blocker is the missing acceptance probe; the pipeline then re-validates
 # every dispatch precondition before anything is created.
 MISSING_PROBE_BLOCKED = (Case.state == CaseState.REMEDIATION_HUMAN_BLOCKED) & (
@@ -207,11 +207,7 @@ class Worker:
                     .where(
                         Case.state.in_(CLAIMABLE_STATES)
                         | ((Case.state == CaseState.HUMAN_BLOCKED) & RECONCILABLE_BLOCKED_ATTEMPT)
-                        | (
-                            MISSING_PROBE_BLOCKED
-                            if self.settings.live_canary_allow_missing_probe
-                            else false()
-                        ),
+                        | (false() if self.settings.probe_required else MISSING_PROBE_BLOCKED),
                         (Case.lease_expires_at.is_(None) | (Case.lease_expires_at < now)),
                         ~active_event,
                     )

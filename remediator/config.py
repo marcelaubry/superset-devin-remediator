@@ -1,5 +1,6 @@
 import ipaddress
 import re
+from enum import StrEnum
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
@@ -22,6 +23,16 @@ PLACEHOLDER_SECRET = "change-me"
 DEFAULT_DEVIN_REPOS_FORMAT = "{repository}"
 REPOS_FORMAT_PLACEHOLDER = "{repository}"
 CANARY_CONCURRENCY_LIMIT = 1
+OBSOLETE_PROBE_OVERRIDE_ENV = "LIVE_CANARY_ALLOW_MISSING_PROBE"
+
+
+class ProbePolicy(StrEnum):
+    """Whether an approved acceptance probe is a precondition for remediation."""
+
+    REQUIRED = "required"
+    IF_AVAILABLE = "if_available"
+
+
 _FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
@@ -127,11 +138,15 @@ class Settings(BaseSettings):
     # Opt-in fail-closed envelope for the first live end-to-end run: exactly one allowlisted
     # repository, a mandatory intake label and every concurrency limit at 1.
     live_canary: bool = False
-    # Emergency canary-only escape hatch: with no approved probe registered for the issue,
-    # a human Slack approval alone authorises the bounded remediation session. Probe
-    # registration and both probe executions are skipped; PR and exact-head CI validation
-    # stay mandatory and the case is disclosed as behaviourally unverified.
-    live_canary_allow_missing_probe: bool = False
+    # Acceptance-probe policy. "required" (default) keeps the original production
+    # behaviour: an approved immutable probe must exist, fail at the pinned base and pass
+    # unchanged at the PR head. "if_available" runs that same verification whenever a probe
+    # is registered and otherwise proceeds from the validated approval straight to the
+    # bounded session; PR validation and exact-head CI stay mandatory either way and the
+    # case reports `probe_status=not_configured` instead of any probe evidence.
+    probe_policy: ProbePolicy = ProbePolicy.REQUIRED
+    # Removed. Read only so readiness can tell an operator to migrate to PROBE_POLICY.
+    live_canary_allow_missing_probe: bool | None = None
     devin_triage_max_acu: int = 5
     devin_triage_timeout_seconds: float = 1800.0
     devin_poll_interval_seconds: float = 15.0
@@ -483,28 +498,24 @@ class Settings(BaseSettings):
                 raise ValueError(f"LIVE_CANARY=true: {problem}")
         return self
 
-    @model_validator(mode="after")
-    def _validate_canary_probe_override(self) -> "Settings":
-        for problem in self.canary_probe_override_violations:
-            raise ValueError(f"LIVE_CANARY_ALLOW_MISSING_PROBE=true: {problem}")
-        return self
+    @property
+    def obsolete_probe_override_problem(self) -> str | None:
+        """Why the deployment still configures the removed missing-probe override, or None."""
+        if self.live_canary_allow_missing_probe is None:
+            return None
+        replacement = (
+            ProbePolicy.IF_AVAILABLE
+            if self.live_canary_allow_missing_probe
+            else ProbePolicy.REQUIRED
+        )
+        return (
+            f"{OBSOLETE_PROBE_OVERRIDE_ENV} has been removed; delete it and set "
+            f"PROBE_POLICY={replacement.value}"
+        )
 
     @property
-    def canary_probe_override_violations(self) -> list[str]:
-        """Safeguards the missing-probe override may never be enabled without."""
-        if not self.live_canary_allow_missing_probe:
-            return []
-        problems: list[str] = []
-        if not self.live_canary:
-            problems.append("LIVE_CANARY must be true")
-        if not self.github_required_label.strip():
-            problems.append("GITHUB_REQUIRED_LABEL must name the intake label")
-        if self.max_concurrent_remediation != CANARY_CONCURRENCY_LIMIT:
-            problems.append(
-                f"MAX_CONCURRENT_REMEDIATION must be {CANARY_CONCURRENCY_LIMIT}, "
-                f"got {self.max_concurrent_remediation}"
-            )
-        return problems
+    def probe_required(self) -> bool:
+        return self.probe_policy is ProbePolicy.REQUIRED
 
     @property
     def canary_violations(self) -> list[str]:

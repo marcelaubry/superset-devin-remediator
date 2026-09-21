@@ -307,9 +307,10 @@ for _state in _ACTIVE - REMEDIATION_PHASE_STATES:
         {CaseState.FAILED, CaseState.CANCELLED, CaseState.TERMINATION_PENDING}
     )
 
-# Edges that exist *only* for an attempt carrying `Attempt.canary_probe_override`: they
-# are the two probe gates the override skips, and are rejected on every other case.
-CANARY_PROBE_OVERRIDE_TRANSITIONS: dict[CaseState, frozenset[CaseState]] = {
+# Edges that exist *only* when no acceptance probe is configured under
+# PROBE_POLICY=if_available: the two probe gates that have nothing to run. They are
+# rejected on every case that does have a probe.
+PROBE_NOT_CONFIGURED_TRANSITIONS: dict[CaseState, frozenset[CaseState]] = {
     # No probe is registered, so there is no BASE gate to run before the create intent.
     CaseState.REMEDIATION_APPROVED: frozenset({CaseState.REMEDIATION_CREATE_INTENT}),
     # The PR was corroborated by GitHub, but no HEAD probe exists to run against it.
@@ -372,12 +373,12 @@ async def transition(
     actor: str,
     *,
     expected_claimed_by: str | None = None,
-    canary_probe_override: bool = False,
+    probe_not_configured: bool = False,
 ) -> None:
     from_state = CaseState(case.state)
     allowed = TRANSITIONS[from_state]
-    if canary_probe_override:
-        allowed = allowed | CANARY_PROBE_OVERRIDE_TRANSITIONS.get(from_state, frozenset())
+    if probe_not_configured:
+        allowed = allowed | PROBE_NOT_CONFIGURED_TRANSITIONS.get(from_state, frozenset())
     if to_state not in allowed:
         raise InvalidTransition(f"{from_state} cannot transition to {to_state}")
     from . import metrics

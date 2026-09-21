@@ -10,7 +10,6 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from ..canary import CANARY_OVERRIDE_WARNING, CANARY_PROBE_OVERRIDE
 from ..config import Settings, get_settings
 from ..db import get_session
 from ..lifecycle import (
@@ -38,6 +37,13 @@ from ..models import (
     Recommendation,
     StateTransition,
     WebhookEvent,
+)
+from ..probe_policy import (
+    LEGACY_CANARY_OVERRIDE_WARNING,
+    LEGACY_CANARY_PROBE_OVERRIDE,
+    PROBE_NOT_CONFIGURED,
+    PROBE_NOT_CONFIGURED_NOTE,
+    ProbeStatus,
 )
 from .auth import require_operator
 from .hardening import safe_href
@@ -369,7 +375,11 @@ def remediation_json(case: Case) -> dict[str, Any] | None:
                     else "Unavailable"
                 ),
                 "base_sha": attempt.base_sha,
-                "canary_probe_override": attempt.canary_probe_override,
+                "probe_status": (
+                    ProbeStatus.NOT_CONFIGURED.value
+                    if attempt.without_probe
+                    else attempt.probe_status
+                ),
                 "triage_result_hash": attempt.triage_result_hash,
                 "approval_request_id": (
                     str(attempt.approval_request_id) if attempt.approval_request_id else None
@@ -405,9 +415,33 @@ def remediation_json(case: Case) -> dict[str, Any] | None:
         "failure_reason": case.failure_reason,
         "ready_for_human_review": CaseState(case.state) == CaseState.CI_PASSED,
         "actions": remediation_actions(case),
+        "probe_policy_decisions": [
+            {
+                "transition": PROBE_NOT_CONFIGURED,
+                "policy": row.policy,
+                "probe_status": row.probe_status,
+                "actor": row.actor,
+                "approved_by": row.approved_by,
+                "recorded_at": _iso(row.created_at),
+                "repository": row.repository,
+                "issue_number": row.issue_number,
+                "triage_result_hash": row.triage_result_hash,
+                "base_sha": row.base_sha,
+                "reason": row.reason,
+                "note": row.note,
+            }
+            for row in case.probe_policy_decisions
+        ],
+        "probe_status": (
+            ProbeStatus.NOT_CONFIGURED.value
+            if case.probe_policy_decisions or case.canary_overrides
+            else ProbeStatus.VERIFIED.value
+        ),
+        "probe_status_note": (PROBE_NOT_CONFIGURED_NOTE if case.probe_policy_decisions else None),
+        # Historical only: cases dispatched under the removed override.
         "canary_probe_overrides": [
             {
-                "transition": CANARY_PROBE_OVERRIDE,
+                "transition": LEGACY_CANARY_PROBE_OVERRIDE,
                 "actor": row.actor,
                 "approved_by": row.approved_by,
                 "recorded_at": _iso(row.created_at),
@@ -420,7 +454,9 @@ def remediation_json(case: Case) -> dict[str, Any] | None:
             }
             for row in case.canary_overrides
         ],
-        "canary_override_warning": (CANARY_OVERRIDE_WARNING if case.canary_overrides else None),
+        "legacy_canary_override_warning": (
+            LEGACY_CANARY_OVERRIDE_WARNING if case.canary_overrides else None
+        ),
         "probe_snapshots": [_probe_snapshot_json(s) for s in case.probe_snapshots],
         "attempts": rows,
     }
@@ -529,6 +565,7 @@ def filter_cases(cases: list[Case], params: dict[str, str]) -> list[Case]:
 
 
 ATTEMPT_EVIDENCE_OPTIONS = (
+    selectinload(Case.probe_policy_decisions),
     selectinload(Case.canary_overrides),
     selectinload(Case.probe_snapshots).selectinload(ProbeSnapshot.executions),
     selectinload(Case.attempts).selectinload(Attempt.probe_snapshot),
