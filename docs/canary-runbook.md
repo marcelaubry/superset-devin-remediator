@@ -144,6 +144,44 @@ situation is under control.
    only when none exists is `POST /operator/cases/{id}/retry?confirm_no_session=true`
    acceptable, and only with `LIVE_CANARY` still enforcing a single slot.
 
+## Recovering a triage stuck in `HUMAN_BLOCKED` after the session finished
+
+An interactive Devin session reports `status_detail=waiting_for_user`
+("Devin is awaiting instructions") once its task is done, including after it
+has submitted `structured_output`. The worker now treats a snapshot that
+carries structured output as *finished* regardless of that status, and it
+re-reads (`GET` only) retained sessions of `HUMAN_BLOCKED` cases on every pass
+(`HUMAN_BLOCKED_RECONCILE_INTERVAL_SECONDS`). A case blocked by the earlier
+behaviour is recovered like this — no database edits, no new issue, no new
+session:
+
+1. Deploy this release and let the worker run, **or** open the case page and
+   click **Reconcile existing session** (`POST
+   /operator/cases/{id}/reconcile-session`). Both paths only `GET` the
+   retained session(s); neither ever `POST`s a create.
+2. If the case already has two triage attempts (a dashboard *Retry* created a
+   duplicate), the newest attempt whose session holds schema-valid output
+   becomes authoritative; the other blocked attempt is marked `CANCELLED`
+   ("superseded by reconciled attempt …") and stays in the audit trail. No
+   third attempt is created. If only the older session has valid output, that
+   one wins.
+3. The case advances `HUMAN_BLOCKED` → `TRIAGING` → `TRIAGED` →
+   `AWAITING_REMEDIATION_APPROVAL`, exactly one `approval_requests` row is
+   created (bound to the sha256 of the ingested output) and exactly one Slack
+   approval card is queued. Repeating the action, or the worker passing over
+   the case again, changes nothing.
+4. If the retained session still has no output, the response says so and the
+   case stays `HUMAN_BLOCKED` with the attempt annotated
+   `reconciled without structured output …`. Only then does the page also
+   offer **Retry (replacement triage)**, which terminates the retained
+   session before any new create; the plain `retry` endpoint answers `409`
+   until that reconciliation has happened.
+5. If the session no longer exists remotely (`404`), the attempt is annotated
+   as gone and a replacement retry becomes available under the same rule.
+
+Record the attempt IDs, the superseding decision and the approval hash in the
+canary checklist below.
+
 ## Canary checklist
 
 Copy into the canary notes. Identifiers only — never secrets, tokens, or raw

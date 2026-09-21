@@ -268,6 +268,8 @@ docker buildx build --platform linux/amd64 -f docker/verifier/Dockerfile .
 | `missing-output` | `issue_missing_output.json` | 4655 | `FAILED` | Session finishes without structured output |
 | `unknown-status` | `issue_unknown_status.json` | 4666 | `TIMED_OUT` | Undocumented status enters reconciliation and stays bounded by the deadline |
 | `create-rejected` | `issue_create_rejected.json` | 4677 | `FAILED` | Definitive API error on create, recorded as `create_state=API_ERROR` |
+| `idle-with-output` | `issue_idle_with_output.json` | 4811 | `AWAITING_REMEDIATION_APPROVAL` | Session reports `waiting_for_user` ("awaiting instructions") *after* submitting valid `structured_output`; the output wins, one approval + one Slack card, never `HUMAN_BLOCKED` |
+| `idle-malformed-output` | `issue_idle_malformed_output.json` | 4822 | `FAILED` | Same idle status with schema-invalid output: fails like `malformed-output`, not `HUMAN_BLOCKED` |
 
 Phase 3 scenarios drive the same fake adapters through the production
 endpoints (`/webhooks/github`, `/webhooks/slack/actions`, operator API). The
@@ -372,6 +374,7 @@ failed termination, concurrent retries, and worker restart in every state.
 | `MAX_CONCURRENT_REMEDIATION_PER_REPOSITORY` | `1` | Remediation leases per repository |
 | `CAPACITY_WAIT_BACKOFF_SECONDS` | `5` | Re-check delay for a case parked on a full limit |
 | `CAPACITY_LEASE_GRACE_SECONDS` | `600` | Lease expiry without heartbeat (crashed worker) |
+| `HUMAN_BLOCKED_RECONCILE_INTERVAL_SECONDS` | `300` | How often the worker re-reads (GET) the retained session of a `HUMAN_BLOCKED` triage case for late `structured_output` |
 | `MAX_REQUEST_BODY_BYTES` | `1048576` | Requests larger than this get `413` before parsing |
 | `OPERATOR_RATE_LIMIT_PER_MINUTE` | `60` | Per-client limit on operator mutations |
 | `OPERATOR_CSRF_TRUSTED_ORIGINS` | *(empty)* | Extra Origins allowed for cookie-authenticated mutations |

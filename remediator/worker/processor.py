@@ -46,7 +46,13 @@ from .devin_runner import (
 )
 from .remediation import REMEDIATION_WORK_STATES, RemediationPipeline
 
-__all__ = ["fail_case", "process_case", "process_event", "terminate_running_attempts"]
+__all__ = [
+    "fail_case",
+    "process_case",
+    "process_event",
+    "reconcile_blocked_triage",
+    "terminate_running_attempts",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -272,6 +278,8 @@ async def process_case(
     ):
         outcome = await runner.run(AttemptKind.TRIAGE)
         await _finish_triage(session, case, outcome, settings, claimed_by)
+    if state == CaseState.HUMAN_BLOCKED:
+        await reconcile_blocked_triage(session, case, devin, settings, claimed_by, resolver)
     if state == CaseState.TERMINATION_PENDING:
         pending = await _pending_termination_attempt(session, case)
         if pending is None:
@@ -280,6 +288,38 @@ async def process_case(
             outcome = await runner.run(pending.kind)
             if pending.kind == AttemptKind.TRIAGE:
                 await _finish_triage(session, case, outcome, settings, claimed_by)
+
+
+async def reconcile_blocked_triage(
+    session: AsyncSession,
+    case: Case,
+    devin: DevinClient,
+    settings: Settings,
+    claimed_by: str | None = None,
+    resolver: BaseCommitResolver | None = None,
+) -> RunOutcome | None:
+    """Re-read the retained session(s) of a HUMAN_BLOCKED case and ingest structured output.
+
+    GET only: no session is ever created here. When the newest retained session carries
+    structured output the case advances exactly as a live poll would have (validation,
+    one approval round, one Slack notification); otherwise the case stays HUMAN_BLOCKED
+    with the attempt annotated so an operator can tell the session was re-read.
+    """
+    if CaseState(case.state) != CaseState.HUMAN_BLOCKED:
+        return None
+    runner = DevinRunner(
+        session,
+        case,
+        devin,
+        settings,
+        resolver or build_base_commit_resolver(settings),
+        claimed_by=claimed_by,
+    )
+    outcome = await runner.reconcile_blocked(AttemptKind.TRIAGE)
+    if outcome is None:
+        return None
+    await _finish_triage(session, case, outcome, settings, claimed_by)
+    return outcome
 
 
 async def _active_kind(session: AsyncSession, case: Case) -> AttemptKind | None:

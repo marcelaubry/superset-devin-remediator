@@ -181,6 +181,9 @@ class Settings(BaseSettings):
     max_concurrent_probes: int = 1
     max_concurrent_remediation_per_repository: int = 1
     capacity_wait_backoff_seconds: float = 5.0
+    # How often the worker re-reads (GET) the retained Devin session of a HUMAN_BLOCKED
+    # triage case to pick up structured output submitted after the block was recorded.
+    human_blocked_reconcile_interval_seconds: float = 300.0
     capacity_lease_grace_seconds: int = 600
     max_request_body_bytes: int = 1_048_576
     operator_rate_limit_per_minute: int = 60
@@ -360,6 +363,8 @@ class Settings(BaseSettings):
                 raise ValueError(f"{name} must be a positive integer")
         if self.capacity_wait_backoff_seconds < 0:
             raise ValueError("CAPACITY_WAIT_BACKOFF_SECONDS must be non-negative")
+        if self.human_blocked_reconcile_interval_seconds < 0:
+            raise ValueError("HUMAN_BLOCKED_RECONCILE_INTERVAL_SECONDS must be non-negative")
         if self.max_request_body_bytes < 4096:
             raise ValueError("MAX_REQUEST_BODY_BYTES must be at least 4096")
         for name, url in (

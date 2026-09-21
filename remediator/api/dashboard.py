@@ -23,6 +23,7 @@ from ..lifecycle import (
 from ..models import (
     ACTIVE_ATTEMPT_STATUSES,
     FAILURE_CLASS_INFRASTRUCTURE,
+    RECONCILED_NO_OUTPUT_PREFIX,
     ApprovalRequest,
     Attempt,
     AttemptKind,
@@ -248,6 +249,34 @@ def _ci_snapshot_json(row: CiSnapshot) -> dict[str, Any]:
     }
 
 
+def triage_actions(case: Case) -> dict[str, bool]:
+    """Operator actions for the generic (triage) phase.
+
+    `reconcile_session`: a HUMAN_BLOCKED case still retains a remote Devin session that
+    has not been proven empty or gone; the only safe action is to re-read it (GET only).
+    `retry`: FAILED / TIMED_OUT, or HUMAN_BLOCKED once every retained session has been
+    reconciled without output, so a replacement triage attempt is legitimately allowed.
+    """
+    state = CaseState(case.state)
+    if state not in {CaseState.FAILED, CaseState.TIMED_OUT, CaseState.HUMAN_BLOCKED}:
+        return {"reconcile_session": False, "retry": False}
+    if state != CaseState.HUMAN_BLOCKED:
+        return {"reconcile_session": False, "retry": True}
+    retained = [
+        a
+        for a in case.attempts
+        if a.kind == AttemptKind.TRIAGE
+        and a.status == AttemptStatus.BLOCKED
+        and a.devin_session_id is not None
+    ]
+    unreconciled = [
+        a
+        for a in retained
+        if not (a.reconciliation_reason or "").startswith(RECONCILED_NO_OUTPUT_PREFIX)
+    ]
+    return {"reconcile_session": bool(retained), "retry": not unreconciled}
+
+
 def remediation_actions(case: Case) -> dict[str, bool]:
     """Which authenticated operator actions the current state/evidence permits."""
     state = CaseState(case.state)
@@ -387,6 +416,7 @@ TEMPLATE_HELPERS: dict[str, object] = {
     "latest_attempt": latest_attempt,
     "latest_triage_result": latest_triage_result,
     "remediation_actions": remediation_actions,
+    "triage_actions": triage_actions,
     "remediation_json": remediation_json,
     "AttemptKind": AttemptKind,
     "iso": _iso_z,

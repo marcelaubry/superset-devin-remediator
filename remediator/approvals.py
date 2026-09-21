@@ -31,6 +31,7 @@ from .models import (
     ApprovalRequest,
     Attempt,
     AttemptKind,
+    AttemptStatus,
     Case,
     DeliveryStatus,
     EventStatus,
@@ -128,10 +129,17 @@ async def open_request_for_case(
 
 
 async def latest_triage_attempt_id(session: AsyncSession, case_id: Any) -> Any | None:
-    """The triage attempt whose result is current for the case (newest by start time)."""
+    """The triage attempt whose result is current for the case (newest by start time).
+
+    Cancelled attempts never produced a result: a blocked attempt superseded during
+    reconciliation must not shadow the older attempt whose output was ingested."""
     return await session.scalar(
         select(Attempt.id)
-        .where(Attempt.case_id == case_id, Attempt.kind == AttemptKind.TRIAGE)
+        .where(
+            Attempt.case_id == case_id,
+            Attempt.kind == AttemptKind.TRIAGE,
+            Attempt.status != AttemptStatus.CANCELLED,
+        )
         .order_by(Attempt.started_at.desc(), Attempt.id.desc())
         .limit(1)
     )

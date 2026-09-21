@@ -45,6 +45,9 @@ SCENARIOS = {
     "timeout": "issue_timeout.json",
     "unknown-status": "issue_unknown_status.json",
     "create-rejected": "issue_create_rejected.json",
+    # Session went idle ("awaiting instructions") after submitting structured output.
+    "idle-with-output": "issue_idle_with_output.json",  # 4811: valid -> approval, not blocked
+    "idle-malformed-output": "issue_idle_malformed_output.json",  # 4822: invalid -> FAILED
 }
 
 # Phase 3: each scenario starts from a distinct fixture issue so runs do not interfere.

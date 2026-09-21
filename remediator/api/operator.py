@@ -13,6 +13,8 @@ from sqlalchemy.orm import selectinload
 from ..approvals import expire_request, record_event
 from ..config import Settings, get_settings
 from ..db import get_session
+from ..devin import build_devin_client
+from ..devin.client import DevinClient
 from ..lifecycle import (
     REMEDIATION_PHASE,
     REMEDIATION_RETRYABLE_STATES,
@@ -27,6 +29,7 @@ from ..models import (
     FAILURE_CLASS_INFRASTRUCTURE,
     OUTBOX_KIND_GITHUB_APPLY_LABEL,
     OUTBOX_KIND_SLACK_APPROVAL_REQUEST,
+    RECONCILED_NO_OUTPUT_PREFIX,
     UNRESOLVED_CREATE_ACK,
     ApprovalRequest,
     Attempt,
@@ -40,6 +43,7 @@ from ..models import (
     OutboxStatus,
     SlackFakeMessage,
 )
+from ..worker.processor import reconcile_blocked_triage
 from ..worker.remediation import enqueue_remediation_update, latest_remediation_attempt
 from .auth import COOKIE_NAME, _cookie_value, require_operator
 from .dashboard import (
@@ -53,6 +57,20 @@ from .dashboard import (
 )
 
 router = APIRouter()
+
+
+_devin_client: DevinClient | None = None
+
+
+def get_devin_client(settings: Settings = Depends(get_settings)) -> DevinClient:
+    """Devin access for operator reconciliation, which only ever reads sessions (GET).
+
+    Built once per process from the configured client mode; tests override this dependency
+    with the fake client that owns the sessions under test."""
+    global _devin_client
+    if _devin_client is None:
+        _devin_client = build_devin_client(settings)
+    return _devin_client
 
 
 @router.post("/login")
@@ -281,6 +299,8 @@ async def _case_action(
             reason = "operator requested remediation retry (new attempt)"
         elif to_state == CaseState.RECEIVED:
             await _acknowledge_unresolved(session, case, request)
+            if current == CaseState.HUMAN_BLOCKED:
+                await _refuse_unreconciled_blocked(session, case)
             counts = await session.execute(
                 select(Attempt.kind, func.count())
                 .where(Attempt.case_id == case.id)
@@ -309,6 +329,78 @@ async def _case_action(
     if not refreshed:
         raise HTTPException(status_code=404, detail="case not found")
     return {"id": str(refreshed.id), "state": refreshed.state}
+
+
+async def _refuse_unreconciled_blocked(session: AsyncSession, case: Case) -> None:
+    """A replacement triage session is only allowed once every retained session has been
+    re-read and proven to carry no structured output (or to no longer exist)."""
+    unreconciled = list(
+        (
+            await session.scalars(
+                select(Attempt.operation_key).where(
+                    Attempt.case_id == case.id,
+                    Attempt.kind == AttemptKind.TRIAGE,
+                    Attempt.status == AttemptStatus.BLOCKED,
+                    Attempt.devin_session_id.is_not(None),
+                    (
+                        Attempt.reconciliation_reason.is_(None)
+                        | Attempt.reconciliation_reason.not_like(f"{RECONCILED_NO_OUTPUT_PREFIX}%")
+                    ),
+                )
+            )
+        ).all()
+    )
+    if unreconciled:
+        raise InvalidTransition(
+            f"retained Devin session for {', '.join(unreconciled)} has not been reconciled; "
+            "use 'Reconcile existing session' first (no new session is created)"
+        )
+
+
+@router.post("/operator/cases/{case_id}/reconcile-session")
+async def reconcile_session(
+    case_id: UUID,
+    request: Request,
+    _: str = Depends(require_operator),
+    session: AsyncSession = Depends(get_session),
+    devin: DevinClient = Depends(get_devin_client),
+) -> Any:
+    """Reconcile existing session: re-read (GET) the retained Devin session(s) of a
+    HUMAN_BLOCKED triage case and ingest structured output that is already there.
+
+    Never creates a session. On success the case advances through TRIAGED to
+    AWAITING_REMEDIATION_APPROVAL with exactly one approval round and one Slack card,
+    idempotently: repeating the action is a no-op once the case has left HUMAN_BLOCKED.
+    """
+    case = await session.get(Case, case_id, with_for_update=True)
+    if not case:
+        raise HTTPException(status_code=404, detail="case not found")
+    detail: str | None = None
+    try:
+        current = CaseState(case.state)
+        if current != CaseState.HUMAN_BLOCKED:
+            raise InvalidTransition(f"reconcile existing session is not available from {current}")
+        outcome = await reconcile_blocked_triage(session, case, devin, get_settings())
+        if outcome is None:
+            await session.commit()
+            detail = (
+                "retained Devin session re-read: no structured output yet; case stays "
+                "HUMAN_BLOCKED (no new session was created)"
+            )
+    except InvalidTransition as exc:
+        await session.rollback()
+        if request.headers.get("HX-Request") == "true":
+            refreshed = await load_case(session, case_id)
+            if not refreshed:
+                raise HTTPException(status_code=404, detail="case not found") from exc
+            return _render_case(request, refreshed, str(exc))
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    refreshed = await load_case(session, case_id)
+    if not refreshed:
+        raise HTTPException(status_code=404, detail="case not found")
+    if request.headers.get("HX-Request") == "true":
+        return _render_case(request, refreshed, detail)
+    return {"id": str(refreshed.id), "state": refreshed.state, "detail": detail}
 
 
 async def _refuse_if_active_attempt(session: AsyncSession, case: Case) -> None:
