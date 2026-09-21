@@ -275,6 +275,8 @@ TRANSITIONS: dict[CaseState, frozenset[CaseState]] = {
             CaseState.FAILED,
             CaseState.RECEIVED,
             CaseState.TERMINATION_PENDING,
+            # Retained session re-read and found to carry structured output.
+            CaseState.TRIAGING,
         }
     ),
     CaseState.RECONCILING_CREATE: frozenset(

@@ -57,6 +57,10 @@ ACTIVE_ATTEMPT_STATUSES = frozenset(
 )
 
 UNRESOLVED_CREATE_ACK = "operator confirmed no live Devin session carries this operation key"
+# Prefix written to a BLOCKED attempt's reconciliation_reason once its retained session
+# has been re-read and proven to carry no structured output (or to no longer exist).
+# Only then may a replacement triage session be created.
+RECONCILED_NO_OUTPUT_PREFIX = "reconciled without structured output"
 CANCEL_TERMINATION_REASON = "operator requested cancel"
 WORKER_ERROR_TERMINATION_PREFIX = "worker error"
 

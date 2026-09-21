@@ -1,10 +1,14 @@
 {% set terminal = case.state in TERMINAL_STATES %}
-{% set legacy_retry = case.state in ["FAILED","TIMED_OUT","HUMAN_BLOCKED"] %}
+{% set triage = triage_actions(case) %}
+{% set legacy_retry = triage.retry %}
 <section id="case-status" class="subsection case-actions" aria-labelledby="actions-title">
   <h2 id="actions-title" class="eyebrow">Operator actions</h2>
   <div class="actions">
+    {% if triage.reconcile_session %}
+    <form method="post" action="/operator/cases/{{ case.id }}/reconcile-session" hx-post="/operator/cases/{{ case.id }}/reconcile-session" hx-target="#case-detail" hx-swap="innerHTML" hx-disabled-elt="this" hx-confirm="Re-read the existing Devin session and ingest structured output it already submitted? No new session is created and no ACUs are spent."><button type="submit" class="btn-primary">Reconcile existing session</button></form>
+    {% endif %}
     {% if legacy_retry %}
-    <form method="post" action="/operator/cases/{{ case.id }}/retry" hx-post="/operator/cases/{{ case.id }}/retry" hx-target="#case-detail" hx-swap="innerHTML" hx-disabled-elt="this" hx-confirm="Retry this case? It re-enters the queue and a new triage attempt may be dispatched."><button type="submit" class="btn-primary">Retry</button></form>
+    <form method="post" action="/operator/cases/{{ case.id }}/retry" hx-post="/operator/cases/{{ case.id }}/retry" hx-target="#case-detail" hx-swap="innerHTML" hx-disabled-elt="this" hx-confirm="Retry this case? It re-enters the queue and a new triage attempt may be dispatched."><button type="submit" class="{{ 'btn-primary' if not triage.reconcile_session else '' }}">{{ 'Retry (replacement triage)' if case.state == 'HUMAN_BLOCKED' else 'Retry' }}</button></form>
     {% endif %}
     {% if actions.retry %}
     <form method="post" action="/operator/cases/{{ case.id }}/retry" hx-post="/operator/cases/{{ case.id }}/retry" hx-target="#case-detail" hx-swap="innerHTML" hx-disabled-elt="this" hx-confirm="Start a NEW paid Devin remediation attempt for this case? This consumes ACU budget."><button type="submit" class="btn-primary">Retry remediation (new attempt)</button></form>
@@ -19,10 +23,13 @@
     <span class="spacer" aria-hidden="true"></span>
     <form method="post" action="/operator/cases/{{ case.id }}/cancel" hx-post="/operator/cases/{{ case.id }}/cancel" hx-target="#case-detail" hx-swap="innerHTML" hx-disabled-elt="this" hx-confirm="Cancel this case? Any live Devin session owned by it is terminated and the case becomes terminal. This cannot be undone."><button type="submit" class="btn-danger">Cancel case</button></form>
     {% endif %}
-    {% if terminal and not legacy_retry and not actions.retry and not actions.retry_ci and not actions.retry_probe %}
+    {% if terminal and not legacy_retry and not triage.reconcile_session and not actions.retry and not actions.retry_ci and not actions.retry_probe %}
     <span class="muted">No operator actions: case is terminal.</span>
     {% endif %}
   </div>
+  {% if triage.reconcile_session %}
+  <p class="notice">This case still retains a Devin session. Reconcile it first: a session that reports “awaiting instructions” after submitting structured output is complete, not blocked. A replacement triage is only offered once the retained session is proven empty or gone.</p>
+  {% endif %}
   {% if case.state == "AWAITING_REMEDIATION_APPROVAL" %}
   <p class="notice">Remediation approval happens in Slack (approve/reject buttons on the notification). Operators cannot approve from the dashboard.</p>
   {% endif %}

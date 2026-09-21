@@ -24,7 +24,9 @@ from ..lifecycle import CaseState, InvalidTransition
 from ..metrics import worker_transient_db_errors_total
 from ..models import (
     ACTIVE_ATTEMPT_STATUSES,
+    RECONCILED_NO_OUTPUT_PREFIX,
     Attempt,
+    AttemptKind,
     AttemptStatus,
     Case,
     EventStatus,
@@ -53,6 +55,23 @@ CLAIMABLE_STATES = (
         }
     )
     | REMEDIATION_WORK_STATES
+)
+# HUMAN_BLOCKED is claimable only while a blocked triage attempt still retains a remote
+# session that has not been proven gone: the worker re-reads it (GET only) so structured
+# output submitted by an otherwise idle session is ingested without a replacement POST.
+RECONCILABLE_BLOCKED_ATTEMPT = exists(
+    select(Attempt.id).where(
+        Attempt.case_id == Case.id,
+        Attempt.kind == AttemptKind.TRIAGE,
+        Attempt.status == AttemptStatus.BLOCKED,
+        Attempt.devin_session_id.is_not(None),
+        (
+            Attempt.reconciliation_reason.is_(None)
+            | Attempt.reconciliation_reason.not_like(
+                f"{RECONCILED_NO_OUTPUT_PREFIX}: session % no longer exists"
+            )
+        ),
+    )
 )
 
 logger = logging.getLogger(__name__)
@@ -178,7 +197,8 @@ class Worker:
                 case = await session.scalar(
                     select(Case)
                     .where(
-                        Case.state.in_(CLAIMABLE_STATES),
+                        Case.state.in_(CLAIMABLE_STATES)
+                        | ((Case.state == CaseState.HUMAN_BLOCKED) & RECONCILABLE_BLOCKED_ATTEMPT),
                         (Case.lease_expires_at.is_(None) | (Case.lease_expires_at < now)),
                         ~active_event,
                     )
@@ -228,6 +248,10 @@ class Worker:
             elif state == CaseState.CI_PENDING:
                 backoff = datetime.now(UTC) + timedelta(
                     seconds=self.settings.ci_poll_interval_seconds
+                )
+            elif state == CaseState.HUMAN_BLOCKED:
+                backoff = datetime.now(UTC) + timedelta(
+                    seconds=self.settings.human_blocked_reconcile_interval_seconds
                 )
             await session.execute(
                 update(Case)

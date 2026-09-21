@@ -39,9 +39,9 @@ from ..devin.prompt import (
     render_triage_prompt,
 )
 from ..devin.remediation import REMEDIATION_OUTPUT_SCHEMA
-from ..devin.status import Disposition, classify
+from ..devin.status import Disposition, StatusMapping, classify
 from ..devin.tags import correlation_tags, operation_key, remediation_operation_key
-from ..devin.triage import TRIAGE_OUTPUT_SCHEMA
+from ..devin.triage import TRIAGE_OUTPUT_SCHEMA, TriageValidationError, validate_triage_output
 from ..github_refs import BaseCommitResolutionError, BaseCommitResolver
 from ..lifecycle import (
     REMEDIATION_PHASE,
@@ -59,6 +59,7 @@ from ..models import (
     ACU_REPORT_NOT_ATTEMPTED,
     CANCEL_TERMINATION_REASON,
     FAILURE_CLASS_SESSION,
+    RECONCILED_NO_OUTPUT_PREFIX,
     UNRESOLVED_CREATE_ACK,
     WORKER_ERROR_TERMINATION_PREFIX,
     ApprovalRequest,
@@ -409,6 +410,106 @@ class DevinRunner:
         await self._settle_capacity(outcome)
         return outcome
 
+    # ------------------------------------------------------------- reconcile
+
+    async def blocked_attempts_with_session(self, kind: AttemptKind) -> list[Attempt]:
+        """BLOCKED attempts of `kind` that still retain a remote session id, newest first."""
+        return list(
+            (
+                await self.session.scalars(
+                    select(Attempt)
+                    .where(
+                        Attempt.case_id == self.case.id,
+                        Attempt.kind == kind,
+                        Attempt.status == AttemptStatus.BLOCKED,
+                        Attempt.devin_session_id.is_not(None),
+                    )
+                    .order_by(desc(Attempt.started_at), desc(Attempt.id))
+                )
+            ).all()
+        )
+
+    async def reconcile_blocked(self, kind: AttemptKind) -> RunOutcome | None:
+        """Re-read the retained sessions of a HUMAN_BLOCKED case; never POST.
+
+        Each BLOCKED attempt that still holds a session id is re-read with a single GET,
+        newest first. The first snapshot that carries structured output is ingested on its
+        *original* attempt (operation key and audit trail preserved) and the case leaves
+        HUMAN_BLOCKED through TRIAGING, exactly as a live poll would have settled it. Any
+        newer blocked attempt without output is superseded so the ingested attempt is the
+        case's current triage round. Attempts whose session has no output (or no longer
+        exists) are annotated with `RECONCILED_NO_OUTPUT_PREFIX`, which is what permits a
+        replacement later. Returns the settled outcome, or None when nothing was ingested.
+        """
+        self.phase = phase_for_kind(kind)
+        candidates = await self.blocked_attempts_with_session(kind)
+        with_output: list[tuple[Attempt, SessionSnapshot, bool]] = []
+        for attempt in candidates:
+            session_id = attempt.devin_session_id
+            assert session_id is not None
+            try:
+                snapshot = await self.devin.get_session(session_id)
+            except DevinSessionNotFound:
+                attempt.reconciliation_reason = (
+                    f"{RECONCILED_NO_OUTPUT_PREFIX}: session {session_id} no longer exists"
+                )
+                await self.session.commit()
+                continue
+            except DevinError as exc:
+                attempt.reconciliation_reason = f"reconcile GET failed: {exc}"
+                await self.session.commit()
+                continue
+            await self._record_poll(attempt, snapshot)
+            if snapshot.structured_output is None:
+                attempt.reconciliation_reason = (
+                    f"{RECONCILED_NO_OUTPUT_PREFIX}: session {snapshot.status}"
+                    f"/{snapshot.status_detail or 'no detail'}"
+                )
+                await self.session.commit()
+                continue
+            with_output.append(
+                (attempt, snapshot, self._output_is_valid(kind, snapshot.structured_output))
+            )
+        if not with_output:
+            return None
+        # Newest valid output wins; only when no retained output is valid does the newest
+        # (malformed) one settle the case through the ordinary malformed-output failure.
+        chosen = next((entry for entry in with_output if entry[2]), with_output[0])
+        attempt, snapshot, _ = chosen
+        session_id = attempt.devin_session_id
+        reason = (
+            f"reconciled retained Devin session {session_id}: structured output present "
+            f"({snapshot.status}/{snapshot.status_detail or 'no detail'})"
+        )
+        for other in candidates:
+            if other.id != attempt.id and other.status == AttemptStatus.BLOCKED:
+                other.status = AttemptStatus.CANCELLED
+                other.error = f"superseded by reconciled attempt {attempt.operation_key}"
+        attempt.status = AttemptStatus.RUNNING
+        attempt.error = None
+        attempt.reconciliation_reason = None
+        self.case.failure_reason = None
+        if CaseState(self.case.state) == self.phase.human_blocked:
+            await self._transition(self.phase.running, reason)
+        await self.session.commit()
+        metrics.reconciliations_total.labels(
+            metrics.mode(), "blocked_session", "structured_output"
+        ).inc()
+        outcome = await self._settle(attempt, snapshot, Disposition.FINISHED, reason)
+        await self._report_consumption(attempt)
+        await self.session.commit()
+        return outcome
+
+    @staticmethod
+    def _output_is_valid(kind: AttemptKind, output: dict[str, Any]) -> bool:
+        if kind != AttemptKind.TRIAGE:
+            return True
+        try:
+            validate_triage_output(output)
+        except TriageValidationError:
+            return False
+        return True
+
     # ---------------------------------------------------------------- create
 
     async def _create(self, kind: AttemptKind) -> Attempt | RunOutcome:
@@ -536,6 +637,13 @@ class DevinRunner:
             if attempt.devin_session_id is None:
                 continue
             try:
+                snapshot = await self.devin.get_session(attempt.devin_session_id)
+                if snapshot.structured_output is not None:
+                    return (
+                        f"attempt {attempt.operation_key} retains Devin session "
+                        f"{attempt.devin_session_id} with structured output; reconcile the "
+                        "existing session instead of creating a replacement"
+                    )
                 await self.devin.terminate_session(attempt.devin_session_id)
             except DevinSessionNotFound:
                 pass
@@ -803,7 +911,7 @@ class DevinRunner:
                 continue
             consecutive_errors = 0
             await self._record_poll(attempt, snapshot)
-            mapping = classify(snapshot.status, snapshot.status_detail)
+            mapping = self._disposition(snapshot)
             if mapping.disposition == Disposition.UNKNOWN:
                 attempt.status = AttemptStatus.RECONCILING
                 attempt.reconciliation_reason = mapping.reason
@@ -827,6 +935,29 @@ class DevinRunner:
         if state != CaseState(self.case.state):
             await self.session.refresh(self.case)
         return state in TERMINATION_PENDING_STATES
+
+    @staticmethod
+    def _disposition(snapshot: SessionSnapshot) -> StatusMapping:
+        """Status mapping with structured output taking precedence over an idle session.
+
+        An interactive Devin session reports ``waiting_for_user`` ("awaiting instructions")
+        after it has completed its task and submitted ``structured_output``. That is not a
+        blocking question: when the snapshot carries structured output the attempt is
+        settled as FINISHED and the output is validated downstream (a malformed document
+        fails the attempt there). Only a waiting session *without* output is a human block.
+        Only structured API fields are consulted; chat text is never inspected.
+        """
+        mapping = classify(snapshot.status, snapshot.status_detail)
+        if (
+            mapping.disposition == Disposition.WAITING_FOR_HUMAN
+            and snapshot.structured_output is not None
+        ):
+            return StatusMapping(
+                Disposition.FINISHED,
+                f"structured output submitted ({mapping.reason}; treated as finished)",
+                mapping.remote_terminal,
+            )
+        return mapping
 
     async def _settle(
         self, attempt: Attempt, snapshot: SessionSnapshot, disposition: Disposition, reason: str
@@ -878,7 +1009,7 @@ class DevinRunner:
             logger.warning("final GET for %s failed: %s", session_id, exc)
         if final is not None:
             await self._record_poll(attempt, final)
-            mapping = classify(final.status, final.status_detail)
+            mapping = self._disposition(final)
             if mapping.disposition in {
                 Disposition.FINISHED,
                 Disposition.WAITING_FOR_HUMAN,

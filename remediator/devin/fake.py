@@ -36,6 +36,12 @@ class FakeScenario(StrEnum):
     NO_CHANGE_NEEDED = "no_change_needed"
     ERROR = "error"
     WAITING_FOR_HUMAN = "waiting_for_human"
+    # An interactive session that completed its task, submitted structured output and then
+    # went idle ("Devin is awaiting instructions"): status running/waiting_for_user *with*
+    # structured output attached. Not a human block.
+    IDLE_WITH_OUTPUT = "idle_with_output"
+    IDLE_WITH_NEEDS_HUMAN_OUTPUT = "idle_with_needs_human_output"
+    IDLE_WITH_MALFORMED_OUTPUT = "idle_with_malformed_output"
     MALFORMED_OUTPUT = "malformed_output"
     MISSING_OUTPUT = "missing_output"
     UNCERTAIN_CREATE = "uncertain_create"
@@ -54,6 +60,8 @@ FIXTURE_SCENARIOS: dict[int, FakeScenario] = {
     4655: FakeScenario.MISSING_OUTPUT,
     4666: FakeScenario.UNKNOWN_STATUS,
     4677: FakeScenario.CREATE_REJECTED,
+    4811: FakeScenario.IDLE_WITH_OUTPUT,
+    4822: FakeScenario.IDLE_WITH_MALFORMED_OUTPUT,
 }
 
 
@@ -293,6 +301,11 @@ class FakeDevinClient:
     async def aclose(self) -> None:
         return None
 
+    def set_scenario(self, session_id: str, scenario: FakeScenario) -> None:
+        """Change what an existing fake session reports from now on (e.g. a session that
+        was waiting for a human later submits structured output)."""
+        self._sessions[session_id].scenario = scenario
+
     def _state(self, fake: _FakeSession, advance: bool) -> tuple[str, str | None]:
         if fake.terminated:
             return "exit", "user_request"
@@ -305,7 +318,12 @@ class FakeDevinClient:
         match fake.scenario:
             case FakeScenario.ERROR:
                 return "error", "error"
-            case FakeScenario.WAITING_FOR_HUMAN:
+            case (
+                FakeScenario.WAITING_FOR_HUMAN
+                | FakeScenario.IDLE_WITH_OUTPUT
+                | FakeScenario.IDLE_WITH_NEEDS_HUMAN_OUTPUT
+                | FakeScenario.IDLE_WITH_MALFORMED_OUTPUT
+            ):
                 return "running", "waiting_for_user"
             case FakeScenario.QUOTA:
                 return "suspended", "out_of_credits"
@@ -317,7 +335,15 @@ class FakeDevinClient:
                 return "running", "finished"
 
     def _output(self, fake: _FakeSession, status: str, detail: str | None) -> dict[str, Any] | None:
-        if detail != "finished" or status != "running":
+        idle_with_output = fake.scenario in {
+            FakeScenario.IDLE_WITH_OUTPUT,
+            FakeScenario.IDLE_WITH_NEEDS_HUMAN_OUTPUT,
+            FakeScenario.IDLE_WITH_MALFORMED_OUTPUT,
+        }
+        if idle_with_output:
+            if status != "running" or detail != "waiting_for_user":
+                return None
+        elif detail != "finished" or status != "running":
             return None
         repository = tag_value(fake.tags, "repo:") or "apache/superset"
         if fake.kind == "REMEDIATION":
@@ -336,9 +362,9 @@ class FakeDevinClient:
                 branch_prefix=prefix_match.group(1) if prefix_match else "devin/",
             )
         match fake.scenario:
-            case FakeScenario.MALFORMED_OUTPUT:
+            case FakeScenario.MALFORMED_OUTPUT | FakeScenario.IDLE_WITH_MALFORMED_OUTPUT:
                 return {"schema_version": TRIAGE_SCHEMA_VERSION, "outcome": "maybe", "summary": 1}
-            case FakeScenario.NEEDS_HUMAN:
+            case FakeScenario.NEEDS_HUMAN | FakeScenario.IDLE_WITH_NEEDS_HUMAN_OUTPUT:
                 return sample_triage_output(fake.issue_number, repository, "needs_human")
             case FakeScenario.DETERMINISTIC_AUTOMATION:
                 return sample_triage_output(
