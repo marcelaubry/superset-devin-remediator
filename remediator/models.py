@@ -241,6 +241,9 @@ class Case(Base):
     probe_snapshots: Mapped[list["ProbeSnapshot"]] = relationship(
         order_by="ProbeSnapshot.created_at"
     )
+    canary_overrides: Mapped[list["CanaryProbeOverride"]] = relationship(
+        order_by="CanaryProbeOverride.created_at"
+    )
 
 
 class Attempt(Base):
@@ -310,6 +313,11 @@ class Attempt(Base):
     triage_result_hash: Mapped[str | None] = mapped_column(String(64))
     probe_snapshot_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("probe_snapshots.id", ondelete="SET NULL")
+    )
+    # Canary-only: this attempt was authorised without an immutable probe, so no BASE or
+    # HEAD probe evidence exists and none may ever be claimed for it.
+    canary_probe_override: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False
     )
     devin_pull_requests: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB)
     pr_url: Mapped[str | None] = mapped_column(Text)
@@ -517,6 +525,33 @@ class CiSnapshot(Base):
         DateTime(timezone=True), server_default=func.now(), default=lambda: datetime.now(UTC)
     )
     attempt: Mapped[Attempt] = relationship(back_populates="ci_snapshots")
+
+
+class CanaryProbeOverride(Base):
+    """Append-only audit record of one `CANARY_PROBE_OVERRIDE` decision.
+
+    Written once per case when `LIVE_CANARY_ALLOW_MISSING_PROBE` lets an approved case
+    dispatch with no registered probe. It is evidence of what was *skipped*; it is never
+    probe evidence and never records a probe verdict.
+    """
+
+    __tablename__ = "canary_probe_overrides"
+    __table_args__ = (
+        UniqueConstraint("case_id", "triage_result_hash", name="uq_canary_override_case_hash"),
+    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    case_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("cases.id", ondelete="CASCADE"))
+    repository: Mapped[str] = mapped_column(String(255))
+    issue_number: Mapped[int] = mapped_column(Integer)
+    triage_result_hash: Mapped[str] = mapped_column(String(64))
+    base_sha: Mapped[str] = mapped_column(String(64))
+    actor: Mapped[str] = mapped_column(String(255))
+    approved_by: Mapped[str | None] = mapped_column(String(255))
+    reason: Mapped[str] = mapped_column(Text)
+    warning: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
 
 
 class StateTransition(Base):

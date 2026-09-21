@@ -41,17 +41,23 @@ class RemediationPromptInput:
     issue_url: str
     triage_output: dict[str, Any]
     triage_result_hash: str
-    probe_identifier: str
-    probe_hash: str
-    probe_script: str
-    probe_expected_base_exit: int
-    probe_expected_head_exit: int
     probe_registry_path: str
     approved_by: str
     approved_at: str
     operation_key: str
     case_id: str
     attempt_id: str
+    # Absent under the canary-only probe override: no immutable probe is registered, so the
+    # prompt must not describe one or ask for probe identity in the structured output.
+    probe_identifier: str | None = None
+    probe_hash: str | None = None
+    probe_script: str | None = None
+    probe_expected_base_exit: int | None = None
+    probe_expected_head_exit: int | None = None
+
+    @property
+    def has_probe(self) -> bool:
+        return self.probe_identifier is not None
 
 
 @lru_cache
@@ -111,7 +117,7 @@ def render_remediation_prompt(
     nonce = nonce or secrets.token_hex(8)
     boundary = _boundary(nonce)
     _check_boundary(boundary, data.issue_body, data.issue_title)
-    if "```" in data.probe_script:
+    if data.probe_script is not None and "```" in data.probe_script:
         raise ValueError("probe script contains a fenced-code delimiter")
     triage = data.triage_output
     template = _environment().get_template(f"{version}.md")
@@ -138,9 +144,10 @@ def render_remediation_prompt(
             "focused_tests": list(triage.get("focused_tests") or []) or ["(none listed)"],
         },
         triage_result_hash=data.triage_result_hash,
+        has_probe=data.has_probe,
         probe_identifier=data.probe_identifier,
         probe_hash=data.probe_hash,
-        probe_script=data.probe_script.rstrip("\n"),
+        probe_script=(data.probe_script or "").rstrip("\n"),
         probe_expected_base_exit=data.probe_expected_base_exit,
         probe_expected_head_exit=data.probe_expected_head_exit,
         probe_registry_path=data.probe_registry_path,

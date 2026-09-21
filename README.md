@@ -208,6 +208,15 @@ spend zero ACUs.
   label, every concurrency limit at 1, remote verifier, secure cookies, no fake
   evidence next to a live session). Activation order, emergency stop and the
   evidence checklist are in [docs/canary-runbook.md](docs/canary-runbook.md).
+- **Emergency canary probe override:** `LIVE_CANARY_ALLOW_MISSING_PROBE=true`
+  (default `false`, only valid inside the canary envelope with
+  `MAX_CONCURRENT_REMEDIATION=1`) lets the human Slack approval start one
+  bounded remediation session when no immutable probe is registered. It skips
+  only probe registration and the BASE/HEAD probe runs; PR validation and
+  exact-head CI still gate the case, no probe evidence is recorded, and the
+  case, dashboard, Slack updates, metrics and the append-only
+  `CANARY_PROBE_OVERRIDE` audit row all disclose that behavioural correctness
+  was not verified.
 - **Request hardening:** body-size limit (`413`), Origin/CSRF checks and a
   rate limit on operator mutations, security headers, SSRF validation of
   provider/verifier URLs, secret redaction in nested errors, allowlisted-host
@@ -343,6 +352,7 @@ failed termination, concurrent retries, and worker restart in every state.
 | `GITHUB_BASE_REF` | `master` | Branch whose current tip is resolved and pinned as the base SHA of every live session; no SHA is ever configured |
 | `GITHUB_BASE_SHA_REFERENCE` | *(empty)* | Readiness-only: last human-verified base SHA; `make readiness` warns when the live tip differs. Never used by the pipeline |
 | `LIVE_CANARY` | `false` | Opt-in fail-closed envelope for the first live run: one allowlisted repository, intake label set and distinct from the remediation label, every `MAX_CONCURRENT_*` = 1, remote verifier, secure cookies with live providers, GitHub + Slack live whenever Devin is (see `docs/canary-runbook.md`) |
+| `LIVE_CANARY_ALLOW_MISSING_PROBE` | `false` | Emergency canary-only: accept a missing probe registration and skip the BASE/HEAD probe runs for an already Slack-approved case. Refuses to start unless `LIVE_CANARY=true`, `GITHUB_REQUIRED_LABEL` is set and `MAX_CONCURRENT_REMEDIATION=1`; every other gate, PR validation and exact-head CI still apply and the result is disclosed as behaviourally unverified |
 | `WORKER_POLL_INTERVAL_SECONDS` | `1.0` | Worker idle poll interval |
 | `WORKER_CONCURRENCY` | `2` | Concurrent worker loops. Safe at 2+: case processor and outbox dispatcher share one lock order (case → approval request → outbox row, all `FOR NO KEY UPDATE`), and a deadlock/serialization failure releases the lease for retry instead of failing the case |
 | `WORKER_LEASE_SECONDS` | `300` | Case and webhook ownership lease |

@@ -9,12 +9,13 @@ from typing import Any, cast
 from uuid import uuid4
 
 import asyncpg
-from sqlalchemy import exists, select, update
+from sqlalchemy import exists, false, select, update
 from sqlalchemy.exc import DBAPIError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import metrics
 from ..adapters import build_github_client, build_slack_client
+from ..canary import MISSING_PROBE_BLOCK_PREFIX
 from ..capacity import CapacityManager
 from ..config import Settings
 from ..db import build_engine, build_session_factory
@@ -72,6 +73,13 @@ RECONCILABLE_BLOCKED_ATTEMPT = exists(
             )
         ),
     )
+)
+
+# REMEDIATION_HUMAN_BLOCKED is claimable only while the canary override is enabled and the
+# sole recorded blocker is the missing acceptance probe; the pipeline then re-validates
+# every dispatch precondition before anything is created.
+MISSING_PROBE_BLOCKED = (Case.state == CaseState.REMEDIATION_HUMAN_BLOCKED) & (
+    Case.failure_reason.like(f"{MISSING_PROBE_BLOCK_PREFIX}%no approved probe registered%")
 )
 
 logger = logging.getLogger(__name__)
@@ -198,7 +206,12 @@ class Worker:
                     select(Case)
                     .where(
                         Case.state.in_(CLAIMABLE_STATES)
-                        | ((Case.state == CaseState.HUMAN_BLOCKED) & RECONCILABLE_BLOCKED_ATTEMPT),
+                        | ((Case.state == CaseState.HUMAN_BLOCKED) & RECONCILABLE_BLOCKED_ATTEMPT)
+                        | (
+                            MISSING_PROBE_BLOCKED
+                            if self.settings.live_canary_allow_missing_probe
+                            else false()
+                        ),
                         (Case.lease_expires_at.is_(None) | (Case.lease_expires_at < now)),
                         ~active_event,
                     )
@@ -249,7 +262,7 @@ class Worker:
                 backoff = datetime.now(UTC) + timedelta(
                     seconds=self.settings.ci_poll_interval_seconds
                 )
-            elif state == CaseState.HUMAN_BLOCKED:
+            elif state in {CaseState.HUMAN_BLOCKED, CaseState.REMEDIATION_HUMAN_BLOCKED}:
                 backoff = datetime.now(UTC) + timedelta(
                     seconds=self.settings.human_blocked_reconcile_interval_seconds
                 )

@@ -307,6 +307,15 @@ for _state in _ACTIVE - REMEDIATION_PHASE_STATES:
         {CaseState.FAILED, CaseState.CANCELLED, CaseState.TERMINATION_PENDING}
     )
 
+# Edges that exist *only* for an attempt carrying `Attempt.canary_probe_override`: they
+# are the two probe gates the override skips, and are rejected on every other case.
+CANARY_PROBE_OVERRIDE_TRANSITIONS: dict[CaseState, frozenset[CaseState]] = {
+    # No probe is registered, so there is no BASE gate to run before the create intent.
+    CaseState.REMEDIATION_APPROVED: frozenset({CaseState.REMEDIATION_CREATE_INTENT}),
+    # The PR was corroborated by GitHub, but no HEAD probe exists to run against it.
+    CaseState.PR_VALIDATING: frozenset({CaseState.PR_VALIDATED}),
+}
+
 
 @dataclass(frozen=True)
 class PhaseStates:
@@ -363,9 +372,13 @@ async def transition(
     actor: str,
     *,
     expected_claimed_by: str | None = None,
+    canary_probe_override: bool = False,
 ) -> None:
     from_state = CaseState(case.state)
-    if to_state not in TRANSITIONS[from_state]:
+    allowed = TRANSITIONS[from_state]
+    if canary_probe_override:
+        allowed = allowed | CANARY_PROBE_OVERRIDE_TRANSITIONS.get(from_state, frozenset())
+    if to_state not in allowed:
         raise InvalidTransition(f"{from_state} cannot transition to {to_state}")
     from . import metrics
     from .models import Case, StateTransition

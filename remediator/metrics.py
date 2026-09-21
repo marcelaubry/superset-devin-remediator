@@ -127,6 +127,14 @@ probe_outcomes_total = Counter(
     ["mode", "target", "outcome"],  # outcome: expected|unexpected|infrastructure|busy
 )
 
+# Canary-only: a remediation was authorised with no acceptance probe registered. This is
+# a disclosure of *skipped* verification; it is never a probe outcome.
+canary_probe_overrides_total = Counter(
+    "canary_probe_overrides_total",
+    "Remediations dispatched without base/head acceptance-probe verification",
+    ["mode"],
+)
+
 ci_outcomes_total = Counter(
     "ci_outcomes_total", "CI verdicts recorded on validated PRs", ["mode", "outcome"]
 )

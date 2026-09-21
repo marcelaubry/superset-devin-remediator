@@ -11,11 +11,17 @@ described at the end. Nothing else.
    Never rebase onto or merge another ref.
 2. Create exactly one new branch named `{{ branch_prefix }}<short-unique-slug>`
    (it must start with `{{ branch_prefix }}`). Push only that branch.
-3. Reproduce the problem before changing code. The approved acceptance check is
+{% if has_probe %}3. Reproduce the problem before changing code. The approved acceptance check is
    the immutable probe described below. Run it first; if it already passes at
    `{{ base_sha }}`, do not change code: return outcome `no_change_needed`
    without opening a PR.
-4. Make the smallest correct change that fixes the root cause.
+{% else %}3. Reproduce the problem before changing code, using the acceptance criteria and
+   focused tests from the approved triage below. No immutable acceptance probe
+   is registered for this issue and none will be run for or against you: state
+   exactly how you reproduced the defect and how you verified the fix in
+   `summary` and `tests_run`. If you cannot reproduce it at `{{ base_sha }}`, do
+   not change code: return outcome `no_change_needed` without opening a PR.
+{% endif %}4. Make the smallest correct change that fixes the root cause.
 5. Never edit, move or delete: the probe registry ({{ probe_registry_path }}),
    anything under `.github/`, repository settings, CI/workflow configuration,
    branch protection, CODEOWNERS, pre-commit configuration, or files unrelated
@@ -56,7 +62,7 @@ described at the end. Nothing else.
   - `{{ test }}`
 {% endfor %}
 
-## Immutable probe (do not modify)
+{% if has_probe %}## Immutable probe (do not modify)
 
 - identifier: `{{ probe_identifier }}`
 - script sha256: `{{ probe_hash }}`
@@ -72,6 +78,13 @@ commit and your PR head. Your own results are not used as evidence.
 ```bash
 {{ probe_script }}
 ```
+{% else %}## No acceptance probe
+
+No immutable acceptance probe is registered for this issue, so this service will
+not run a base or head probe. Your change is corroborated only by the
+independent GitHub pull-request checks and the CI run for your exact head
+commit; a human reviews behavioural correctness. Do not claim probe evidence.
+{% endif %}
 
 ## Approval metadata
 
@@ -90,8 +103,8 @@ Provide structured output that validates against the attached JSON schema
 - `head_sha`, `branch` and `pr_url` must describe the pushed branch and draft
   PR exactly (or be `null` when no PR was opened).
 - `issue_reference` must be `{{ repository }}#{{ issue_number }}`.
-- `probe_identifier` and `probe_hash` must repeat the values above.
-- `changed_files`, `commits` and `tests_run` must be complete and accurate.
+{% if has_probe %}- `probe_identifier` and `probe_hash` must repeat the values above.
+{% endif %}- `changed_files`, `commits` and `tests_run` must be complete and accurate.
 
 ## UNTRUSTED GITHUB ISSUE CONTENT
 

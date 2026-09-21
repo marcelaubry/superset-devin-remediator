@@ -44,7 +44,11 @@ from .devin_runner import (
     fail_case,
     terminate_running_attempts,
 )
-from .remediation import REMEDIATION_WORK_STATES, RemediationPipeline
+from .remediation import (
+    REMEDIATION_WORK_STATES,
+    RemediationPipeline,
+    resumable_missing_probe_block,
+)
 
 __all__ = [
     "fail_case",
@@ -250,7 +254,9 @@ async def process_case(
     capacity = capacity or CapacityManager.from_settings(settings, claimed_by or "worker")
     state = CaseState(case.state)
     if state in REMEDIATION_PHASE_STATES:
-        if state not in REMEDIATION_WORK_STATES:
+        if state not in REMEDIATION_WORK_STATES and not resumable_missing_probe_block(
+            case, settings
+        ):
             return
         pipeline = RemediationPipeline(
             session,

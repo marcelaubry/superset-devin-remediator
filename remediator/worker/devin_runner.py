@@ -38,7 +38,10 @@ from ..devin.prompt import (
     render_remediation_prompt,
     render_triage_prompt,
 )
-from ..devin.remediation import REMEDIATION_OUTPUT_SCHEMA
+from ..devin.remediation import (
+    REMEDIATION_OUTPUT_SCHEMA,
+    REMEDIATION_OUTPUT_SCHEMA_WITHOUT_PROBE,
+)
 from ..devin.status import Disposition, StatusMapping, classify
 from ..devin.tags import correlation_tags, operation_key, remediation_operation_key
 from ..devin.triage import TRIAGE_OUTPUT_SCHEMA, TriageValidationError, validate_triage_output
@@ -137,13 +140,30 @@ class RemediationContext:
 
     approval: ApprovalRequest
     triage_output: dict[str, Any]
-    probe: ProbeSnapshot
-    base_execution: ProbeExecution
     base_ref: str
+    # Both are absent only under the canary-only probe override, where no probe is
+    # registered: `pinned_base_sha` then carries the base SHA resolved at dispatch.
+    probe: ProbeSnapshot | None = None
+    base_execution: ProbeExecution | None = None
+    pinned_base_sha: str | None = None
+    # Only a persisted `CanaryProbeOverride` may set this; a merely absent snapshot never
+    # authorises a session.
+    probe_override: bool = False
+
+    def __post_init__(self) -> None:
+        if self.probe_override:
+            if self.probe is not None or self.pinned_base_sha is None:
+                raise ValueError("probe override requires no snapshot and a pinned base SHA")
+        elif self.probe is None or self.base_execution is None:
+            raise ValueError("remediation context needs a probe snapshot and its BASE execution")
 
     @property
     def base_sha(self) -> str:
-        return self.probe.base_sha
+        if self.probe is not None:
+            return self.probe.base_sha
+        if self.pinned_base_sha is None:
+            raise ValueError("remediation context has neither a probe nor a pinned base SHA")
+        return self.pinned_base_sha
 
 
 async def active_attempts_with_session(session: AsyncSession, case_id: Any) -> list[Attempt]:
@@ -565,9 +585,12 @@ class DevinRunner:
         if context is not None and kind == AttemptKind.REMEDIATION:
             attempt.approval_request_id = context.approval.id
             attempt.triage_result_hash = context.approval.triage_result_hash
-            attempt.probe_snapshot_id = context.probe.id
             attempt.base_sha = context.base_sha
-            context.base_execution.attempt = attempt
+            attempt.canary_probe_override = context.probe_override
+            if context.probe is not None:
+                attempt.probe_snapshot_id = context.probe.id
+            if context.base_execution is not None:
+                context.base_execution.attempt = attempt
         self.session.add(attempt)
         await self.session.commit()
 
@@ -714,7 +737,9 @@ class DevinRunner:
         if context is None:
             return "remediation attempt requested without an approved dispatch context"
         probe = context.probe
-        if probe.repository != case.repository or probe.issue_number != case.issue_number:
+        if probe is not None and (
+            probe.repository != case.repository or probe.issue_number != case.issue_number
+        ):
             return "probe snapshot does not belong to this case"
         approval = context.approval
         approved_by = approval.decided_by_slack_user_id or "unknown"
@@ -733,12 +758,18 @@ class DevinRunner:
                     issue_url=str(issue.get("html_url") or case.issue_url),
                     triage_output=context.triage_output,
                     triage_result_hash=approval.triage_result_hash,
-                    probe_identifier=probe.probe_identifier,
-                    probe_hash=probe.script_hash,
-                    probe_script=probe.script_content,
-                    probe_expected_base_exit=probe.expected_base_exit_code,
-                    probe_expected_head_exit=probe.expected_head_exit_code,
-                    probe_registry_path=probe.manifest_path,
+                    probe_identifier=None if probe is None else probe.probe_identifier,
+                    probe_hash=None if probe is None else probe.script_hash,
+                    probe_script=None if probe is None else probe.script_content,
+                    probe_expected_base_exit=(
+                        None if probe is None else probe.expected_base_exit_code
+                    ),
+                    probe_expected_head_exit=(
+                        None if probe is None else probe.expected_head_exit_code
+                    ),
+                    probe_registry_path=(
+                        self.settings.probe_root if probe is None else probe.manifest_path
+                    ),
                     approved_by=approved_by,
                     approved_at=approved_at,
                     operation_key=attempt.operation_key,
@@ -763,7 +794,11 @@ class DevinRunner:
                     attempt.id,
                 )
             ),
-            structured_output_schema=REMEDIATION_OUTPUT_SCHEMA,
+            structured_output_schema=(
+                REMEDIATION_OUTPUT_SCHEMA_WITHOUT_PROBE
+                if context.probe_override
+                else REMEDIATION_OUTPUT_SCHEMA
+            ),
             title=f"Remediate {case.repository}#{case.issue_number}",
         )
 

@@ -114,8 +114,8 @@ def sample_remediation_output(
     issue_number: int,
     repository: str,
     base_sha: str,
-    probe_identifier: str,
-    probe_hash: str,
+    probe_identifier: str | None,
+    probe_hash: str | None,
     branch_prefix: str = "devin/",
 ) -> dict[str, Any]:
     fixture = remediation_fixture(issue_number)
@@ -138,7 +138,7 @@ def sample_remediation_output(
     head_sha = fake_head_sha(issue_number) if created else None
     if fixture == RemediationFixture.CONTRADICTORY_HEAD_SHA and head_sha is not None:
         head_sha = fake_head_sha(issue_number + 1)
-    return {
+    output: dict[str, Any] = {
         "schema_version": REMEDIATION_SCHEMA_VERSION,
         "outcome": outcome,
         "summary": f"simulated remediation of {repository}#{issue_number}: {outcome}",
@@ -152,11 +152,15 @@ def sample_remediation_output(
         ),
         "commits": [head_sha] if head_sha else [],
         "tests_run": ["pytest tests/unit_tests/views/test_core.py -q"] if created else [],
-        "probe_identifier": probe_identifier,
-        "probe_hash": probe_hash,
         "risks": ["simulated: low"],
         "blocking_questions": blocking,
     }
+    # A prompt that registers no probe gets no probe identity back: the canary-only
+    # override forbids invented probe evidence.
+    if probe_identifier is not None and probe_hash is not None:
+        output["probe_identifier"] = probe_identifier
+        output["probe_hash"] = probe_hash
+    return output
 
 
 def sample_triage_output(
@@ -357,8 +361,8 @@ class FakeDevinClient:
                 fake.issue_number,
                 repository,
                 fake.request.base_sha,
-                probe_identifier=id_match.group(1) if id_match else "unknown",
-                probe_hash=hash_match.group(1) if hash_match else "0" * 64,
+                probe_identifier=id_match.group(1) if id_match else None,
+                probe_hash=hash_match.group(1) if hash_match else None,
                 branch_prefix=prefix_match.group(1) if prefix_match else "devin/",
             )
         match fake.scenario:
