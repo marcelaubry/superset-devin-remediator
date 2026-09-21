@@ -23,6 +23,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import metrics
 from ..approvals import enqueue, is_current_request, open_request_for_case, triage_result_hash
+from ..canary import (
+    CANARY_OVERRIDE_ACTOR,
+    CANARY_OVERRIDE_REASON,
+    CANARY_OVERRIDE_WARNING,
+    CANARY_PROBE_OVERRIDE,
+    MISSING_PROBE_BLOCK_PREFIX,
+    is_missing_probe_block,
+    is_missing_probe_error,
+)
 from ..capacity import (
     CapacityDenied,
     CapacityManager,
@@ -44,7 +53,7 @@ from ..github.client import (
     PullRequestNotFound,
     PullRequestSnapshot,
 )
-from ..github_refs import BaseCommitResolver
+from ..github_refs import BaseCommitResolutionError, BaseCommitResolver
 from ..lifecycle import (
     REMEDIATION_SESSION_STATES,
     CaseState,
@@ -63,6 +72,7 @@ from ..models import (
     Attempt,
     AttemptKind,
     AttemptStatus,
+    CanaryProbeOverride,
     CapacityLeaseKind,
     Case,
     CiSnapshot,
@@ -174,6 +184,19 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
+def resumable_missing_probe_block(case: Case, settings: Settings) -> bool:
+    """A blocked case the canary override may re-evaluate: blocked *only* on a missing probe.
+
+    Nothing is authorised here — `_dispatch()` re-validates every precondition before any
+    session is created.
+    """
+    return (
+        settings.live_canary_allow_missing_probe
+        and CaseState(case.state) == CaseState.REMEDIATION_HUMAN_BLOCKED
+        and is_missing_probe_block(case.failure_reason)
+    )
+
+
 def parse_pr_url(url: str) -> tuple[str, int] | None:
     match = _PR_URL_RE.match(url.strip())
     if match is None:
@@ -269,6 +292,10 @@ async def remediation_progress(session: AsyncSession, case: Case) -> Remediation
     attempt = await latest_remediation_attempt(session, case.id)
     state = str(case.state)
     progress = RemediationProgress(case_state=state, headline=remediation_headline(state))
+    override = await session.scalar(
+        select(CanaryProbeOverride.id).where(CanaryProbeOverride.case_id == case.id).limit(1)
+    )
+    canary_warning = CANARY_OVERRIDE_WARNING if override is not None else None
     probe_base: str | None = None
     probe_head: str | None = None
     snapshot = await latest_probe_snapshot(session, case.id)
@@ -307,6 +334,7 @@ async def remediation_progress(session: AsyncSession, case: Case) -> Remediation
             headline=progress.headline,
             probe_base=probe_base,
             failure_reason=case.failure_reason if blocked else None,
+            canary_override_warning=canary_warning,
         )
     ci: CiSnapshot | None = await session.scalar(
         select(CiSnapshot)
@@ -334,6 +362,7 @@ async def remediation_progress(session: AsyncSession, case: Case) -> Remediation
         ci_summary=f"{ci.overall}: {ci.summary}" if ci is not None else None,
         failure_reason=failure,
         ready_for_review=CaseState(case.state) == CaseState.CI_PASSED,
+        canary_override_warning=canary_warning,
     )
 
 
@@ -382,6 +411,8 @@ class RemediationPipeline:
         case = self.case
         entered = CaseState(case.state)
         try:
+            if CaseState(case.state) == CaseState.REMEDIATION_HUMAN_BLOCKED:
+                await self._resume_missing_probe_block()
             if CaseState(case.state) == CaseState.REMEDIATION_APPROVED:
                 await self._dispatch()
             if CaseState(case.state) == CaseState.PROBE_VALIDATING_BASE:
@@ -440,7 +471,9 @@ class RemediationPipeline:
             await self._notify()
             await self.session.commit()
 
-    async def _transition(self, to_state: CaseState, reason: str) -> None:
+    async def _transition(
+        self, to_state: CaseState, reason: str, *, canary_probe_override: bool = False
+    ) -> None:
         await transition(
             self.session,
             self.case,
@@ -448,6 +481,7 @@ class RemediationPipeline:
             reason,
             "worker",
             expected_claimed_by=self.claimed_by,
+            canary_probe_override=canary_probe_override,
         )
 
     async def _fail(
@@ -587,7 +621,10 @@ class RemediationPipeline:
                 settings.probe_root_path, case.repository, case.issue_number
             )
         except ProbeRegistryError as exc:
-            await self._human_block(f"approved probe unavailable: {exc}", "dispatch")
+            if settings.live_canary_allow_missing_probe and is_missing_probe_error(str(exc)):
+                await self._dispatch_without_probe(request, str(exc))
+                return
+            await self._human_block(f"{MISSING_PROBE_BLOCK_PREFIX} {exc}", "dispatch")
             return
         snapshot = ProbeSnapshot(
             case_id=case.id,
@@ -613,6 +650,80 @@ class RemediationPipeline:
             f"dispatch preconditions satisfied; probe {probe.identifier} "
             f"({probe.script_hash[:12]}) snapshotted; reproducing at base {probe.base_sha[:12]}",
         )
+        await self.session.commit()
+
+    # -- canary-only probe override ----------------------------------------------------
+
+    async def _canary_override(self, triage_result_hash: str) -> CanaryProbeOverride | None:
+        record: CanaryProbeOverride | None = await self.session.scalar(
+            select(CanaryProbeOverride).where(
+                CanaryProbeOverride.case_id == self.case.id,
+                CanaryProbeOverride.triage_result_hash == triage_result_hash,
+            )
+        )
+        return record
+
+    async def _dispatch_without_probe(self, request: ApprovalRequest, detail: str) -> None:
+        """Emergency canary path: no probe is registered, so the human Slack approval alone
+        authorises the bounded session. Every other dispatch precondition already passed.
+
+        Only probe registration and the BASE/HEAD executions are skipped; nothing here
+        records probe evidence, and the case is disclosed as behaviourally unverified.
+        """
+        case = self.case
+        existing = await self._canary_override(request.triage_result_hash)
+        if existing is not None:
+            base_sha = existing.base_sha
+        else:
+            try:
+                base_sha = await self.resolver.resolve(
+                    case.repository, self.settings.github_base_ref
+                )
+            except BaseCommitResolutionError as exc:
+                raise TransientVerificationError(f"base SHA resolution failed: {exc}") from exc
+            self.session.add(
+                CanaryProbeOverride(
+                    case_id=case.id,
+                    repository=case.repository,
+                    issue_number=case.issue_number,
+                    triage_result_hash=request.triage_result_hash,
+                    base_sha=base_sha,
+                    actor=CANARY_OVERRIDE_ACTOR,
+                    approved_by=request.decided_by_slack_user_id,
+                    reason=CANARY_OVERRIDE_REASON,
+                    warning=CANARY_OVERRIDE_WARNING,
+                )
+            )
+            metrics.canary_probe_overrides_total.labels(metrics.mode()).inc()
+        case.failure_reason = None
+        await self._transition(
+            CaseState.REMEDIATION_CREATE_INTENT,
+            f"{CANARY_PROBE_OVERRIDE}: {CANARY_OVERRIDE_REASON} ({detail}); "
+            f"actor={CANARY_OVERRIDE_ACTOR} repository={case.repository} "
+            f"issue=#{case.issue_number} triage_hash={request.triage_result_hash} "
+            f"base={base_sha}; {CANARY_OVERRIDE_WARNING}",
+            canary_probe_override=True,
+        )
+        await self.session.commit()
+
+    async def _resume_missing_probe_block(self) -> None:
+        """Re-open a case blocked *solely* on a missing probe once the override is enabled.
+
+        Nothing is trusted from the blocked state: `_dispatch()` re-validates the approval,
+        the exact triage hash, the confirmed label webhook, the repository, active attempts
+        and capacity before anything is created.
+        """
+        case = self.case
+        if not self.settings.live_canary_allow_missing_probe:
+            return
+        if not is_missing_probe_block(case.failure_reason):
+            return
+        await self._transition(
+            CaseState.REMEDIATION_APPROVED,
+            f"{CANARY_PROBE_OVERRIDE} enabled: re-evaluating dispatch preconditions for the "
+            "approval already recorded; no new approval, triage or issue is requested",
+        )
+        case.failure_reason = None
         await self.session.commit()
 
     async def _matched_base_execution(self, snapshot: ProbeSnapshot) -> ProbeExecution | None:
@@ -641,7 +752,17 @@ class RemediationPipeline:
             return triage
         probe = await latest_probe_snapshot(self.session, self.case.id)
         if probe is None:
-            return "no probe snapshot was persisted at dispatch"
+            override = await self._canary_override(request.triage_result_hash)
+            if override is None:
+                return "no probe snapshot was persisted at dispatch"
+            self._request = request
+            return RemediationContext(
+                approval=request,
+                triage_output=triage,
+                base_ref=self.settings.github_base_ref,
+                pinned_base_sha=override.base_sha,
+                probe_override=True,
+            )
         base_execution = await self._matched_base_execution(probe)
         if base_execution is None:
             return (
@@ -717,7 +838,7 @@ class RemediationPipeline:
                 await self._transition(CaseState.REMEDIATION_CANCELLED, CANCEL_TERMINATION_REASON)
                 await self.session.commit()
                 return
-        if runner_context is not None:
+        if runner_context is not None and runner_context.probe is not None:
             await self._acquire_resource_keys(runner_context.probe)
         outcome = await runner.run(AttemptKind.REMEDIATION)
         if outcome.result not in {RunResult.TERMINATION_PENDING, RunResult.WAITING_FOR_CAPACITY}:
@@ -736,12 +857,15 @@ class RemediationPipeline:
 
     async def _validate_output(self, attempt: Attempt) -> None:
         case = self.case
-        snapshot = await self.session.get(ProbeSnapshot, attempt.probe_snapshot_id)
-        if snapshot is None:
+        override = attempt.canary_probe_override
+        snapshot = (
+            None if override else await self.session.get(ProbeSnapshot, attempt.probe_snapshot_id)
+        )
+        if snapshot is None and not override:
             await self._fail("attempt has no probe snapshot", "output", attempt=attempt)
             return
         try:
-            result = validate_remediation_output(attempt.structured_output)
+            result = validate_remediation_output(attempt.structured_output, probe=not override)
         except RemediationValidationError as exc:
             await self._fail(f"structured output invalid: {exc}", "output", attempt=attempt)
             return
@@ -753,14 +877,17 @@ class RemediationPipeline:
                 attempt=attempt,
             )
             return
-        if result.probe_hash != snapshot.script_hash:
-            await self._fail(
-                "structured output names a different probe hash", "output", attempt=attempt
-            )
-            return
-        if result.probe_identifier != snapshot.probe_identifier:
-            await self._fail("structured output names a different probe", "output", attempt=attempt)
-            return
+        if snapshot is not None:
+            if result.probe_hash != snapshot.script_hash:
+                await self._fail(
+                    "structured output names a different probe hash", "output", attempt=attempt
+                )
+                return
+            if result.probe_identifier != snapshot.probe_identifier:
+                await self._fail(
+                    "structured output names a different probe", "output", attempt=attempt
+                )
+                return
         parts = result.issue_reference_parts()
         if parts != (case.repository.lower(), case.issue_number):
             await self._fail(
@@ -787,6 +914,16 @@ class RemediationPipeline:
             if claimed:
                 await self._human_block(
                     "Devin reported no_change_needed but opened a PR: " + ", ".join(claimed),
+                    "output",
+                    attempt,
+                )
+                return
+            if snapshot is None:
+                # Canary override: nothing independent reproduced the defect, so the claim
+                # can only be judged by a human.
+                await self._human_block(
+                    "Devin reported no_change_needed and no acceptance probe exists to "
+                    f"contradict it ({CANARY_PROBE_OVERRIDE}): {result.summary}",
                     "output",
                     attempt,
                 )
@@ -867,7 +1004,9 @@ class RemediationPipeline:
     async def _validate_pull_request(self, attempt: Attempt) -> None:
         case = self.case
         settings = self.settings
-        result = validate_remediation_output(attempt.structured_output)
+        result = validate_remediation_output(
+            attempt.structured_output, probe=not attempt.canary_probe_override
+        )
         number = attempt.pr_number
         if number is None or attempt.head_sha is None:
             await self._fail("attempt lost its PR identity", "pr", attempt=attempt)
@@ -1065,6 +1204,16 @@ class RemediationPipeline:
         if human:
             await self._human_block(
                 f"PR #{number} needs a human: {'; '.join(human)}", "pr", attempt
+            )
+            return
+        if attempt.canary_probe_override:
+            # No probe exists to run at head; PR corroboration plus exact-head CI are the
+            # only machine evidence this case will ever have.
+            await self._transition(
+                CaseState.PR_VALIDATED,
+                f"PR #{number} corroborated by GitHub at {pull.head_sha[:12]}; "
+                f"head probe skipped ({CANARY_PROBE_OVERRIDE}). {CANARY_OVERRIDE_WARNING}",
+                canary_probe_override=True,
             )
             return
         await self._transition(

@@ -7,6 +7,9 @@
 {% if not ns.base and snap and snap.pre_session_executions %}{% set ns.base = snap.pre_session_executions[-1] %}{% endif %}
 <section id="side-probe" class="panel side-card" aria-labelledby="side-probe-title">
   <header class="panel-head"><h2 id="side-probe-title">Probe</h2>{% if ns.head %}{{ b.enum("verdict", ns.head.verdict) }}{% elif ns.base %}{{ b.enum("verdict", ns.base.verdict) }}{% endif %}</header>
+  {% if remediation.canary_override_warning %}
+  <p class="alert small"><strong>CANARY_PROBE_OVERRIDE</strong> — {{ remediation.canary_override_warning }}</p>
+  {% endif %}
   {% if snap %}
   <dl class="facts">
     <dt>Probe</dt><dd>{{ ui.ident(snap.probe_identifier, 28) }}</dd>

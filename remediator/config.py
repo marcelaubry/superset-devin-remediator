@@ -127,6 +127,11 @@ class Settings(BaseSettings):
     # Opt-in fail-closed envelope for the first live end-to-end run: exactly one allowlisted
     # repository, a mandatory intake label and every concurrency limit at 1.
     live_canary: bool = False
+    # Emergency canary-only escape hatch: with no approved probe registered for the issue,
+    # a human Slack approval alone authorises the bounded remediation session. Probe
+    # registration and both probe executions are skipped; PR and exact-head CI validation
+    # stay mandatory and the case is disclosed as behaviourally unverified.
+    live_canary_allow_missing_probe: bool = False
     devin_triage_max_acu: int = 5
     devin_triage_timeout_seconds: float = 1800.0
     devin_poll_interval_seconds: float = 15.0
@@ -477,6 +482,29 @@ class Settings(BaseSettings):
             for problem in self.canary_violations:
                 raise ValueError(f"LIVE_CANARY=true: {problem}")
         return self
+
+    @model_validator(mode="after")
+    def _validate_canary_probe_override(self) -> "Settings":
+        for problem in self.canary_probe_override_violations:
+            raise ValueError(f"LIVE_CANARY_ALLOW_MISSING_PROBE=true: {problem}")
+        return self
+
+    @property
+    def canary_probe_override_violations(self) -> list[str]:
+        """Safeguards the missing-probe override may never be enabled without."""
+        if not self.live_canary_allow_missing_probe:
+            return []
+        problems: list[str] = []
+        if not self.live_canary:
+            problems.append("LIVE_CANARY must be true")
+        if not self.github_required_label.strip():
+            problems.append("GITHUB_REQUIRED_LABEL must name the intake label")
+        if self.max_concurrent_remediation != CANARY_CONCURRENCY_LIMIT:
+            problems.append(
+                f"MAX_CONCURRENT_REMEDIATION must be {CANARY_CONCURRENCY_LIMIT}, "
+                f"got {self.max_concurrent_remediation}"
+            )
+        return problems
 
     @property
     def canary_violations(self) -> list[str]:

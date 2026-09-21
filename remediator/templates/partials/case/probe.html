@@ -26,6 +26,10 @@
   <header class="panel-head"><h2 id="probe-title">Probe verification</h2>{{ b.state(remediation.state) }}</header>
   <p class="muted small">Remediation (Phase 4) verification evidence.{% if remediation.ready_for_human_review %} This case is <strong>ready for human PR review</strong> — nothing is merged or closed automatically.{% endif %}</p>
   {% if remediation.failure_reason %}<p class="alert"><strong>Failure / blocked reason:</strong> {{ remediation.failure_reason }}</p>{% endif %}
+  {% for override in remediation.canary_probe_overrides %}
+  <p class="alert"><strong>CANARY_PROBE_OVERRIDE</strong> — {{ override.warning }}<br>
+    <span class="small">actor {{ override.actor }} · approved by {{ override.approved_by or "unknown" }} · {{ override.recorded_at }} · {{ override.repository }}#{{ override.issue_number }} · triage hash <code>{{ override.triage_result_hash }}</code> · pinned base <code>{{ override.base_sha }}</code> · reason: {{ override.reason }}</span></p>
+  {% endfor %}
   <h3>Pre-session BASE gate</h3>
   {% for snap in remediation.probe_snapshots %}
   <details {% if loop.last and not remediation.attempts %}open{% endif %}>

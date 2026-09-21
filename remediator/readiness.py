@@ -32,6 +32,7 @@ from pydantic import SecretStr, ValidationError
 from sqlalchemy import text
 
 from .adapters import SettingsRedactingFilter
+from .canary import CANARY_OVERRIDE_WARNING, CANARY_PROBE_OVERRIDE
 from .config import (
     CANARY_CONCURRENCY_LIMIT,
     DEFAULT_DEVIN_REPOS_FORMAT,
@@ -216,9 +217,10 @@ async def check_canary(settings: Settings, probes: Probes) -> list[CheckResult]:
     """The controlled-canary envelope (`LIVE_CANARY=true`): reported here so an operator sees
     every deviation at once; `Settings` refuses to start on the same list."""
     violations = settings.canary_violations
+    results = _probe_override_results(settings)
     if not settings.live_canary:
         if settings.live_mode:
-            return [
+            return results + [
                 CheckResult(
                     "canary.envelope",
                     "warn",
@@ -226,11 +228,11 @@ async def check_canary(settings: Settings, probes: Probes) -> list[CheckResult]:
                     + (f"; would fail: {'; '.join(violations)}" if violations else ""),
                 )
             ]
-        return [CheckResult("canary.envelope", "skip", "LIVE_CANARY=false")]
+        return results + [CheckResult("canary.envelope", "skip", "LIVE_CANARY=false")]
     if violations:
-        return [CheckResult("canary.envelope", "fail", "; ".join(violations))]
+        return results + [CheckResult("canary.envelope", "fail", "; ".join(violations))]
     (repository,) = settings.allowed_repositories
-    return [
+    return results + [
         CheckResult(
             "canary.envelope",
             "pass",
@@ -239,6 +241,27 @@ async def check_canary(settings: Settings, probes: Probes) -> list[CheckResult]:
             f"concurrency={CANARY_CONCURRENCY_LIMIT} modes="
             f"devin:{settings.devin_client_mode}/github:{settings.github_client_mode}/"
             f"slack:{settings.slack_client_mode}/probes:{settings.probe_runner_mode}",
+        )
+    ]
+
+
+def _probe_override_results(settings: Settings) -> list[CheckResult]:
+    """`LIVE_CANARY_ALLOW_MISSING_PROBE`: reported at every readiness run because it removes
+    the only independent behavioural evidence the pipeline has."""
+    if not settings.live_canary_allow_missing_probe:
+        return [
+            CheckResult("canary.probe_override", "pass", "LIVE_CANARY_ALLOW_MISSING_PROBE=false")
+        ]
+    violations = settings.canary_probe_override_violations
+    if violations:
+        return [CheckResult("canary.probe_override", "fail", "; ".join(violations))]
+    return [
+        CheckResult(
+            "canary.probe_override",
+            "warn",
+            "LIVE_CANARY_ALLOW_MISSING_PROBE=true: remediation may start with no acceptance "
+            "probe; base/head probe verification is skipped and "
+            f"{CANARY_PROBE_OVERRIDE} is recorded. " + CANARY_OVERRIDE_WARNING,
         )
     ]
 

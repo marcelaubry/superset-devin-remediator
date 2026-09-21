@@ -6,6 +6,7 @@ claim in it (PR URL, head SHA, branch, probe identity) is cross-checked against 
 `pull_requests[]`, GitHub and an independent probe run before the case advances.
 """
 
+import copy
 import json
 import re
 from dataclasses import dataclass
@@ -64,8 +65,31 @@ REMEDIATION_OUTPUT_SCHEMA: dict[str, Any] = {
     },
 }
 
+
+def _without_probe_fields(schema: dict[str, Any]) -> dict[str, Any]:
+    """Canary-only variant: no probe is registered, so no probe identity can be reported.
+
+    Dropping the fields is deliberate — an optional probe field would let a session invent
+    probe identity that nothing verified.
+    """
+    variant = copy.deepcopy(schema)
+    variant["title"] = "SupersetIssueRemediationWithoutProbe"
+    variant["required"] = [
+        name for name in variant["required"] if name not in {"probe_identifier", "probe_hash"}
+    ]
+    for name in ("probe_identifier", "probe_hash"):
+        variant["properties"].pop(name, None)
+    return variant
+
+
+REMEDIATION_OUTPUT_SCHEMA_WITHOUT_PROBE: dict[str, Any] = _without_probe_fields(
+    REMEDIATION_OUTPUT_SCHEMA
+)
+
 _validator = Draft7Validator(REMEDIATION_OUTPUT_SCHEMA)
+_validator_without_probe = Draft7Validator(REMEDIATION_OUTPUT_SCHEMA_WITHOUT_PROBE)
 Draft7Validator.check_schema(REMEDIATION_OUTPUT_SCHEMA)
+Draft7Validator.check_schema(REMEDIATION_OUTPUT_SCHEMA_WITHOUT_PROBE)
 assert len(json.dumps(REMEDIATION_OUTPUT_SCHEMA).encode()) < 64 * 1024
 
 _ISSUE_REF_RE = re.compile(r"^(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(?P<number>[1-9][0-9]*)$")
@@ -87,8 +111,8 @@ class RemediationResult:
     changed_files: tuple[str, ...]
     commits: tuple[str, ...]
     tests_run: tuple[str, ...]
-    probe_identifier: str
-    probe_hash: str
+    probe_identifier: str | None
+    probe_hash: str | None
     risks: tuple[str, ...]
     blocking_questions: tuple[str, ...]
     raw: dict[str, Any]
@@ -104,14 +128,17 @@ class RemediationResult:
         return match.group("repo").lower(), int(match.group("number"))
 
 
-def validate_remediation_output(output: object) -> RemediationResult:
+def validate_remediation_output(output: object, *, probe: bool = True) -> RemediationResult:
+    """Validate one remediation document. `probe=False` accepts the canary-only variant
+    produced when no immutable probe was registered for the issue."""
     if output is None:
         raise RemediationValidationError("structured output missing")
     if not isinstance(output, dict):
         raise RemediationValidationError(
             f"structured output is {type(output).__name__}, expected object"
         )
-    errors = sorted(_validator.iter_errors(output), key=lambda e: list(e.absolute_path))
+    validator = _validator if probe else _validator_without_probe
+    errors = sorted(validator.iter_errors(output), key=lambda e: list(e.absolute_path))
     if errors:
         first = errors[0]
         path = "/".join(str(p) for p in first.absolute_path) or "<root>"
@@ -127,8 +154,8 @@ def validate_remediation_output(output: object) -> RemediationResult:
         changed_files=tuple(str(f) for f in output["changed_files"]),
         commits=tuple(str(c) for c in output["commits"]),
         tests_run=tuple(str(t) for t in output["tests_run"]),
-        probe_identifier=str(output["probe_identifier"]),
-        probe_hash=str(output["probe_hash"]),
+        probe_identifier=str(output["probe_identifier"]) if probe else None,
+        probe_hash=str(output["probe_hash"]) if probe else None,
         risks=tuple(str(r) for r in output["risks"]),
         blocking_questions=tuple(str(q) for q in output["blocking_questions"]),
         raw=output,
