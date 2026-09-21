@@ -124,15 +124,10 @@ session_outcomes_total = Counter(
 probe_outcomes_total = Counter(
     "probe_outcomes_total",
     "Probe executions by target and verdict",
-    ["mode", "target", "outcome"],  # outcome: expected|unexpected|infrastructure|busy
-)
-
-# Canary-only: a remediation was authorised with no acceptance probe registered. This is
-# a disclosure of *skipped* verification; it is never a probe outcome.
-canary_probe_overrides_total = Counter(
-    "canary_probe_overrides_total",
-    "Remediations dispatched without base/head acceptance-probe verification",
-    ["mode"],
+    # outcome: expected|unexpected|infrastructure|busy|not_configured. `not_configured`
+    # (target `none`) counts cases dispatched under PROBE_POLICY=if_available with no
+    # registered probe: no probe ran, so it is neither a pass nor a failure.
+    ["mode", "target", "outcome"],
 )
 
 ci_outcomes_total = Counter(

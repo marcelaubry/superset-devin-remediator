@@ -78,6 +78,7 @@ from ..models import (
     ProbeSnapshot,
     WebhookEvent,
 )
+from ..probe_policy import ProbeStatus
 from ..safe_urls import safe_href
 
 logger = logging.getLogger(__name__)
@@ -141,19 +142,21 @@ class RemediationContext:
     approval: ApprovalRequest
     triage_output: dict[str, Any]
     base_ref: str
-    # Both are absent only under the canary-only probe override, where no probe is
-    # registered: `pinned_base_sha` then carries the base SHA resolved at dispatch.
+    # Both are absent only when no probe is registered under PROBE_POLICY=if_available:
+    # `pinned_base_sha` then carries the base SHA resolved at dispatch.
     probe: ProbeSnapshot | None = None
     base_execution: ProbeExecution | None = None
     pinned_base_sha: str | None = None
-    # Only a persisted `CanaryProbeOverride` may set this; a merely absent snapshot never
+    # Only a persisted `ProbePolicyDecision` may set this; a merely absent snapshot never
     # authorises a session.
-    probe_override: bool = False
+    probe_not_configured: bool = False
 
     def __post_init__(self) -> None:
-        if self.probe_override:
+        if self.probe_not_configured:
             if self.probe is not None or self.pinned_base_sha is None:
-                raise ValueError("probe override requires no snapshot and a pinned base SHA")
+                raise ValueError(
+                    "a not-configured probe status requires no snapshot and a pinned base SHA"
+                )
         elif self.probe is None or self.base_execution is None:
             raise ValueError("remediation context needs a probe snapshot and its BASE execution")
 
@@ -586,7 +589,11 @@ class DevinRunner:
             attempt.approval_request_id = context.approval.id
             attempt.triage_result_hash = context.approval.triage_result_hash
             attempt.base_sha = context.base_sha
-            attempt.canary_probe_override = context.probe_override
+            attempt.probe_status = (
+                ProbeStatus.NOT_CONFIGURED.value
+                if context.probe_not_configured
+                else ProbeStatus.VERIFIED.value
+            )
             if context.probe is not None:
                 attempt.probe_snapshot_id = context.probe.id
             if context.base_execution is not None:
@@ -796,7 +803,7 @@ class DevinRunner:
             ),
             structured_output_schema=(
                 REMEDIATION_OUTPUT_SCHEMA_WITHOUT_PROBE
-                if context.probe_override
+                if context.probe_not_configured
                 else REMEDIATION_OUTPUT_SCHEMA
             ),
             title=f"Remediate {case.repository}#{case.issue_number}",

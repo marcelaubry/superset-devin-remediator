@@ -23,15 +23,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import metrics
 from ..approvals import enqueue, is_current_request, open_request_for_case, triage_result_hash
-from ..canary import (
-    CANARY_OVERRIDE_ACTOR,
-    CANARY_OVERRIDE_REASON,
-    CANARY_OVERRIDE_WARNING,
-    CANARY_PROBE_OVERRIDE,
-    MISSING_PROBE_BLOCK_PREFIX,
-    is_missing_probe_block,
-    is_missing_probe_error,
-)
 from ..capacity import (
     CapacityDenied,
     CapacityManager,
@@ -80,10 +71,22 @@ from ..models import (
     NotificationOutbox,
     OutboxChannel,
     ProbeExecution,
+    ProbePolicyDecision,
     ProbeSnapshot,
     ProbeTarget,
     ProbeVerdict,
     PullRequestEvidence,
+)
+from ..probe_policy import (
+    LEGACY_CANARY_OVERRIDE_WARNING,
+    MISSING_PROBE_BLOCK_PREFIX,
+    PROBE_NOT_CONFIGURED,
+    PROBE_NOT_CONFIGURED_NOTE,
+    PROBE_NOT_CONFIGURED_REASON,
+    PROBE_POLICY_ACTOR,
+    ProbeStatus,
+    is_missing_probe_block,
+    is_missing_probe_error,
 )
 from ..probes.registry import (
     ProbeRegistryError,
@@ -185,13 +188,14 @@ def _now() -> datetime:
 
 
 def resumable_missing_probe_block(case: Case, settings: Settings) -> bool:
-    """A blocked case the canary override may re-evaluate: blocked *only* on a missing probe.
+    """A blocked case `PROBE_POLICY=if_available` may re-evaluate: blocked *only* on a
+    missing probe.
 
     Nothing is authorised here — `_dispatch()` re-validates every precondition before any
     session is created.
     """
     return (
-        settings.live_canary_allow_missing_probe
+        not settings.probe_required
         and CaseState(case.state) == CaseState.REMEDIATION_HUMAN_BLOCKED
         and is_missing_probe_block(case.failure_reason)
     )
@@ -292,10 +296,19 @@ async def remediation_progress(session: AsyncSession, case: Case) -> Remediation
     attempt = await latest_remediation_attempt(session, case.id)
     state = str(case.state)
     progress = RemediationProgress(case_state=state, headline=remediation_headline(state))
-    override = await session.scalar(
-        select(CanaryProbeOverride.id).where(CanaryProbeOverride.case_id == case.id).limit(1)
+    decision = await session.scalar(
+        select(ProbePolicyDecision.id).where(ProbePolicyDecision.case_id == case.id).limit(1)
     )
-    canary_warning = CANARY_OVERRIDE_WARNING if override is not None else None
+    probe_note = PROBE_NOT_CONFIGURED_NOTE if decision is not None else None
+    probe_note_legacy = False
+    if probe_note is None:
+        # Historical cases dispatched under the removed override keep their warning.
+        legacy = await session.scalar(
+            select(CanaryProbeOverride.id).where(CanaryProbeOverride.case_id == case.id).limit(1)
+        )
+        if legacy is not None:
+            probe_note = LEGACY_CANARY_OVERRIDE_WARNING
+            probe_note_legacy = True
     probe_base: str | None = None
     probe_head: str | None = None
     snapshot = await latest_probe_snapshot(session, case.id)
@@ -334,7 +347,8 @@ async def remediation_progress(session: AsyncSession, case: Case) -> Remediation
             headline=progress.headline,
             probe_base=probe_base,
             failure_reason=case.failure_reason if blocked else None,
-            canary_override_warning=canary_warning,
+            probe_status_note=probe_note,
+            probe_note_legacy=probe_note_legacy,
         )
     ci: CiSnapshot | None = await session.scalar(
         select(CiSnapshot)
@@ -362,7 +376,8 @@ async def remediation_progress(session: AsyncSession, case: Case) -> Remediation
         ci_summary=f"{ci.overall}: {ci.summary}" if ci is not None else None,
         failure_reason=failure,
         ready_for_review=CaseState(case.state) == CaseState.CI_PASSED,
-        canary_override_warning=canary_warning,
+        probe_status_note=probe_note,
+        probe_note_legacy=probe_note_legacy,
     )
 
 
@@ -472,7 +487,7 @@ class RemediationPipeline:
             await self.session.commit()
 
     async def _transition(
-        self, to_state: CaseState, reason: str, *, canary_probe_override: bool = False
+        self, to_state: CaseState, reason: str, *, probe_not_configured: bool = False
     ) -> None:
         await transition(
             self.session,
@@ -481,7 +496,7 @@ class RemediationPipeline:
             reason,
             "worker",
             expected_claimed_by=self.claimed_by,
-            canary_probe_override=canary_probe_override,
+            probe_not_configured=probe_not_configured,
         )
 
     async def _fail(
@@ -621,7 +636,7 @@ class RemediationPipeline:
                 settings.probe_root_path, case.repository, case.issue_number
             )
         except ProbeRegistryError as exc:
-            if settings.live_canary_allow_missing_probe and is_missing_probe_error(str(exc)):
+            if not settings.probe_required and is_missing_probe_error(str(exc)):
                 await self._dispatch_without_probe(request, str(exc))
                 return
             await self._human_block(f"{MISSING_PROBE_BLOCK_PREFIX} {exc}", "dispatch")
@@ -652,26 +667,27 @@ class RemediationPipeline:
         )
         await self.session.commit()
 
-    # -- canary-only probe override ----------------------------------------------------
+    # -- PROBE_POLICY=if_available with no registered probe ----------------------------
 
-    async def _canary_override(self, triage_result_hash: str) -> CanaryProbeOverride | None:
-        record: CanaryProbeOverride | None = await self.session.scalar(
-            select(CanaryProbeOverride).where(
-                CanaryProbeOverride.case_id == self.case.id,
-                CanaryProbeOverride.triage_result_hash == triage_result_hash,
+    async def _probe_policy_decision(self, triage_result_hash: str) -> ProbePolicyDecision | None:
+        record: ProbePolicyDecision | None = await self.session.scalar(
+            select(ProbePolicyDecision).where(
+                ProbePolicyDecision.case_id == self.case.id,
+                ProbePolicyDecision.triage_result_hash == triage_result_hash,
             )
         )
         return record
 
     async def _dispatch_without_probe(self, request: ApprovalRequest, detail: str) -> None:
-        """Emergency canary path: no probe is registered, so the human Slack approval alone
-        authorises the bounded session. Every other dispatch precondition already passed.
+        """No probe is registered and the policy is `if_available`, so the validated approval
+        and confirmed label authorise the bounded session. Every other dispatch precondition
+        already passed.
 
-        Only probe registration and the BASE/HEAD executions are skipped; nothing here
-        records probe evidence, and the case is disclosed as behaviourally unverified.
+        Only probe registration and the BASE/HEAD executions have nothing to run; nothing
+        here records probe evidence and the case reports `probe_status=not_configured`.
         """
         case = self.case
-        existing = await self._canary_override(request.triage_result_hash)
+        existing = await self._probe_policy_decision(request.triage_result_hash)
         if existing is not None:
             base_sha = existing.base_sha
         else:
@@ -682,46 +698,52 @@ class RemediationPipeline:
             except BaseCommitResolutionError as exc:
                 raise TransientVerificationError(f"base SHA resolution failed: {exc}") from exc
             self.session.add(
-                CanaryProbeOverride(
+                ProbePolicyDecision(
                     case_id=case.id,
                     repository=case.repository,
                     issue_number=case.issue_number,
                     triage_result_hash=request.triage_result_hash,
                     base_sha=base_sha,
-                    actor=CANARY_OVERRIDE_ACTOR,
+                    policy=self.settings.probe_policy.value,
+                    probe_status=ProbeStatus.NOT_CONFIGURED.value,
+                    actor=PROBE_POLICY_ACTOR,
                     approved_by=request.decided_by_slack_user_id,
-                    reason=CANARY_OVERRIDE_REASON,
-                    warning=CANARY_OVERRIDE_WARNING,
+                    reason=PROBE_NOT_CONFIGURED_REASON,
+                    note=PROBE_NOT_CONFIGURED_NOTE,
                 )
             )
-            metrics.canary_probe_overrides_total.labels(metrics.mode()).inc()
+            metrics.probe_outcomes_total.labels(
+                metrics.mode(), "none", ProbeStatus.NOT_CONFIGURED.value
+            ).inc()
         case.failure_reason = None
         await self._transition(
             CaseState.REMEDIATION_CREATE_INTENT,
-            f"{CANARY_PROBE_OVERRIDE}: {CANARY_OVERRIDE_REASON} ({detail}); "
-            f"actor={CANARY_OVERRIDE_ACTOR} repository={case.repository} "
-            f"issue=#{case.issue_number} triage_hash={request.triage_result_hash} "
-            f"base={base_sha}; {CANARY_OVERRIDE_WARNING}",
-            canary_probe_override=True,
+            f"{PROBE_NOT_CONFIGURED}: {PROBE_NOT_CONFIGURED_REASON} ({detail}); "
+            f"actor={PROBE_POLICY_ACTOR} policy={self.settings.probe_policy.value} "
+            f"repository={case.repository} issue=#{case.issue_number} "
+            f"triage_hash={request.triage_result_hash} base={base_sha}; "
+            f"{PROBE_NOT_CONFIGURED_NOTE}",
+            probe_not_configured=True,
         )
         await self.session.commit()
 
     async def _resume_missing_probe_block(self) -> None:
-        """Re-open a case blocked *solely* on a missing probe once the override is enabled.
+        """Re-open a case blocked *solely* on a missing probe once the policy allows it.
 
         Nothing is trusted from the blocked state: `_dispatch()` re-validates the approval,
         the exact triage hash, the confirmed label webhook, the repository, active attempts
         and capacity before anything is created.
         """
         case = self.case
-        if not self.settings.live_canary_allow_missing_probe:
+        if self.settings.probe_required:
             return
         if not is_missing_probe_block(case.failure_reason):
             return
         await self._transition(
             CaseState.REMEDIATION_APPROVED,
-            f"{CANARY_PROBE_OVERRIDE} enabled: re-evaluating dispatch preconditions for the "
-            "approval already recorded; no new approval, triage or issue is requested",
+            f"PROBE_POLICY={self.settings.probe_policy.value}: re-evaluating dispatch "
+            "preconditions for the approval already recorded; no new approval, triage or "
+            "issue is requested",
         )
         case.failure_reason = None
         await self.session.commit()
@@ -752,16 +774,16 @@ class RemediationPipeline:
             return triage
         probe = await latest_probe_snapshot(self.session, self.case.id)
         if probe is None:
-            override = await self._canary_override(request.triage_result_hash)
-            if override is None:
+            decision = await self._probe_policy_decision(request.triage_result_hash)
+            if decision is None:
                 return "no probe snapshot was persisted at dispatch"
             self._request = request
             return RemediationContext(
                 approval=request,
                 triage_output=triage,
                 base_ref=self.settings.github_base_ref,
-                pinned_base_sha=override.base_sha,
-                probe_override=True,
+                pinned_base_sha=decision.base_sha,
+                probe_not_configured=True,
             )
         base_execution = await self._matched_base_execution(probe)
         if base_execution is None:
@@ -857,15 +879,17 @@ class RemediationPipeline:
 
     async def _validate_output(self, attempt: Attempt) -> None:
         case = self.case
-        override = attempt.canary_probe_override
+        without_probe = attempt.without_probe
         snapshot = (
-            None if override else await self.session.get(ProbeSnapshot, attempt.probe_snapshot_id)
+            None
+            if without_probe
+            else await self.session.get(ProbeSnapshot, attempt.probe_snapshot_id)
         )
-        if snapshot is None and not override:
+        if snapshot is None and not without_probe:
             await self._fail("attempt has no probe snapshot", "output", attempt=attempt)
             return
         try:
-            result = validate_remediation_output(attempt.structured_output, probe=not override)
+            result = validate_remediation_output(attempt.structured_output, probe=not without_probe)
         except RemediationValidationError as exc:
             await self._fail(f"structured output invalid: {exc}", "output", attempt=attempt)
             return
@@ -919,11 +943,11 @@ class RemediationPipeline:
                 )
                 return
             if snapshot is None:
-                # Canary override: nothing independent reproduced the defect, so the claim
-                # can only be judged by a human.
+                # No probe reproduced the defect independently, so the claim can only be
+                # judged by a human.
                 await self._human_block(
                     "Devin reported no_change_needed and no acceptance probe exists to "
-                    f"contradict it ({CANARY_PROBE_OVERRIDE}): {result.summary}",
+                    f"contradict it ({PROBE_NOT_CONFIGURED}): {result.summary}",
                     "output",
                     attempt,
                 )
@@ -1005,7 +1029,7 @@ class RemediationPipeline:
         case = self.case
         settings = self.settings
         result = validate_remediation_output(
-            attempt.structured_output, probe=not attempt.canary_probe_override
+            attempt.structured_output, probe=not attempt.without_probe
         )
         number = attempt.pr_number
         if number is None or attempt.head_sha is None:
@@ -1206,14 +1230,14 @@ class RemediationPipeline:
                 f"PR #{number} needs a human: {'; '.join(human)}", "pr", attempt
             )
             return
-        if attempt.canary_probe_override:
+        if attempt.without_probe:
             # No probe exists to run at head; PR corroboration plus exact-head CI are the
             # only machine evidence this case will ever have.
             await self._transition(
                 CaseState.PR_VALIDATED,
                 f"PR #{number} corroborated by GitHub at {pull.head_sha[:12]}; "
-                f"head probe skipped ({CANARY_PROBE_OVERRIDE}). {CANARY_OVERRIDE_WARNING}",
-                canary_probe_override=True,
+                f"no head probe to run ({PROBE_NOT_CONFIGURED}). {PROBE_NOT_CONFIGURED_NOTE}",
+                probe_not_configured=True,
             )
             return
         await self._transition(

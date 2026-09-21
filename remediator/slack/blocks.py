@@ -135,9 +135,10 @@ class RemediationProgress:
     ci_summary: str | None = None
     failure_reason: str | None = None
     ready_for_review: bool = False
-    # Set when this case was dispatched under the canary-only probe override: no base or
-    # head acceptance probe ran and none ever will for it.
-    canary_override_warning: str | None = None
+    # Set when no acceptance probe backs this case: neutral status under
+    # PROBE_POLICY=if_available, or the historical override warning on legacy cases.
+    probe_status_note: str | None = None
+    probe_note_legacy: bool = False
 
 
 # Case states → status headline. Anything not listed renders the raw state name.
@@ -204,8 +205,9 @@ def _remediation_blocks(progress: RemediationProgress) -> list[dict[str, Any]]:
         label = f"PR #{progress.pr_number}" if progress.pr_number else "pull request"
         head = f" @ `{_safe(progress.head_sha[:12], 12)}`" if progress.head_sha else ""
         lines.append(f"PR: {_link(progress.pr_url, label)}{head}")
-    if progress.canary_override_warning:
-        lines.append(f":warning: {_safe(progress.canary_override_warning, 600)}")
+    if progress.probe_status_note:
+        prefix = ":warning:" if progress.probe_note_legacy else "Acceptance probe: Not configured —"
+        lines.append(f"{prefix} {_safe(progress.probe_status_note, 600)}")
     elif progress.probe_base or progress.probe_head:
         lines.append(
             f"Probe base: {_safe(progress.probe_base or 'not run', ITEM_MAX)} · "

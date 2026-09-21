@@ -182,47 +182,50 @@ session:
 Record the attempt IDs, the superseding decision and the approval hash in the
 canary checklist below.
 
-## Emergency: approving a canary with no registered probe
+## Acceptance-probe policy (`PROBE_POLICY`)
 
-`LIVE_CANARY_ALLOW_MISSING_PROBE=true` (default `false`) lets the human Slack
-approval alone start the bounded remediation session when the probe registry has
-nothing for the issue — the live block
+`PROBE_POLICY=required` (default) is the original production behaviour: an
+approved immutable probe must exist, reproduce the defect at the pinned base SHA
+and pass unchanged at the PR head; a missing registration blocks the case with
 `approved probe unavailable: no approved probe registered at /app/probes/<owner>/<repo>/<n>/probe.yaml`.
-It only takes effect when `LIVE_CANARY=true`, `GITHUB_REQUIRED_LABEL` is set and
-`MAX_CONCURRENT_REMEDIATION=1`; otherwise the process refuses to start and
-`make readiness` fails `canary.probe_override` (it warns while the override is on).
 
-It skips exactly three things: the probe-registration requirement and the BASE
-and HEAD probe executions. Everything else still gates the case — allowlisted
-repository, the original approval bound to the exact triage hash, the confirmed
-`devin:remediate` label webhook, the dynamically pinned base SHA, capacity and
+`PROBE_POLICY=if_available` runs exactly that verification whenever a probe is
+registered. With no probe registered, the validated Slack approval and the
+confirmed `devin:remediate` label proceed straight to the bounded session; only
+the probe-registration requirement and the BASE/HEAD executions have nothing to
+run. Everything else still gates the case — allowlisted repository, the approval
+bound to the exact triage hash, the dynamically pinned base SHA, capacity and
 spend, durable create intent with operation-key idempotency and uncertain-create
 reconciliation, structured-output validation, PR discovery from `pull_requests[]`,
-independent GitHub PR validation and CI for the exact head SHA. No probe snapshot,
-probe execution or probe-passed metric is ever written, and nothing merges or
-closes anything. Every surface (case page, dashboard, Slack milestone update,
-`canary_probe_overrides_total`, the append-only `CANARY_PROBE_OVERRIDE` audit row)
-carries:
+independent GitHub PR validation and CI for the exact head SHA. No probe
+snapshot, probe execution or probe-passed metric is ever written, and nothing
+merges or closes anything. The case page, dashboard, Slack update, the
+`probe_outcomes_total{target="none",outcome="not_configured"}` counter and the
+append-only `probe_policy_decisions` row all report:
 
-> CANARY OVERRIDE: remediation proceeded without base/head acceptance-probe verification. PR and exact-head CI were validated, but behavioral correctness requires human review.
+> Acceptance probe: not configured. PR structure and exact-head CI will still be independently validated.
 
-Recovering the case that is already approved and blocked on the missing probe —
+`LIVE_CANARY_ALLOW_MISSING_PROBE` has been removed: `make readiness` fails
+`probe.policy_migration` while it is still set in the environment. Historical
+`CANARY_PROBE_OVERRIDE` rows are retained and still rendered on the cases that
+ran under it; nothing writes new ones.
+
+Resuming a case that is already approved and blocked solely on the missing probe —
 no database edit, no new approval, no new triage session, no new issue:
 
-1. Set `LIVE_CANARY_ALLOW_MISSING_PROBE=true` in the deployment `.env`, run
-   `make readiness` (expect the `canary.probe_override` warning) and
-   `docker compose up -d`.
+1. Set `PROBE_POLICY=if_available` in the deployment `.env`, run `make readiness`
+   (expect the `probe.policy` warning) and `docker compose up -d`.
 2. The worker picks the case up on its own: only a case blocked *solely* on a
    missing registration is re-evaluated, and `_dispatch()` re-validates every
    precondition above before anything is created. Any other blocker keeps the
    case blocked.
-3. Exactly one `CANARY_PROBE_OVERRIDE` audit row, one remediation attempt and one
+3. Exactly one `probe_policy_decisions` row, one remediation attempt and one
    Devin session result; the case then follows the normal path to `CI_PASSED` and
    stops there for human PR review.
-4. Turn the flag back to `false` immediately after the canary.
+4. Set `PROBE_POLICY=required` again once probes are registered for the repository.
 
-Record the audit row (actor, timestamp, triage hash, pinned base SHA) in the
-checklist below, and mark the probe lines `n/a — canary override`.
+Record the decision row (actor, timestamp, triage hash, pinned base SHA) in the
+checklist below, and mark the probe lines `n/a — probe not configured`.
 
 ## Canary checklist
 
@@ -242,7 +245,7 @@ Triage attempt id:                       operation key:
 Triage Devin session id / URL:
 Triage output hash (triage_result_hash):
 Slack approval: actor=                   ts=
-Canary probe override used? [ ] no [ ] yes (LIVE_CANARY_ALLOW_MISSING_PROBE) — audit actor/ts:
+Probe policy: [ ] required [ ] if_available — probe_status: [ ] verified [ ] not_configured (decision actor/ts: )
 Probe identifier (marcelaubry/superset#<issue>):   manifest hash:          script hash:
 Base probe result: exit=      expected base=      verdict=
 Remediation attempt id:                  operation key:
