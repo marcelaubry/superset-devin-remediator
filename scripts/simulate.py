@@ -74,6 +74,12 @@ PHASE4_SCENARIOS: dict[str, int] = {
     "remediate-unlabeled-intake": 4222,  # unlabeled opened issue is evaluated; `bug` label inert
 }
 
+# `demo`: the smallest set of scenarios that shows every representative outcome on the
+# dashboard (context rejection, triage, approval, rejection, remediation, failure, blocked).
+DEMO_INGEST = ["needs-scoping", "good", "blocked"]
+DEMO_PHASE3 = ["approve", "reject"]
+DEMO_PHASE4 = ["remediate", "remediate-head-fails"]
+
 # Phase 5: twenty consecutive fixture issues; none is a pinned fake-Devin scenario.
 PHASE5_FIRST_ISSUE = 5200
 PHASE5_SCENARIOS: dict[str, int] = {"concurrency-20": PHASE5_FIRST_ISSUE}
@@ -1000,6 +1006,7 @@ def main() -> None:
             *PHASE4_SCENARIOS,
             *PHASE5_SCENARIOS,
             "all",
+            "demo",
             "phase3",
             "phase4",
             "phase5",
@@ -1019,6 +1026,9 @@ def main() -> None:
     if args.scenario == "all":
         ingest, phase3, phase4 = list(SCENARIOS), list(PHASE3_SCENARIOS), list(PHASE4_SCENARIOS)
         phase5 = list(PHASE5_SCENARIOS)
+    elif args.scenario == "demo":
+        ingest, phase3, phase4 = list(DEMO_INGEST), list(DEMO_PHASE3), list(DEMO_PHASE4)
+        args.wait = True
     elif args.scenario == "phase3":
         phase3 = list(PHASE3_SCENARIOS)
     elif args.scenario == "phase4":
